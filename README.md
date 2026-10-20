@@ -1,0 +1,1 @@
+# trading_dignal_app
