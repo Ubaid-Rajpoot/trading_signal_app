@@ -1,1 +1,1 @@
-# trading_dignal_app
+# trading_signal_app
