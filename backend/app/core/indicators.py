@@ -120,3 +120,47 @@ def rolling_low(series: pd.Series, length: int) -> pd.Series:
 
 def pct_change(series: pd.Series, periods: int) -> pd.Series:
     return series.pct_change(periods) * 100.0
+
+
+def stdev(series: pd.Series, length: int) -> pd.Series:
+    """Population standard deviation (matches Pine Script's ``stdev``)."""
+    return series.rolling(length, min_periods=length).std(ddof=0)
+
+
+def tdi(
+    close: pd.Series,
+    rsi_length: int = 50,
+    band_length: int = 50,
+    fast_length: int = 1,
+    slow_length: int = 9,
+    mult: float = 1.6185,
+) -> pd.DataFrame:
+    """Traders Dynamic Index, exactly as the TradingView TDIGM script computes it.
+
+        r    = RSI(close, rsi_length)
+        ma   = SMA(r, band_length)                  # Market Base Line (middle band)
+        offs = mult * stdev(r, band_length)
+        up   = ma + offs ; dn = ma - offs ; mid = (up + dn) / 2
+        fast = SMA(r, fast_length)                  # "purple line" (== r when fast=1)
+        slow = SMA(r, slow_length)
+
+    Returns a frame with columns: rsi, fast, slow, mbl, upper, lower.
+    """
+    r = rsi(close, rsi_length)
+    ma = sma(r, band_length)
+    offs = mult * stdev(r, band_length)
+    upper = ma + offs
+    lower = ma - offs
+    fast = r if fast_length <= 1 else sma(r, fast_length)
+    slow = sma(r, slow_length)
+    return pd.DataFrame(
+        {
+            "rsi": r,
+            "fast": fast,
+            "slow": slow,
+            "mbl": (upper + lower) / 2,
+            "upper": upper,
+            "lower": lower,
+        },
+        index=close.index,
+    )

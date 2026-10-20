@@ -25,3 +25,6 @@ frontend/dist/
 .env.*
 .DS_Store
 *.log
+
+# Local reference material (PDFs / screenshots) - not part of the app
+.refs/

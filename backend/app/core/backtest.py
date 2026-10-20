@@ -122,7 +122,7 @@ def _sortino(returns: np.ndarray, periods: float) -> float:
     if returns.size < 2:
         return 0.0
     downside = returns[returns < 0]
-    if downside.size == 0:
+    if downside.size < 2:
         return 0.0
     dd = downside.std(ddof=1)
     if dd == 0 or not np.isfinite(dd):

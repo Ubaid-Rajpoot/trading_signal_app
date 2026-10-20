@@ -9,14 +9,16 @@ from .base import ParamSpec, RuleCheck, Strategy, Targets, TriggerSet
 from .custom import CustomStrategy
 from .donchian import DonchianBreakout
 from .ema_trend import EmaTrend
+from .tdi_shift import TdiShift
 
 _REGISTRY: dict[str, type[Strategy]] = {
+    TdiShift.id: TdiShift,
     DonchianBreakout.id: DonchianBreakout,
     EmaTrend.id: EmaTrend,
     CustomStrategy.id: CustomStrategy,
 }
 
-DEFAULT_STRATEGY = DonchianBreakout.id
+DEFAULT_STRATEGY = TdiShift.id
 
 
 def get_strategy(strategy_id: str | None) -> Strategy:

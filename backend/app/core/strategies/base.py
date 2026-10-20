@@ -102,6 +102,7 @@ class Strategy:
     allows_short: bool = True
     params: list[ParamSpec] = []
     plot_lines: list[dict[str, str]] = []  # {column, label, colour}
+    pane: dict[str, Any] | None = None  # optional oscillator sub-chart (e.g. TDI)
 
     # ---------------------------------------------------------------- params
     @classmethod
@@ -155,6 +156,7 @@ class Strategy:
             ],
             "defaults": cls.default_params(),
             "plot_lines": cls.plot_lines,
+            "pane": cls.pane,
         }
 
     # ------------------------------------------------------------ interface

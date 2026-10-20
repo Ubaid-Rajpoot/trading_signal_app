@@ -3,6 +3,7 @@ import { api } from './api'
 import BacktestView from './components/BacktestView'
 import CandleChart from './components/CandleChart'
 import HistoryView from './components/HistoryView'
+import OscillatorChart from './components/OscillatorChart'
 import SettingsView from './components/SettingsView'
 import SignalPanel from './components/SignalPanel'
 import WatchlistPanel from './components/WatchlistPanel'
@@ -211,7 +212,12 @@ export default function App() {
                         <span className="right tiny muted mono">{signal.timeframe_label}</span>
                       </header>
                       <div className="panel-body" style={{ padding: '10px 12px 4px' }}>
-                        <CandleChart chart={signal.chart} height={366} />
+                        <CandleChart chart={signal.chart} height={signal.chart.pane ? 330 : 366} />
+                        {signal.chart.pane && (
+                          <div style={{ borderTop: '1px solid var(--border-soft)', marginTop: 6, paddingTop: 6 }}>
+                            <OscillatorChart pane={signal.chart.pane} bars={signal.chart.time.length} />
+                          </div>
+                        )}
                       </div>
                     </section>
 

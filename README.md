@@ -27,11 +27,18 @@ file, and everything else — charting, scanning, backtesting, alerting — reus
 | **Persistence** | SQLite for settings, signal history and alert log — no external services |
 | **Data** | Binance public REST (no API key), disk cache, and a deterministic demo feed so the app is fully usable offline |
 
-Three strategies ship in the box:
+Four strategies ship in the box:
 
-1. **Donchian Breakout** (default) — turtle-style trend following with an EMA trend filter and ADX chop filter.
-2. **EMA Trend Cross** — fast/slow EMA crossover with an RSI over-extension filter.
-3. **My Strategy (template)** — a documented, editable file meant to be replaced with your own rules.
+1. **TDI + Shift (HVB)** (default) — the TDIGM system: the purple RSI line breaks the
+   Market Base Line *with speed* on the same candle that price breaks a minor swing
+   (SHIFT) or a major swing (MS). Full spec in [`docs/strategy-spec.md`](docs/strategy-spec.md).
+2. **Donchian Breakout** — turtle-style trend following with an EMA trend filter and ADX chop filter.
+3. **EMA Trend Cross** — fast/slow EMA crossover with an RSI over-extension filter.
+4. **My Strategy (template)** — a documented, editable file meant to be replaced with your own rules.
+
+`tdi_shift` also renders its own **TDI sub-pane** under the price chart — purple RSI
+line, Market Base Line, volatility bands and yellow HVB markers — with the swing
+levels drawn on price.
 
 ---
 

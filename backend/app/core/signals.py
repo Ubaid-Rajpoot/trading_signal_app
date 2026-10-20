@@ -192,6 +192,44 @@ def build_signal(
                 "colour": line["colour"],
                 "values": [None if pd.isna(v) else round(float(v), 8) for v in window[col]],
             }
+    # Optional oscillator sub-pane (TDI for the shift strategy).
+    pane_payload = None
+    if strategy.pane:
+        spec = strategy.pane
+        pane_lines = {}
+        for line in spec.get("lines", []):
+            col = line["column"]
+            if col in window:
+                pane_lines[col] = {
+                    "label": line["label"],
+                    "colour": line["colour"],
+                    "width": line.get("width", 1.4),
+                    "values": [None if pd.isna(v) else round(float(v), 3) for v in window[col]],
+                }
+        pane_bands = []
+        for band in spec.get("bands", []):
+            if band["upper"] in window and band["lower"] in window:
+                pane_bands.append(
+                    {
+                        "colour": band.get("colour", "#3b82f6"),
+                        "upper": [None if pd.isna(v) else round(float(v), 3) for v in window[band["upper"]]],
+                        "lower": [None if pd.isna(v) else round(float(v), 3) for v in window[band["lower"]]],
+                    }
+                )
+        pane_markers = []
+        for marker in spec.get("markers", []):
+            col = marker["column"]
+            if col in window:
+                for pos in window[col].to_numpy().nonzero()[0]:
+                    pane_markers.append({"index": int(pos), "side": marker["side"]})
+        pane_payload = {
+            "title": spec.get("title", ""),
+            "levels": spec.get("levels", []),
+            "lines": pane_lines,
+            "bands": pane_bands,
+            "markers": pane_markers,
+        }
+
     markers = []
     for i in range(len(window)):
         idx = len(prepared) - len(window) + i
@@ -208,6 +246,34 @@ def build_signal(
         down_dist = (price - channel_low) / price * 100
         nearest = min(up_dist, down_dist)
         readiness = int(max(0, min(100, round(100 - (nearest / 3.0) * 100))))
+    elif price:
+        # Strategies built on swing levels (e.g. TDI + shift): how close is price
+        # to the nearest structure that still has to break?
+        candidates = [
+            _f(last.get(col))
+            for col in ("sw_hi_minor", "sw_lo_minor", "sw_hi_major", "sw_lo_major")
+        ]
+        distances = [abs(price - lvl) for lvl in candidates if lvl]
+        atr_now = _f(last.get("atr"))
+        structure_ready = None
+        if distances:
+            nearest = min(distances)
+            # Normalise by ATR so "close" means the same thing on every asset.
+            span = (atr_now * 2.0) if atr_now else (price * 0.02)
+            structure_ready = max(0.0, min(100.0, 100 - (nearest / span) * 100))
+
+        # Strategies with an oscillator pane (TDI): the first condition is the
+        # purple line approaching the base line, so show that too.
+        pane_ready = None
+        upper, lower = _f(last.get("tdi_upper")), _f(last.get("tdi_lower"))
+        purple, base = _f(last.get("tdi_fast")), _f(last.get("tdi_mbl"))
+        if upper is not None and lower is not None and purple is not None and base is not None:
+            half_band = max((upper - lower) / 2.0, 0.5)
+            pane_ready = max(0.0, min(100.0, 100 - (abs(purple - base) / half_band) * 100))
+
+        parts = [v for v in (structure_ready, pane_ready) if v is not None]
+        if parts:
+            readiness = int(round(sum(parts) / len(parts)))
 
     last_trigger = None
     for name, label in (("long_entry", "LONG"), ("short_entry", "SHORT")):
@@ -274,6 +340,7 @@ def build_signal(
             "series": series,
             "lines": lines,
             "markers": markers,
+            "pane": pane_payload,
         },
     }
 

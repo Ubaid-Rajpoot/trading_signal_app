@@ -53,11 +53,27 @@ export interface Plan {
   note: string
 }
 
+export interface PaneLine {
+  label: string
+  colour: string
+  width: number
+  values: (number | null)[]
+}
+
+export interface OscillatorPane {
+  title: string
+  levels: number[]
+  lines: Record<string, PaneLine>
+  bands: { colour: string; upper: (number | null)[]; lower: (number | null)[] }[]
+  markers: { index: number; side: string }[]
+}
+
 export interface ChartPayload {
   time: number[]
   series: Record<string, (number | null)[]>
   lines: Record<string, { label: string; colour: string; values: (number | null)[] }>
   markers: { index: number; side: 'LONG' | 'SHORT'; price: number }[]
+  pane: OscillatorPane | null
 }
 
 export interface Signal {
