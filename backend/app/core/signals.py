@@ -19,6 +19,7 @@ import pandas as pd
 from ..config import TIMEFRAMES
 from .data.providers import MarketDataError, get_candles
 from .strategies import Strategy, get_strategy
+from .strategies.base import Targets
 
 
 def _f(value: Any, default: float | None = None) -> float | None:
@@ -275,7 +276,12 @@ def build_signal(
     trend_ref = _f(last.get("trend_ema")) or _f(last.get("slow_ema"))
     price = _f(last["close"], 0.0) or 0.0
     plan_side = side or ("LONG" if (trend_ref is None or price >= trend_ref) else "SHORT")
-    targets = strategy.targets(prepared, resolved, plan_side)
+    # Stop-less systems only report the setup; no entry/stop/target ladder.
+    targets = (
+        strategy.targets(prepared, resolved, plan_side)
+        if getattr(strategy, "uses_stops", True)
+        else Targets()
+    )
     confidence, confidence_notes = _confidence(prepared, bias if bias != "NEUTRAL" else plan_side)
     unrealized = None
     if state_info["entry_price"] and state != "FLAT":
@@ -437,7 +443,11 @@ def build_signal(
         "plan": {
             **targets.as_dict(plan_side, price_decimals=6),
             "is_live": bool(bias != "NEUTRAL"),
-            "note": "Live setup" if bias != "NEUTRAL" else "Illustrative levels from the current bias",
+            "note": (
+                "No stop loss or take profit - this system reports the setup only"
+                if not getattr(strategy, "uses_stops", True)
+                else ("Live setup" if bias != "NEUTRAL" else "Illustrative levels from the current bias")
+            ),
         },
         "indicators": {
             k: round(float(v), 4)

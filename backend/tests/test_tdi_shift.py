@@ -132,13 +132,17 @@ def test_long_and_short_directions_are_mirrored(strategy, params):
         assert row["tdi_fast"] < row["tdi_mbl"] or row["hvb_down"]
 
 
-def test_targets_straddle_price(strategy, params, prepared):
-    targets = strategy.targets(prepared, params, "LONG")
-    assert targets.stop < targets.entry
-    assert all(tp > targets.entry for tp in targets.take_profits)
-    short = strategy.targets(prepared, params, "SHORT")
-    assert short.stop > short.entry
-    assert all(tp < short.entry for tp in short.take_profits)
+def test_no_stop_loss_or_take_profit(strategy, params, prepared):
+    """The system reports setups only - there is no risk plan to compute."""
+    assert strategy.uses_stops is False
+    for side in ("LONG", "SHORT"):
+        targets = strategy.targets(prepared, params, side)
+        assert targets.stop is None
+        assert not targets.take_profits
+    signal = build_signal("BTCUSDT", "15m", "tdi_shift", limit=600)
+    plan = signal["plan"]
+    assert plan["stop"] is None and not plan["take_profits"]
+    assert signal["strategy"]["uses_stops"] is False
 
 
 def test_signal_payload_carries_the_tdi_pane():

@@ -1,8 +1,8 @@
 # Win-rate study — BTCUSDT
 
 - Window: last **30 days**
-- Strategy: `tdi_shift` with `{"rsi_len": 50, "band_len": 50, "fast_len": 1, "slow_len": 9, "band_mult": 1.6185, "hvb_step": 4.0, "hvb_step_bars": 2, "hvb_margin": 1.0, "swing_minor": 3, "swing_major": 15, "allow_shift": true, "allow_ms": true, "confluence_window": 0, "stop_buffer_atr": 0.25, "atr_len": 14, "target_r": 2.0, "long_only": false}`
-- Generated: 2026-10-20 17:10 UTC
+- Strategy: `tdi_shift` with `{"rsi_len": 50, "band_len": 50, "fast_len": 1, "slow_len": 9, "band_mult": 1.6185, "hvb_step": 4.0, "hvb_step_bars": 2, "hvb_margin": 1.0, "swing_minor": 3, "swing_major": 15, "allow_shift": true, "allow_ms": true, "confluence_window": 0, "atr_len": 14, "long_only": false}`
+- Generated: 2026-10-20 17:13 UTC
 - Data source: **demo**
 
 | TF | Bars | Trades | Wins | Losses | Win % | Return % | PF | Max DD % |

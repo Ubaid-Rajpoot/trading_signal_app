@@ -70,11 +70,8 @@ class TdiShift(Strategy):
         ParamSpec("confluence_window", "Confluence window (bars)", "int", 0, 0, 5, 1,
                   "0 = the swing break must happen on the exact same candle as the HVB. "
                   "1-3 allow the break to come this many bars later."),
-        # ---- risk -----------------------------------------------------------
-        ParamSpec("stop_buffer_atr", "Stop buffer (ATR)", "float", 0.25, 0.0, 3.0, 0.05,
-                  "Extra room beyond the swing that was broken."),
+        # ---- filters --------------------------------------------------------
         ParamSpec("atr_len", "ATR length", "int", 14, 5, 50, 1),
-        ParamSpec("target_r", "Second target (R)", "float", 2.0, 1.0, 8.0, 0.5),
         ParamSpec("long_only", "Long only", "bool", False, None, None, None),
     ]
 
@@ -181,35 +178,13 @@ class TdiShift(Strategy):
 
     # ------------------------------------------------------------- targets
     def targets(self, data: pd.DataFrame, params: dict[str, Any], side) -> Targets:
-        """Stop beyond the swing that the break left behind, targets at R multiples."""
-        if data.empty:
-            return Targets()
-        row = data.iloc[-1]
-        price = float(row["close"])
-        atr = float(row["atr"]) if pd.notna(row.get("atr")) else price * 0.005
-        buffer = atr * float(params["stop_buffer_atr"])
+        """No stop loss and no take profit.
 
-        if side == "LONG":
-            swing_low = row.get("sw_lo_minor")
-            if pd.isna(swing_low) or float(swing_low) >= price:
-                swing_low = row.get("sw_lo_major")
-            stop = float(swing_low) - buffer if pd.notna(swing_low) and float(swing_low) < price else price - 2 * atr
-        else:
-            swing_high = row.get("sw_hi_minor")
-            if pd.isna(swing_high) or float(swing_high) <= price:
-                swing_high = row.get("sw_hi_major")
-            stop = float(swing_high) + buffer if pd.notna(swing_high) and float(swing_high) > price else price + 2 * atr
-
-        risk = abs(price - stop)
-        if risk <= 0:
-            return Targets()
-        rr = float(params["target_r"])
-        ladder = [1.0, rr, rr * 1.6]
-        if side == "LONG":
-            tps = [price + m * risk for m in ladder]
-        else:
-            tps = [price - m * risk for m in ladder]
-        return Targets(entry=price, stop=stop, take_profits=tps)
+        This system only answers *where a setup is forming*. A position is closed
+        when the purple line crosses back through the base line, which is what
+        signals the end of the move — not a fixed R multiple.
+        """
+        return Targets()
 
     # ------------------------------------------------------------- checks
     def checks(self, data: pd.DataFrame, params: dict[str, Any]) -> list[RuleCheck]:
