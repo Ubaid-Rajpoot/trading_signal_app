@@ -30,13 +30,17 @@ USER_AGENT = "SignalForge/0.1 (+https://github.com/Ubaid-Rajpoot/trading_signal_
 # timeframe -> (binance interval, seconds)
 TIMEFRAMES: dict[str, dict[str, int | str]] = {
     "1m": {"interval": "1m", "seconds": 60, "label": "1 minute"},
+    "3m": {"interval": "3m", "seconds": 180, "label": "3 minutes"},
     "5m": {"interval": "5m", "seconds": 300, "label": "5 minutes"},
     "15m": {"interval": "15m", "seconds": 900, "label": "15 minutes"},
+    "30m": {"interval": "30m", "seconds": 1800, "label": "30 minutes"},
     "1h": {"interval": "1h", "seconds": 3600, "label": "1 hour"},
     "4h": {"interval": "4h", "seconds": 14400, "label": "4 hours"},
     "1d": {"interval": "1d", "seconds": 86400, "label": "1 day"},
 }
-DEFAULT_TIMEFRAME = "1h"
+DEFAULT_TIMEFRAME = "15m"
+# The scalping timeframes the TDIGM setup is read on.
+SCAN_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 
 # Curated liquid USDT pairs shown in the picker (any Binance symbol still works).
 DEFAULT_SYMBOLS: list[dict[str, str]] = [

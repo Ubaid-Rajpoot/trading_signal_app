@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from ..config import APP_NAME, APP_VERSION, DEFAULT_SYMBOLS, DEFAULT_WATCHLIST, TIMEFRAMES
-from ..core import backtest_service
+from ..config import APP_NAME, APP_VERSION, DEFAULT_SYMBOLS, DEFAULT_WATCHLIST, SCAN_TIMEFRAMES, TIMEFRAMES
+from ..core import backtest_service, winrate as winrate_service
 from ..core.alerts import notifier, scheduler
 from ..core.data.providers import MarketDataError, provider_status
 from ..core.signals import build_signal, scan
@@ -80,6 +81,7 @@ def meta() -> dict[str, Any]:
             "version": APP_VERSION,
             "strategies": strategies,
             "timeframes": [{"value": k, "label": v["label"]} for k, v in TIMEFRAMES.items()],
+            "scan_timeframes": SCAN_TIMEFRAMES,
             "symbols": DEFAULT_SYMBOLS,
             "default_watchlist": DEFAULT_WATCHLIST,
             "default_strategy": strategies[0]["id"],
@@ -145,6 +147,87 @@ def backtest(payload: BacktestRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc))
     except (MarketDataError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/winrate")
+def winrate(
+    symbol: str = Query("BTCUSDT"),
+    days: int = Query(30, ge=1, le=120),
+    timeframes: str = Query("", description="Comma-separated; defaults to 1m,3m,5m,15m,30m"),
+    strategy: str = Query("tdi_shift"),
+    params: str | None = Query(None),
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    tfs = [t.strip() for t in timeframes.split(",") if t.strip()] or None
+    try:
+        return sanitize(
+            winrate_service.report(
+                symbol=symbol,
+                days=days,
+                timeframes=tfs,
+                strategy=strategy,
+                params=_params(params),
+                refresh=refresh,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/radar")
+def radar(
+    symbols: str = Query("", description="Comma-separated; defaults to the saved watchlist"),
+    timeframes: str = Query("", description="Comma-separated; defaults to 1m,3m,5m,15m,30m"),
+    strategy: str = Query("tdi_shift"),
+    params: str | None = Query(None),
+) -> dict[str, Any]:
+    from ..config import SCAN_TIMEFRAMES
+
+    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()] or get_settings().get("watchlist", [])
+    tfs = [t.strip() for t in timeframes.split(",") if t.strip()] or SCAN_TIMEFRAMES
+    if len(wanted) > 12 or len(tfs) > 8:
+        raise HTTPException(status_code=400, detail="At most 12 symbols and 8 timeframes per radar scan")
+
+    resolved = _params(params)
+    grid: list[dict[str, Any]] = []
+    for symbol in wanted:
+        cells: dict[str, Any] = {}
+        for tf in tfs:
+            try:
+                signal = build_signal(symbol, tf, strategy, resolved, limit=500)
+                cells[tf] = {
+                    "status": signal["setup"]["status"],
+                    "direction": signal["setup"]["direction"],
+                    "level": signal["setup"]["level"],
+                    "distance_pct": signal["setup"]["distance_pct"],
+                    "price": signal["price"],
+                    "change_pct": signal["change_pct"],
+                    "tdi": signal["setup"]["tdi"],
+                    "text": signal["setup"]["text"],
+                    "source": signal["source"],
+                }
+            except Exception as exc:
+                cells[tf] = {"status": "ERROR", "error": str(exc)}
+        grid.append({"symbol": symbol, "cells": cells})
+
+    actionable = [
+        {"symbol": row["symbol"], "timeframe": tf, **cell}
+        for row in grid
+        for tf, cell in row["cells"].items()
+        if cell.get("status") in ("TRIGGERED", "ARMED", "FORMING")
+    ]
+    actionable.sort(key=lambda r: ({"TRIGGERED": 0, "ARMED": 1, "FORMING": 2}.get(r["status"], 3), r["symbol"]))
+    return sanitize(
+        {
+            "generated_at": int(time.time() * 1000),
+            "symbols": wanted,
+            "timeframes": tfs,
+            "grid": grid,
+            "actionable": actionable,
+        }
+    )
 
 
 @router.get("/signals")

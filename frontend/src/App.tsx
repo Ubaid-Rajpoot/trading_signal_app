@@ -5,15 +5,19 @@ import CandleChart from './components/CandleChart'
 import HistoryView from './components/HistoryView'
 import OscillatorChart from './components/OscillatorChart'
 import SettingsView from './components/SettingsView'
+import SetupRadar from './components/SetupRadar'
+import WinRateView from './components/WinRateView'
 import SignalPanel from './components/SignalPanel'
 import WatchlistPanel from './components/WatchlistPanel'
 import { ErrorBox, Spinner, fmtAgo, fmtPrice } from './components/ui'
 import type { Meta, ScanRow, Settings, Signal } from './types'
 
-type Tab = 'dashboard' | 'backtest' | 'history' | 'settings'
+type Tab = 'radar' | 'dashboard' | 'winrate' | 'backtest' | 'history' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'radar', label: 'Setup radar' },
+  { id: 'dashboard', label: 'Chart' },
+  { id: 'winrate', label: 'Win rate' },
   { id: 'backtest', label: 'Backtest' },
   { id: 'history', label: 'Signals & alerts' },
   { id: 'settings', label: 'Settings' },
@@ -22,7 +26,7 @@ const TABS: { id: Tab; label: string }[] = [
 export default function App() {
   const [meta, setMeta] = useState<Meta | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
-  const [tab, setTab] = useState<Tab>('dashboard')
+  const [tab, setTab] = useState<Tab>('radar')
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [timeframe, setTimeframe] = useState('1h')
   const [strategyId, setStrategyId] = useState('donchian')
@@ -177,9 +181,9 @@ export default function App() {
                 {meta.strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
               <div className="segmented">
-                {meta.timeframes.map((t) => (
-                  <button key={t.value} className={timeframe === t.value ? 'active' : ''} onClick={() => setTimeframe(t.value)}>
-                    {t.value}
+                {(meta.scan_timeframes ?? meta.timeframes.map((t) => t.value)).map((tf) => (
+                  <button key={tf} className={timeframe === tf ? 'active' : ''} onClick={() => setTimeframe(tf)}>
+                    {tf}
                   </button>
                 ))}
               </div>
@@ -272,6 +276,23 @@ export default function App() {
               </div>
             )}
           </div>
+        </main>
+      )}
+
+      {tab === 'radar' && (
+        <main className="layout single">
+          <SetupRadar
+            meta={meta}
+            watchlist={settings.watchlist}
+            strategyId={strategyId}
+            onOpen={(sym, tf) => { setSymbol(sym); setTimeframe(tf); setTab('dashboard') }}
+          />
+        </main>
+      )}
+
+      {tab === 'winrate' && (
+        <main className="layout single">
+          <WinRateView meta={meta} />
         </main>
       )}
 

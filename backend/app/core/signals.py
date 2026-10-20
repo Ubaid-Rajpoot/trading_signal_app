@@ -119,6 +119,113 @@ def _action_for(state: str, entry_fired: bool, exit_fired: bool, bars_in_state: 
     return "WAIT", "No setup right now - the engine is watching"
 
 
+ARMED_WINDOW = 3  # bars an HVB stays "armed" while waiting for the structure break
+
+
+def _setup_block(
+    prepared: pd.DataFrame,
+    triggers,
+    strategy: Strategy,
+    params: dict[str, Any],
+    entry_fired: bool,
+    state: str,
+    action: str,
+    price: float,
+) -> dict[str, Any]:
+    """What the setup is doing right now - state only, no stop, no targets.
+
+    TRIGGERED : every condition completed on the last closed candle
+    ARMED     : the TDI momentum break (HVB) printed, price still has to break
+                a swing level
+    FORMING   : price is closing in on a swing level and/or the purple line is
+                heading for the base line
+    IDLE      : nothing worth watching on this instrument
+    """
+    has_tdi = "hvb_up" in prepared.columns and "tdi_mbl" in prepared.columns
+    has_swings = "sw_hi_minor" in prepared.columns
+
+    def val(col: str) -> float | None:
+        try:
+            v = float(prepared[col].iloc[-1])
+            return v if np.isfinite(v) else None
+        except Exception:
+            return None
+
+    atr_now = val("atr")
+    purple, base = val("tdi_fast"), val("tdi_mbl")
+    upper, lower = val("tdi_upper"), val("tdi_lower")
+
+    # Nearest swing levels that price still has to break, on each side.
+    highs = [v for v in (val("sw_hi_minor"), val("sw_hi_major")) if v and price and v > price]
+    lows = [v for v in (val("sw_lo_minor"), val("sw_lo_major")) if v and price and v < price]
+    level_up = min(highs) if highs else None
+    level_down = max(lows) if lows else None
+
+    status = "IDLE"
+    direction: str | None = None
+    level: float | None = None
+    bars_ago: int | None = None
+    text = "No setup on this instrument right now."
+
+    if has_tdi:
+        up_hits = prepared["hvb_up"].tail(ARMED_WINDOW).to_numpy().nonzero()[0]
+        down_hits = prepared["hvb_down"].tail(ARMED_WINDOW).to_numpy().nonzero()[0]
+        last_up = int(up_hits[-1]) if up_hits.size else None
+        last_down = int(down_hits[-1]) if down_hits.size else None
+
+        if entry_fired:
+            status = "TRIGGERED"
+            direction = "LONG" if bool(triggers.long_entry.iloc[-1]) else "SHORT"
+            bars_ago = 0
+            text = "HVB crossed the base line and the swing broke on the same candle."
+        elif last_up is not None or last_down is not None:
+            if last_up is not None and (last_down is None or last_up >= last_down):
+                direction, bars_ago = "LONG", ARMED_WINDOW - 1 - last_up
+            else:
+                direction, bars_ago = "SHORT", ARMED_WINDOW - 1 - last_down
+            status = "ARMED"
+            wait_for = "high" if direction == "LONG" else "low"
+            text = f"HVB fired {bars_ago} bar(s) ago - waiting for price to break a {wait_for}."
+        elif purple is not None and base is not None:
+            # How close is the purple line to the base line, and price to structure?
+            half_band = max(((upper - lower) / 2.0) if (upper and lower) else 5.0, 0.5)
+            tdi_gap = abs(purple - base) / half_band
+            bias = "LONG" if purple > base else "SHORT"
+            next_level = level_up if bias == "LONG" else level_down
+            gap_atr = abs(next_level - price) / atr_now if (next_level and atr_now) else None
+            if (gap_atr is not None and gap_atr <= 1.0) or tdi_gap <= 0.2:
+                status = "FORMING"
+                direction = bias
+                text = (
+                    f"Purple line {abs(purple - base):.2f} pts from the base line - "
+                    f"setup building for a {bias.lower()}."
+                )
+
+    if direction == "LONG":
+        level = level_up
+    elif direction == "SHORT":
+        level = level_down
+
+    distance_pct = round((level - price) / price * 100, 3) if (level and price) else None
+
+    return {
+        "status": status,
+        "direction": direction,
+        "level": round(float(level), 8) if level else None,
+        "distance_pct": distance_pct,
+        "hvb_bars_ago": bars_ago,
+        "text": text,
+        "tdi": {
+            "purple": round(purple, 3) if purple is not None else None,
+            "base": round(base, 3) if base is not None else None,
+            "slow": (round(val("tdi_slow"), 3) if val("tdi_slow") is not None else None),
+            "side": ("above" if (purple or 0) > (base or 0) else "below") if purple is not None else None,
+        }
+        if has_tdi
+        else None,
+    }
+
+
 def build_signal(
     symbol: str,
     timeframe: str,
@@ -296,11 +403,14 @@ def build_signal(
     else:
         confidence_label = "Conviction"
 
+    setup = _setup_block(prepared, triggers, strategy, resolved, entry_fired, state, action, price)
+
     return {
+        "setup": setup,
         "symbol": symbol.upper(),
         "timeframe": timeframe,
         "timeframe_label": TIMEFRAMES.get(timeframe, {}).get("label", timeframe),
-        "strategy": {"id": strategy.id, "name": strategy.name},
+        "strategy": {"id": strategy.id, "name": strategy.name, "uses_stops": strategy.uses_stops},
         "params": resolved,
         "source": source,
         "generated_at": int(time.time() * 1000),
@@ -367,6 +477,10 @@ def scan(
                     "state": signal["state"]["position"],
                     "unrealized_pct": signal["state"]["unrealized_pct"],
                     "distance_to_stop_pct": _distance_to_stop(signal),
+                    "setup_status": signal["setup"]["status"],
+                    "setup_direction": signal["setup"]["direction"],
+                    "setup_level": signal["setup"]["level"],
+                    "setup_distance_pct": signal["setup"]["distance_pct"],
                     "source": signal["source"],
                     "error": None,
                 }

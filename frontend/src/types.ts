@@ -29,6 +29,7 @@ export interface Meta {
   version: string
   strategies: StrategySchema[]
   timeframes: { value: string; label: string }[]
+  scan_timeframes: string[]
   symbols: { symbol: string; base: string; name: string }[]
   default_watchlist: string[]
   default_strategy: string
@@ -76,11 +77,76 @@ export interface ChartPayload {
   pane: OscillatorPane | null
 }
 
+export interface Setup {
+  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE'
+  direction: 'LONG' | 'SHORT' | null
+  level: number | null
+  distance_pct: number | null
+  hvb_bars_ago: number | null
+  text: string
+  tdi: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
+}
+
+export interface RadarCell {
+  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE' | 'ERROR'
+  direction?: 'LONG' | 'SHORT' | null
+  level?: number | null
+  distance_pct?: number | null
+  price?: number
+  change_pct?: number
+  tdi?: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
+  text?: string
+  source?: string
+  error?: string
+}
+
+export interface RadarResponse {
+  generated_at: number
+  symbols: string[]
+  timeframes: string[]
+  grid: { symbol: string; cells: Record<string, RadarCell> }[]
+  actionable: ({ symbol: string; timeframe: string } & RadarCell)[]
+}
+
+export interface WinRateRow {
+  timeframe: string
+  label: string
+  bars?: number
+  source?: string
+  trades?: number
+  wins?: number
+  losses?: number
+  win_rate_pct?: number | null
+  profit_factor?: number | null
+  total_return_pct?: number
+  buy_hold_return_pct?: number
+  avg_win_pct?: number
+  avg_loss_pct?: number
+  max_drawdown_pct?: number
+  exposure_pct?: number
+  avg_bars_held?: number
+  error?: string
+}
+
+export interface WinRateReport {
+  symbol: string
+  days: number
+  strategy: string
+  params: Record<string, number | boolean>
+  generated_at: number
+  sources: string[]
+  is_real_data: boolean
+  rows: WinRateRow[]
+  summary: { timeframes_tested: number; trades: number; wins: number; losses: number; win_rate_pct: number | null; best_timeframe: string | null }
+  caveat: string
+}
+
 export interface Signal {
+  setup: Setup
   symbol: string
   timeframe: string
   timeframe_label: string
-  strategy: { id: string; name: string }
+  strategy: { id: string; name: string; uses_stops: boolean }
   params: Record<string, number | boolean>
   source: 'live' | 'cache' | 'demo'
   generated_at: number

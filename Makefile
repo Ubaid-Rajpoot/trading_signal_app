@@ -1,4 +1,4 @@
-.PHONY: install dev test api build run clean
+.PHONY: install dev test winrate api build run clean
 
 install:
 	python3 -m venv .venv
@@ -14,6 +14,9 @@ api:
 
 test:
 	./.venv/bin/python -m pytest backend/tests -q
+
+winrate:
+	./.venv/bin/python scripts/winrate.py --symbol BTCUSDT --days 30 --out docs/reports/winrate-btcusdt.md
 
 build:
 	./scripts/build.sh

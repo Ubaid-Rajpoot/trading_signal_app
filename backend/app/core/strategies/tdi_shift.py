@@ -44,6 +44,7 @@ class TdiShift(Strategy):
     market = "Crypto spot / perpetual"
     timeframe_hint = "15m"
     allows_short = True
+    uses_stops = False  # no SL/TP: exit only when the purple line crosses back
 
     params = [
         # ---- TDI settings (his exact settings as defaults) ------------------

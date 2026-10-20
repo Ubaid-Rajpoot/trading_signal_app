@@ -20,8 +20,10 @@ file, and everything else — charting, scanning, backtesting, alerting — reus
 
 | Area | Details |
 |---|---|
-| **Live dashboard** | Watchlist scanner, candlestick chart with strategy overlays and trigger markers, rule-by-rule breakdown, ATR-based trade plan |
-| **Signal engine** | Current state (flat / long / short), fresh-trigger detection, confidence score, setup readiness, "last trigger N bars ago" |
+| **Setup radar** | The main screen: a symbol × timeframe grid (1m / 3m / 5m / 15m / 30m) showing whether a setup is **triggered / armed / forming / absent** on each instrument right now |
+| **Chart view** | Candles with swing levels, the TDI sub-pane (purple RSI, base line, bands, HVB markers) and a rule-by-rule explanation of the current state |
+| **Win-rate study** | 30 days of history across the five scalping timeframes, with hit rate, profit factor, returns and drawdown per timeframe |
+| **Signal engine** | Setup state (triggered / armed / forming / idle), which swing level still has to break, how far price is from it, and the TDI values behind it |
 | **Backtester** | Next-bar fills, intrabar stop/target checks, fees + slippage, fixed-fractional risk, full trade log, equity curve vs buy & hold, Sharpe/Sortino/PF/expectancy |
 | **Alerts** | Background scanner persists each actionable signal once per bar, delivers to Telegram and/or a JSON webhook, logs every attempt |
 | **Persistence** | SQLite for settings, signal history and alert log — no external services |
@@ -82,6 +84,45 @@ Tests:
 ```
 
 ---
+
+## Setup radar & win-rate study
+
+**Setup radar** is where you look first. Each cell answers one question: is the
+setup building on this instrument and timeframe right now?
+
+| Status | Meaning |
+|---|---|
+| **SETUP** | HVB crossed the base line **and** the swing broke, on the same candle |
+| **ARMED** | The HVB printed, price still has to break a swing high/low |
+| **FORMING** | Price is near a swing level and/or the purple line is heading for the base line |
+| **—** | Nothing on this instrument right now |
+
+Click any cell to open that chart. The radar rescans every 60 seconds.
+
+**Win rate** runs the strategy over the last N days (default 30) on
+1m / 3m / 5m / 15m / 30m. There is **no stop loss and no take profit** — a trade
+opens on the setup and closes on the opposite TDI cross, which is how the setup
+is meant to be read.
+
+```bash
+# from the command line, real Binance data (needs internet)
+python scripts/winrate.py --symbol BTCUSDT --days 30
+
+# write a markdown report as well
+python scripts/winrate.py --symbol BTCUSDT --days 30 --out docs/reports/winrate-btcusdt.md
+
+# try different thresholds
+python scripts/winrate.py --symbol ETHUSDT --params '{"hvb_step": 2.0, "confluence_window": 1}'
+```
+
+Downloads are paged (a 30-day 1m window is 43,200 candles = 44 requests) and
+cached under `backend/data/cache/history/`, so the second run is instant and
+works offline.
+
+> **Data source matters.** Every report states where its candles came from
+> (`live`, `cache` or `demo`). If the exchange is unreachable the app falls back
+> to a deterministic demo feed; the report then says **DEMO DATA** in red,
+> because those numbers say nothing about the real market.
 
 ## How the signal engine works
 
@@ -221,6 +262,8 @@ Environment variables:
 | GET | `/api/meta` | Strategies (with parameter schema), timeframes, symbols, settings |
 | GET | `/api/signal` | Full signal for one symbol (`symbol`, `timeframe`, `strategy`, `params` JSON) |
 | GET | `/api/scan` | Watchlist scan, ranked by actionability |
+| GET | `/api/radar` | Symbol × timeframe setup grid (status, side, level to break, distance) |
+| GET | `/api/winrate` | 30-day win-rate study per timeframe (`days`, `timeframes`, `refresh`) |
 | POST | `/api/backtest` | Run a backtest |
 | GET | `/api/signals` | Stored signal history |
 | GET/PUT | `/api/settings` | Read/update settings |
@@ -240,36 +283,55 @@ curl -X POST http://localhost:8000/api/backtest \
 
 ## Project layout
 
+Everything lives in one place, nothing is loose in the root.
+
 ```
+README.md · Makefile · requirements*.txt · .gitignore
+docs/
+  README.md                 documentation index
+  strategy-spec.md          the strategy, rule by rule
+  reference/
+    README.md               what each reference file shows
+    charts/*.png            the trader's own charts (TDI, HVB, SHIFT)
+    book/*.pdf              the ICT/SMC book the concepts come from
+  reports/                  saved win-rate studies
+scripts/
+  dev.sh                    run API + UI together
+  build.sh                  build the UI into backend/static
+  winrate.py                30-day win-rate study from the CLI
 backend/
   app/
-    config.py               constants, timeframes, default symbols
+    config.py               timeframes (1m..1d), symbols, paths
     main.py                 FastAPI app + static hosting
     api/routes.py           HTTP endpoints
+    utils.py                JSON sanitising
     core/
-      indicators.py         pure-pandas TA library
-      data/providers.py     Binance → cache → demo provider chain
-      data/synthetic.py     deterministic demo candles
-      strategies/           ← YOUR STRATEGY LIVES HERE
-        base.py             Strategy/TriggerSet/Targets framework
-        donchian.py         default breakout strategy
-        ema_trend.py        EMA crossover strategy
-        custom.py           editable template
-      signals.py            signal engine (state, confidence, plan, chart payload)
-      backtest.py           event-driven backtester
+      indicators.py         pure-pandas TA including TDI
+      swings.py             swing pivots, SHIFT and MS detection
+      signals.py            signal + setup state
+      winrate.py            win-rate study
+      backtest.py           event-driven backtester (stops optional)
       backtest_service.py   data + strategy + backtest glue
       store.py              SQLite settings / signals / notifications
+      utils_paths.py        cache paths
+      strategies/
+        base.py             Strategy / TriggerSet / Targets framework
+        tdi_shift.py        the trader's system (default)
+        donchian.py · ema_trend.py · custom.py
+      data/
+        history.py          paged downloads + CSV cache
+        providers.py        live -> cache -> demo for the dashboard
+        synthetic.py        deterministic demo feed
       alerts/               notifier + background scanner
-    tests/                  30 tests incl. no-look-ahead checks
+    data/                   runtime DB + cache (gitignored)
+    tests/                  58 tests incl. no-look-ahead checks
 frontend/
   src/
     App.tsx                 shell, polling, tab routing
-    components/             SignalPanel, CandleChart, BacktestView, SettingsView…
+    components/             SetupRadar, WinRateView, SignalPanel, CandleChart,
+                            OscillatorChart, BacktestView, SettingsView ...
     styles.css              dark terminal theme (no UI framework)
-scripts/dev.sh · scripts/build.sh · Makefile
 ```
-
----
 
 ## Notes & limitations
 
@@ -278,8 +340,8 @@ scripts/dev.sh · scripts/build.sh · Makefile
   numbers are not the real market.
 * Signals are computed on candle close. Intraday alerts therefore arrive when a bar
   closes, not tick-by-tick.
-* Backtests use up to 1,000 candles per run (the exchange's per-request limit).
-  Deeper history needs paging — a good next addition.
+* The win-rate study uses paged downloads (30 days of 1m = 43,200 candles), so
+  long windows take a few seconds the first time and are cached afterwards.
 * This is a research and automation tool, **not financial advice**. Paper-trade a
   strategy before risking capital.
 

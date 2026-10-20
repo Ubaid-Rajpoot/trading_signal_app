@@ -1,8 +1,12 @@
 # Strategy Specification — TDIGM + Structural Shift (HVB)
 
-> **Status: CONFIRMED** (revised after your answers). Implemented in
-> `backend/app/core/strategies/tdi_shift.py`, selectable in the app as
-> **"TDI + Shift (HVB)"**. It runs side by side with the earlier strategies.
+> **Status: CONFIRMED.** Implemented in `backend/app/core/strategies/tdi_shift.py`,
+> selectable in the app as **"TDI + Shift (HVB)"** and used by the Setup radar and
+> the win-rate study. It runs side by side with the earlier strategies.
+>
+> **No stop loss, no take profit.** By design the app only reports *where* a
+> setup is forming; a position is exited when the purple line crosses back
+> through the base line.
 
 ---
 

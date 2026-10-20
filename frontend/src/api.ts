@@ -1,5 +1,7 @@
 import type {
   BacktestResult,
+  RadarResponse,
+  WinRateReport,
   Meta,
   NotificationRow,
   ScanResponse,
@@ -54,6 +56,10 @@ export const api = {
     ),
   backtest: (body: Record<string, unknown>) =>
     request<BacktestResult>('/backtest', { method: 'POST', body: JSON.stringify(body) }),
+  radar: (symbols: string[], timeframes: string[], strategy: string) =>
+    request<RadarResponse>(`/radar${qs({ symbols: symbols.join(','), timeframes: timeframes.join(','), strategy })}`),
+  winrate: (symbol: string, days: number, strategy: string, refresh = false) =>
+    request<WinRateReport>(`/winrate${qs({ symbol, days, strategy, refresh: refresh ? 'true' : undefined })}`),
   settings: () => request<Settings>('/settings'),
   saveSettings: (patch: Partial<Settings>) =>
     request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(patch) }),

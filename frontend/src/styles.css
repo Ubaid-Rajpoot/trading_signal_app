@@ -355,3 +355,20 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 }
 
 .footer { padding: 18px 22px 30px; color: var(--muted-2); font-size: 11.5px; text-align: center; }
+
+/* ------------------------------------------------------------- setup radar */
+.radar-table td { padding: 5px 8px; }
+.radar-table th { padding: 9px 8px; }
+.radar-cell {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  width: 100%; min-width: 78px; padding: 7px 6px;
+  border: 1px solid transparent; border-radius: 7px;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em;
+  cursor: pointer; transition: transform 0.08s ease, filter 0.15s ease;
+}
+.radar-cell:disabled { cursor: default; }
+.radar-cell:not(:disabled):hover { filter: brightness(1.12); transform: translateY(-1px); }
+.radar-status { white-space: nowrap; }
+.radar-dir { opacity: 0.85; }
+.radar-dist { font-weight: 500; opacity: 0.8; font-size: 10px; }
+.radar-legend { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }

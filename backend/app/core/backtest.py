@@ -31,6 +31,7 @@ class BacktestConfig:
     fee_bps: float = 5.0           # per side, 5 bps = 0.05%
     slippage_bps: float = 2.0      # per side
     leverage: float = 1.0          # max notional / equity
+    cash_fraction: float = 1.0     # notional per trade when no stop is used
     bars_per_year: float | None = None
 
 
@@ -59,7 +60,7 @@ class Trade:
             "entry_price": round(self.entry_price, 6),
             "exit_price": round(self.exit_price, 6),
             "qty": round(self.qty, 8),
-            "stop": round(self.stop, 6),
+            "stop": round(self.stop, 6) if self.stop == self.stop else None,
             "target": round(self.target, 6) if self.target is not None else None,
             "pnl": round(self.pnl, 2),
             "pnl_pct": round(self.pnl_pct, 3),
@@ -137,6 +138,7 @@ def run_backtest(
     params: dict[str, Any],
     config: BacktestConfig | None = None,
     timeframe_seconds: int = 3600,
+    include_curve: bool = True,
 ) -> BacktestResult:
     cfg = config or BacktestConfig()
     result = BacktestResult()
@@ -152,6 +154,7 @@ def run_backtest(
     c = prepared["close"].to_numpy(dtype=float)
     atr = prepared["atr"].to_numpy(dtype=float) if "atr" in prepared else np.full(n, np.nan)
 
+    use_stops = bool(getattr(strategy, "uses_stops", True))
     long_entry = triggers.long_entry.to_numpy()
     long_exit = triggers.long_exit.to_numpy()
     short_entry = triggers.short_entry.to_numpy()
@@ -175,7 +178,7 @@ def run_backtest(
         pnl -= abs(fill * position.qty) * fee
         equity += pnl
         risk_amount = abs(position.entry_price - position.stop) * position.qty
-        r_mult = pnl / risk_amount if risk_amount > 0 else 0.0
+        r_mult = pnl / risk_amount if risk_amount > 0 else pnl / max(position.equity_before, 1e-9) * 100
         result.trades.append(
             Trade(
                 side=position.side,
@@ -203,7 +206,32 @@ def run_backtest(
             a = atr[i - 1] if np.isfinite(atr[i - 1]) else c[i - 1] * 0.005
             mult = float(params.get("atr_mult", 2.0))
             stop_distance = a * mult
-            if stop_distance <= 0 or price <= 0:
+            if price <= 0:
+                pending = None
+            elif not use_stops:
+                # Setup mode: no stop/target, size with a fixed cash fraction and
+                # rely on the strategy's own exit trigger.
+                notional = equity * min(max(cfg.cash_fraction, 0.01), max(cfg.leverage, 1.0))
+                qty = notional / price
+                if qty <= 0:
+                    pending = None
+                else:
+                    side = pending
+                    equity_before = equity
+                    equity -= abs(price * qty) * fee
+                    position = OpenPosition(
+                        side=side,
+                        entry_index=i,
+                        entry_time=int(t[i]),
+                        entry_price=price,
+                        qty=qty,
+                        stop=float("nan"),
+                        target=None,
+                        risk_per_unit=float("nan"),
+                        equity_before=equity_before,
+                    )
+                    pending = None
+            elif stop_distance <= 0:
                 pending = None
             else:
                 risk_amount = equity * risk_frac
@@ -236,10 +264,13 @@ def run_backtest(
         if position is not None:
             bars_in_market += 1
             side = position.side
-            hit_stop = lo[i] <= position.stop if side == "LONG" else h[i] >= position.stop
-            hit_target = position.target is not None and (
-                h[i] >= position.target if side == "LONG" else lo[i] <= position.target
-            )
+            if use_stops:
+                hit_stop = lo[i] <= position.stop if side == "LONG" else h[i] >= position.stop
+                hit_target = position.target is not None and (
+                    h[i] >= position.target if side == "LONG" else lo[i] <= position.target
+                )
+            else:
+                hit_stop = hit_target = False
             if hit_stop:
                 close_position(i, position.stop, "stop")
             elif hit_target:
@@ -267,11 +298,12 @@ def run_backtest(
     equity_series[0] = cfg.initial_equity
     valid = ~np.isnan(equity_series)
 
-    result.equity_curve = [
-        {"time": int(t[i]), "equity": round(float(equity_series[i]), 2), "price": round(float(c[i]), 6)}
-        for i in range(n)
-        if valid[i]
-    ]
+    if include_curve:
+        result.equity_curve = [
+            {"time": int(t[i]), "equity": round(float(equity_series[i]), 2), "price": round(float(c[i]), 6)}
+            for i in range(n)
+            if valid[i]
+        ]
 
     # ------------------------------------------------------------- metrics
     trades = result.trades

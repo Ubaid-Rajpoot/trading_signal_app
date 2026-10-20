@@ -100,6 +100,9 @@ class Strategy:
     market: str = "Crypto spot / perpetual"
     timeframe_hint: str = "1h"
     allows_short: bool = True
+    # False = no stop loss / take profit at all; the strategy's own exit trigger
+    # is the only way out (used by the TDI + shift setup system).
+    uses_stops: bool = True
     params: list[ParamSpec] = []
     plot_lines: list[dict[str, str]] = []  # {column, label, colour}
     pane: dict[str, Any] | None = None  # optional oscillator sub-chart (e.g. TDI)
@@ -141,6 +144,7 @@ class Strategy:
             "market": cls.market,
             "timeframe_hint": cls.timeframe_hint,
             "allows_short": cls.allows_short,
+            "uses_stops": cls.uses_stops,
             "params": [
                 {
                     "key": p.key,

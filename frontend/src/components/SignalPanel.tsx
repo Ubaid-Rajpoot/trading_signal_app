@@ -1,12 +1,18 @@
 import type { Signal } from '../types'
 import { ActionChip, fmtPct, fmtPrice, fmtTime, Ring, actionTone } from './ui'
 
+const STATUS_STYLE: Record<string, { bg: string; colour: string; label: string }> = {
+  TRIGGERED: { bg: 'linear-gradient(180deg, #3ee3b1, #21b98a)', colour: '#04140f', label: 'SETUP CONFIRMED' },
+  ARMED: { bg: 'linear-gradient(180deg, #ffcf6b, #f5b544)', colour: '#241a02', label: 'ARMED' },
+  FORMING: { bg: 'rgba(56,189,248,0.16)', colour: '#8fb7ff', label: 'FORMING' },
+  IDLE: { bg: 'rgba(255,255,255,0.04)', colour: 'var(--muted)', label: 'NO SETUP' },
+}
+
 export default function SignalPanel({ signal }: { signal: Signal }) {
-  const { plan, state } = signal
+  const { setup, plan, state } = signal
   const tone = actionTone(signal.action)
-  const direction = plan.side
-  const isLong = direction === 'LONG'
-  const price = signal.price
+  const style = STATUS_STYLE[setup.status] ?? STATUS_STYLE.IDLE
+  const tdi = setup.tdi
 
   return (
     <section className={`panel signal-card ${tone === 'sell' ? 'sell' : ''}`}>
@@ -20,28 +26,40 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
               {signal.source === 'live' ? 'Live' : signal.source === 'cache' ? 'Cached' : 'Demo'}
             </span>
           </div>
-          <div className="signal-price">{fmtPrice(price)}</div>
+          <div className="signal-price">{fmtPrice(signal.price)}</div>
           <div className={`mono small ${signal.change_pct >= 0 ? 'pos' : 'neg'}`}>{fmtPct(signal.change_pct)} last bar</div>
         </div>
 
         <div className="signal-action">
-          <span className={`action-badge ${tone}`}>{signal.action}</span>
+          <span className="action-badge" style={{ background: style.bg, color: style.colour, borderColor: 'transparent' }}>
+            {style.label}
+          </span>
           <span className="tiny muted mono">{fmtTime(signal.bar_time)}</span>
         </div>
       </div>
 
-      <div className="muted small" style={{ marginTop: 10 }}>{signal.action_reason}</div>
+      <div className="muted small" style={{ marginTop: 12 }}>{setup.text}</div>
 
       <div className="ring-wrap">
-        <Ring value={signal.confidence} label={signal.confidence_label} tone={signal.bias === 'SHORT' ? 'var(--red)' : 'var(--green)'} />
+        <Ring
+          value={signal.confidence}
+          label={signal.confidence_label}
+          tone={setup.direction === 'SHORT' ? 'var(--red)' : 'var(--green)'}
+        />
         <div style={{ flex: 1 }}>
           <div className="hstack" style={{ gap: 8 }}>
-            <span className="chip-item" style={{ fontSize: 11.5 }}>
-              <span className="muted">Bias</span>
-              <strong style={{ color: signal.bias === 'LONG' ? 'var(--green)' : signal.bias === 'SHORT' ? 'var(--red)' : 'var(--muted)' }}>
-                {signal.bias}
-              </strong>
-            </span>
+            {setup.direction && (
+              <span className="chip-item" style={{ fontSize: 11.5 }}>
+                <span className="muted">Side</span>
+                <strong style={{ color: setup.direction === 'LONG' ? 'var(--green)' : 'var(--red)' }}>{setup.direction}</strong>
+              </span>
+            )}
+            {setup.hvb_bars_ago != null && (
+              <span className="chip-item" style={{ fontSize: 11.5 }}>
+                <span className="muted">HVB</span>
+                <strong className="mono">{setup.hvb_bars_ago === 0 ? 'this bar' : `${setup.hvb_bars_ago} bars ago`}</strong>
+              </span>
+            )}
             {state.position !== 'FLAT' && (
               <span className="chip-item" style={{ fontSize: 11.5 }}>
                 <span className="muted">Open</span>
@@ -59,39 +77,64 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
         </div>
       </div>
 
+      {/* Setup levels - the only "plan" this system needs */}
       <div style={{ marginTop: 18 }}>
-        <div className="hstack" style={{ marginBottom: 8 }}>
-          <span className="tiny muted" style={{ textTransform: 'uppercase', letterSpacing: '0.09em', fontWeight: 600 }}>
-            Trade plan · {direction}
-          </span>
-          <span className="pill-tag">{plan.is_live ? 'Live' : 'Illustrative'}</span>
+        <div className="tiny muted" style={{ textTransform: 'uppercase', letterSpacing: '0.09em', fontWeight: 600, marginBottom: 8 }}>
+          Structure
         </div>
         <div className="plan-grid">
           <div className="plan-box">
-            <div className="k">Entry</div>
-            <div className="v">{fmtPrice(plan.entry)}</div>
+            <div className="k">Level to break</div>
+            <div className="v">{fmtPrice(setup.level)}</div>
+            <div className="tiny muted mono">{setup.level ? (setup.direction === 'LONG' ? 'swing high above' : 'swing low below') : 'no clean level'}</div>
           </div>
           <div className="plan-box">
-            <div className="k">Stop loss</div>
-            <div className="v neg">{fmtPrice(plan.stop)}</div>
-            <div className="tiny muted mono">{plan.risk_pct != null ? `${plan.risk_pct.toFixed(2)}% risk` : ''}</div>
+            <div className="k">Distance</div>
+            <div className="v">{setup.distance_pct != null ? fmtPct(setup.distance_pct) : '—'}</div>
+            <div className="tiny muted">price → level</div>
           </div>
-          {plan.take_profits.slice(0, 3).map((tp, i) => (
-            <div className="plan-box" key={i}>
-              <div className="k">Target {i + 1} {plan.risk_reward[i] != null ? `· ${plan.risk_reward[i]}R` : ''}</div>
-              <div className="v pos">{fmtPrice(tp)}</div>
-            </div>
-          ))}
+          {tdi && (
+            <>
+              <div className="plan-box">
+                <div className="k">Purple (RSI)</div>
+                <div className="v">{tdi.purple?.toFixed(2) ?? '—'}</div>
+                <div className="tiny muted">{tdi.side ? `${tdi.side} the base line` : ''}</div>
+              </div>
+              <div className="plan-box">
+                <div className="k">Middle band</div>
+                <div className="v">{tdi.base?.toFixed(2) ?? '—'}</div>
+                <div className="tiny muted">
+                  {tdi.purple != null && tdi.base != null ? `gap ${Math.abs(tdi.purple - tdi.base).toFixed(2)} pts` : ''}
+                </div>
+              </div>
+            </>
+          )}
         </div>
-        {!plan.is_live && <div className="tiny muted" style={{ marginTop: 8 }}>{plan.note}</div>}
-
-        {signal.last_trigger && (
-          <div className="info-box" style={{ marginTop: 12 }}>
-            Last {signal.last_trigger.side.toLowerCase()} trigger {signal.last_trigger.bars_ago === 0 ? 'on the latest bar' : `${signal.last_trigger.bars_ago} bars ago`} at{' '}
-            <span className="mono">{fmtPrice(signal.last_trigger.price)}</span> · {fmtTime(signal.last_trigger.time)}
-          </div>
-        )}
       </div>
+
+      {/* Only strategies that actually use a stop show one */}
+      {signal.strategy.uses_stops && plan?.entry != null && (
+        <div style={{ marginTop: 16 }}>
+          <div className="hstack" style={{ marginBottom: 8 }}>
+            <span className="tiny muted" style={{ textTransform: 'uppercase', letterSpacing: '0.09em', fontWeight: 600 }}>
+              Risk model · {plan.side}
+            </span>
+            <span className="pill-tag">{plan.is_live ? 'Live' : 'Illustrative'}</span>
+          </div>
+          <div className="plan-grid">
+            <div className="plan-box">
+              <div className="k">Stop</div>
+              <div className="v neg">{fmtPrice(plan.stop)}</div>
+            </div>
+            {plan.take_profits.slice(0, 2).map((tp, i) => (
+              <div className="plan-box" key={i}>
+                <div className="k">Target {i + 1}</div>
+                <div className="v pos">{fmtPrice(tp)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div style={{ marginTop: 16 }}>
         <div className="tiny muted" style={{ textTransform: 'uppercase', letterSpacing: '0.09em', fontWeight: 600, marginBottom: 4 }}>
@@ -113,9 +156,7 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
       <div className="hstack" style={{ marginTop: 14, gap: 14 }}>
         <span className="tiny muted">Strategy · <strong style={{ color: 'var(--text)' }}>{signal.strategy.name}</strong></span>
         <span className="tiny muted">Position · <strong style={{ color: 'var(--text)' }}>{state.position}</strong></span>
-        {state.entry_price != null && (
-          <span className="tiny muted">Avg entry · <strong className="mono" style={{ color: 'var(--text)' }}>{fmtPrice(state.entry_price)}</strong></span>
-        )}
+        <ActionChip action={signal.action} />
       </div>
     </section>
   )
