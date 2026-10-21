@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TDIGM · break + HVB scanner</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-2: #171d2b;
+    --line: #222b3d;
+    --text: #e6edf7;
+    --muted: #8b97ad;
+    --green: #2ee6a8;
+    --red: #ff5c7a;
+    --amber: #ffb347;
+    --blue: #63a8ff;
+    --purple: #b487ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: radial-gradient(1200px 600px at 20% -10%, #16203a 0%, var(--bg) 55%);
+    color: var(--text); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 22px 20px 60px; }
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .2px; }
+  h1 span { color: var(--muted); font-weight: 500; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel); font-size: 12px; font-weight: 700;
+    letter-spacing: .08em; text-transform: uppercase;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .badge.live { color: var(--green); border-color: #1d5c47; }
+  .badge.live .dot { background: var(--green); box-shadow: 0 0 0 0 rgba(46,230,168,.6); animation: pulse 1.8s infinite; }
+  .badge.replay { color: var(--amber); border-color: #6b4c1c; }
+  .badge.replay .dot { background: var(--amber); }
+  .badge.down { color: var(--red); border-color: #6b2233; }
+  .badge.down .dot { background: var(--red); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(46,230,168,.55);} 70% { box-shadow: 0 0 0 9px rgba(46,230,168,0);} 100% { box-shadow: 0 0 0 0 rgba(46,230,168,0);} }
+  .spacer { flex: 1; }
+  .meta { color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .meta b { color: var(--text); font-weight: 600; }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(300px, 1fr); gap: 16px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .card h2 { margin: 0; padding: 13px 16px; font-size: 13px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px;}
+  .card h2 .count { color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 10px; text-align: center; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; font-size: 11px; }
+  td.sym, th.sym { text-align: left; font-weight: 700; letter-spacing: .02em; }
+  tr:last-child td { border-bottom: none; }
+  .cell { border-radius: 9px; padding: 7px 6px; background: var(--panel-2); border: 1px solid transparent; min-width: 86px; }
+  .cell .price { display: block; font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--muted); }
+  .cell .tags { display: flex; gap: 3px; justify-content: center; margin-top: 3px; font-size: 11px; }
+  .t { border-radius: 6px; padding: 1px 5px; font-weight: 700; }
+  .t.up { color: var(--green); background: rgba(46,230,168,.12); }
+  .t.down { color: var(--red); background: rgba(255,92,122,.12); }
+  .t.hvb { color: var(--purple); background: rgba(180,135,255,.14); }
+  .t.hot { color: #0b0e14; background: var(--amber); }
+  .cell.signal-up { border-color: #1d7a5c; box-shadow: inset 0 0 22px rgba(46,230,168,.13); }
+  .cell.signal-down { border-color: #7a2438; box-shadow: inset 0 0 22px rgba(255,92,122,.13); }
+  .cell.warming { opacity: .55; }
+  .forming { color: var(--blue); }
+
+  .alerts { max-height: 520px; overflow: auto; }
+  .alert { display: flex; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); align-items: flex-start; }
+  .alert:last-child { border-bottom: none; }
+  .alert.new { animation: flash 1.4s ease-out; }
+  @keyframes flash { from { background: rgba(255,179,71,.18);} to { background: transparent;} }
+  .pill { font-size: 10.5px; font-weight: 800; letter-spacing: .07em; padding: 3px 7px; border-radius: 6px; margin-top: 1px; }
+  .pill.LONG { color: var(--green); background: rgba(46,230,168,.13); }
+  .pill.SHORT { color: var(--red); background: rgba(255,92,122,.13); }
+  .a-main { flex: 1; }
+  .a-title { font-weight: 700; font-size: 13px; }
+  .a-sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .empty { padding: 26px 16px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  footer { margin-top: 16px; color: var(--muted); font-size: 11.5px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+  footer code { color: var(--text); background: var(--panel); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; }
+  .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>TDIGM <span>· high/low break + HVB</span></h1>
+    <span class="badge" id="source"><span class="dot"></span><span id="source-text">connecting</span></span>
+    <div class="spacer"></div>
+    <div class="meta">
+      <span>symbols <b id="symbol-count">–</b></span>
+      <span>candles <b id="candles-seen">–</b></span>
+      <span>uptime <b id="uptime">–</b></span>
+      <span>server <b id="feed-status">–</b></span>
+      <span>last candle <b id="last-candle">–</b></span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Live matrix <span class="count" id="warm-count">–</span></h2>
+      <div style="overflow:auto">
+        <table id="matrix">
+          <thead><tr><th class="sym">instrument</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Alerts <span class="count" id="alert-count">0</span></h2>
+      <div class="alerts" id="alerts"><div class="empty">Waiting for a candle to close…</div></div>
+    </section>
+  </div>
+
+  <footer>
+    <span>TDIGM <code id="tdi-settings">–</code></span>
+    <span>break = close beyond the last <code id="lookback">–</code> highs/lows</span>
+    <span>HVB = purple line crosses the centre band</span>
+    <label class="toggle"><input type="checkbox" id="sound" /> sound</label>
+    <label class="toggle"><input type="checkbox" id="signals-only" /> show only break + HVB (hide the partials)</label>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+let lastAlertKey = null;
+let ws = null;
+let retry = 0;
+
+function fmt(n, digits = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '–';
+  if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+  if (Math.abs(n) >= 1) return n.toFixed(digits);
+  return n.toPrecision(4);
+}
+function hhmmss(ms) {
+  if (!ms) return '–';
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function duration(sec) {
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
+function setSource(isReplay, connected) {
+  const el = $('source');
+  el.className = 'badge ' + (connected ? (isReplay ? 'replay' : 'live') : 'down');
+  $('source-text').textContent = connected ? (isReplay ? 'replay · real recorded data' : 'live · streaming') : 'disconnected';
+}
+
+function renderHeader(s) {
+  $('symbol-count').textContent = s.symbols.length;
+  const age = s.last_candle_age;
+  const stale = age > 150;
+  $('last-candle').innerHTML = `<span style="color:${stale ? 'var(--red)' : 'var(--green)'}">${stale ? 'stale ' : ''}${age}s ago</span>`;
+  $('candles-seen').textContent = s.candles_seen.toLocaleString();
+  $('uptime').textContent = duration(s.uptime);
+  $('warm-count').textContent = `${s.cells.filter(c => c.warm).length}/${s.cells.length} warm`;
+  const tdi = s.settings;
+  $('tdi-settings').textContent = `RSI ${tdi.rsi_period} · band ${tdi.band_period} · fast ${tdi.fast_period} · slow ${tdi.slow_period}`;
+  $('lookback').textContent = s.break_lookback;
+}
+
+function cellHtml(cell) {
+  if (!cell.warm) {
+    return `<div class="cell warming"><span class="price">warming ${cell.bars}</span></div>`;
+  }
+  const p = cell.preview || {};
+  const hvb = p.hvb || cell.hvb;
+  const brk = p.break || cell.break;
+  const aligned = (hvb === 'up' && brk === 'high') || (hvb === 'down' && brk === 'low');
+  const cls = aligned ? (hvb === 'up' ? 'signal-up' : 'signal-down') : '';
+  const tags = [];
+  if (aligned) tags.push('<span class="t hot">SETUP</span>');
+  if (brk === 'high') tags.push('<span class="t up">▲ break</span>');
+  if (brk === 'low') tags.push('<span class="t down">▼ break</span>');
+  if (hvb === 'up') tags.push('<span class="t hvb">⚡ HVB ↑</span>');
+  if (hvb === 'down') tags.push('<span class="t hvb">⚡ HVB ↓</span>');
+  if (!tags.length) tags.push('<span class="t" style="color:var(--muted)">–</span>');
+  const live = p.hvb || p.break ? ' <span class="forming" title="still forming">•</span>' : '';
+  return `<div class="cell ${cls}"><span class="price">${fmt(cell.price)}${live}</span><div class="tags">${tags.join('')}</div></div>`;
+}
+
+function renderMatrix(s) {
+  const table = $('matrix');
+  const head = `<thead><tr><th class="sym">instrument</th>${s.timeframes.map(tf => `<th>${tf}</th>`).join('')}</tr></thead>`;
+  const bySymbol = {};
+  for (const cell of s.cells) (bySymbol[cell.symbol] ||= {})[cell.timeframe] = cell;
+  const rows = s.symbols.map(sym => {
+    const cells = s.timeframes.map(tf => `<td>${cellHtml(bySymbol[sym]?.[tf] || { warm: false, bars: 0 })}</td>`).join('');
+    return `<tr><td class="sym">${sym.replace('USDT', '<span style="color:var(--muted)">/USDT</span>')}</td>${cells}</tr>`;
+  }).join('');
+  table.innerHTML = head + `<tbody>${rows}</tbody>`;
+}
+
+function renderAlert(a, isNew) {
+  const dir = a.side === 'LONG' ? 'LONG' : 'SHORT';
+  const cond = a.kind === 'signal'
+    ? 'high/low break + HVB on the same candle'
+    : a.kind === 'hvb' ? 'HVB only (no break)' : 'break only (no HVB)';
+  return `<div class="alert ${isNew ? 'new' : ''}">
+    <span class="pill ${dir}">${dir}</span>
+    <div class="a-main">
+      <div class="a-title">${a.symbol} · ${a.timeframe} · ${cond}</div>
+      <div class="a-sub">${hhmmss(a.time)} · price ${fmt(a.price)} · fast ${fmt(a.fast)} / base ${fmt(a.mbl)}
+        ${a.hvb ? `· HVB ${a.hvb}` : ''}${a.break ? ` · ${a.break} break` : ''}</div>
+    </div>
+  </div>`;
+}
+
+function renderAlerts(list) {
+  const onlySignals = $('signals-only').checked;
+  const shown = onlySignals ? list.filter(a => a.kind === 'signal') : list;
+  $('alert-count').textContent = shown.length;
+  const box = $('alerts');
+  if (!shown.length) {
+    box.innerHTML = `<div class="empty">${onlySignals ? 'No break + HVB confluence yet. Untick “both-conditions” to see partials.' : 'Waiting for a candle to close…'}</div>`;
+    return;
+  }
+  box.innerHTML = shown.map((a, i) => renderAlert(a, i === 0 && a.time !== lastAlertKey)).join('');
+  lastAlertKey = shown[0].time;
+}
+
+function applyState(s) {
+  state = s;
+  renderHeader(s);
+  renderMatrix(s);
+  renderAlerts(s.alerts);
+  setSource(s.source === 'replay', true);
+}
+
+function beep() {
+  if (!$('sound').checked) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = 880; osc.type = 'sine';
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+    osc.start(); osc.stop(ctx.currentTime + 0.36);
+  } catch (e) { /* audio blocked until user interaction - fine */ }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { retry = 0; setSource(state?.source === 'replay', true); ws.send('ping'); };
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'state') applyState(msg);
+    else if (msg.type === 'alert') {
+      const a = msg.alert;
+      state.alerts.unshift(a);
+      renderAlerts(state.alerts);
+      if (a.kind === 'signal') beep();
+    } else if (msg.type === 'log') {
+      $('feed-status').textContent = msg.message;
+    }
+  };
+  ws.onclose = () => {
+    setSource(state?.source === 'replay', false);
+    retry += 1;
+    setTimeout(connect, Math.min(8000, 500 * retry));
+  };
+}
+
+$('signals-only').addEventListener('change', () => state && renderAlerts(state.alerts));
+connect();
+setInterval(() => { if (ws && ws.readyState === 1) ws.send('ping'); }, 20000);
+</script>
+</body>
+</html>

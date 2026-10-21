@@ -113,6 +113,14 @@ the finding that 1m is unprofitable.
 or `--binance-vision` / `--mirror`. The chart tab has a **rewind** box to replay
 any moment of that real history. This checkout ships BTCUSDT 1m for Jan–Jun 2025.
 
+## Live break + HVB bot (separate, standalone)
+
+`tdigm-live/` is a small standalone scanner for the trader's TDIGM setting
+(50, 50, 1, 9): it streams Binance klines, builds every timeframe, and alerts when
+a candle closes beyond the last 20 highs/lows **and** the purple line crosses the
+centre band on that same candle. It has no other purpose, no backtest and no
+orders. See [`tdigm-live/README.md`](tdigm-live/README.md).
+
 ## Scan the market
 
 ```bash
