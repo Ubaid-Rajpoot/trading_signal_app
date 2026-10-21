@@ -86,7 +86,15 @@ Tests:
 
 ---
 
-## The trader's system — v4
+## The trader's system — v5
+
+`tdi_shift_v5` adds the risk model from the trader's drawing: stop beyond the
+sweep/box high (shorts) or low (longs), target at the far side of the box (the
+previous low/high), entry on the pullback into the premium. Measured on six
+months of real BTCUSDT: `docs/reports/v5-real-btcusdt.md` — profitable on 1h,
+marginal on 5m, losing on 15m/30m, with the stop-vs-no-stop comparison.
+
+## v4 (kept, no stop)
 
 `tdi_shift_v4` is the current default: HVB (aggressive centre-band break, no
 volume requirement) on the same candle as a swing break, in the direction of the

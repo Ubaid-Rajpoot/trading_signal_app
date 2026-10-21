@@ -75,7 +75,7 @@ def test_winrate_is_cached(monkeypatch):
 
 
 def test_strategy_without_stops_never_exits_on_a_stop(candles):
-    strategy = get_strategy("tdi_shift")
+    strategy = get_strategy("tdi_shift_v4")
     params = strategy.resolve_params({"confluence_window": 3, "hvb_step": 1.0})
     prepared = strategy.prepare(candles, params)
     triggers = strategy.rules(prepared, params)

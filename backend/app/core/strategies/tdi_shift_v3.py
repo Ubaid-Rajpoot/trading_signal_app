@@ -63,8 +63,17 @@ class TdiShiftV3(TdiShift):
 
     @classmethod
     def resolve_params(cls, overrides: dict[str, Any] | None) -> dict[str, Any]:
+        """Defaults relaxations accumulate down the version chain.
+
+        Each version only declares what *it* changes (``_OVERRIDES``), and the
+        whole chain is applied oldest-first. Without this a newer version would
+        silently drop an older version's relaxation (v5 lost v4's HVB changes).
+        """
         resolved = super().resolve_params(overrides)
-        for key, value in cls._OVERRIDES.items():
+        merged: dict[str, Any] = {}
+        for klass in reversed(cls.__mro__):
+            merged.update(getattr(klass, "_OVERRIDES", None) or {})
+        for key, value in merged.items():
             if not overrides or key not in overrides:
                 resolved[key] = value
         return resolved

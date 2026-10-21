@@ -156,6 +156,7 @@ def run_backtest(
 
     use_stops = bool(getattr(strategy, "uses_stops", True))
     level_columns = getattr(strategy, "level_columns", None)
+    stop_columns = getattr(strategy, "stop_columns", None)
     max_bars = int(params.get("max_bars", 0) or 0)
     long_entry = triggers.long_entry.to_numpy()
     long_exit = triggers.long_exit.to_numpy()
@@ -245,9 +246,23 @@ def run_backtest(
                         equity_before=equity_before,
                     )
                     pending = None
-            elif stop_distance <= 0:
-                pending = None
             else:
+                # A strategy may name its own invalidation level (the swing the
+                # setup broke). That is a real structural stop, not an ATR guess.
+                structural = None
+                if stop_columns:
+                    column = stop_columns[0] if pending == "LONG" else stop_columns[1]
+                    if column in prepared.columns:
+                        value = prepared[column].iloc[i - 1]
+                        if np.isfinite(value) and (
+                            (pending == "LONG" and value < price) or (pending == "SHORT" and value > price)
+                        ):
+                            structural = float(value)
+                if structural is not None:
+                    stop_distance = abs(price - structural)
+                if stop_distance <= 0:
+                    pending = None
+                    continue
                 risk_amount = equity * risk_frac
                 qty = risk_amount / stop_distance
                 max_notional = equity * max(cfg.leverage, 1.0)
@@ -256,9 +271,22 @@ def run_backtest(
                     pending = None
                 else:
                     side = pending
-                    stop = price - stop_distance if side == "LONG" else price + stop_distance
-                    rr = float(params.get("target_r", 2.0))
-                    target = price + rr * stop_distance if side == "LONG" else price - rr * stop_distance
+                    if structural is not None:
+                        stop = structural
+                    else:
+                        stop = price - stop_distance if side == "LONG" else price + stop_distance
+                    target = None
+                    if level_columns:
+                        column = level_columns[0] if side == "LONG" else level_columns[1]
+                        if column in prepared.columns:
+                            value = prepared[column].iloc[i - 1]
+                            if np.isfinite(value) and (
+                                (side == "LONG" and value > price) or (side == "SHORT" and value < price)
+                            ):
+                                target = float(value)
+                    if target is None:
+                        rr = float(params.get("target_r", 2.0))
+                        target = price + rr * stop_distance if side == "LONG" else price - rr * stop_distance
                     equity_before = equity
                     equity -= abs(price * qty) * fee
                     position = OpenPosition(

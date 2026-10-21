@@ -33,9 +33,9 @@ def prepared():
 
 
 # --------------------------------------------------------------- defaults
-def test_v4_is_the_default_and_v3_is_untouched():
-    assert DEFAULT_STRATEGY == "tdi_shift_v4"
-    assert get_strategy("tdi_shift").id == "tdi_shift_v4"
+def test_v4_still_exists_and_the_alias_points_at_the_newest():
+    assert get_strategy("tdi_shift").id == DEFAULT_STRATEGY
+    assert get_strategy("tdi_shift_v4").id == "tdi_shift_v4"
     assert get_strategy("tdi_shift_v3").id == "tdi_shift_v3"
 
 

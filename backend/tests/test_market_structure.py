@@ -111,11 +111,12 @@ def test_old_id_resolves_to_the_latest_version():
     from app.core.strategies import DEFAULT_STRATEGY
 
     assert get_strategy("tdi_shift").id == DEFAULT_STRATEGY
-    assert DEFAULT_STRATEGY == "tdi_shift_v4"
+    assert DEFAULT_STRATEGY == "tdi_shift_v5"
     # pinned versions never move
     assert get_strategy("tdi_shift_v1").id == "tdi_shift_v1"
     assert get_strategy("tdi_shift_v2").id == "tdi_shift_v2"
     assert get_strategy("tdi_shift_v3").id == "tdi_shift_v3"
+    assert get_strategy("tdi_shift_v4").id == "tdi_shift_v4"
 
 
 def test_v1_behaviour_is_unchanged(v1):

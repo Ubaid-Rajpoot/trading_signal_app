@@ -168,3 +168,20 @@ Trend and range filters stay: the trade must agree with the external trend, and 
 ranging market still produces nothing.
 
 Measured on real BTCUSDT, Jan–Jun 2025: `docs/reports/v4-real-btcusdt.md`.
+
+## v5 — 5.0 (current)
+
+The trader's drawing, encoded:
+
+* **Box**: the high/low of the last `range_len` (60) bars.
+* **Setup**: v4's rule (HVB + same-candle structure break, with the trend).
+* **Entry**: the pullback into the premium of the box (`premium_level` 0.9) within
+  `retest_window` bars of the setup — not the break candle itself.
+* **Stop**: beyond the sweep high / box high (+0.15 ATR). This is the red box in
+  the drawing.
+* **Target**: the far side of the box, i.e. the previous low/high — the dashed
+  line. Typically 5.5 : 1.
+* **Filter**: `min_rr` 0.5 (skip trades whose target is closer than half the risk).
+
+Measured on real BTCUSDT: 1h profitable (+15.4%, PF 3.9), 5m marginal, 15m/30m
+losing. Full write-up: `docs/reports/v5-real-btcusdt.md`.

@@ -95,7 +95,15 @@ def test_minor_breaks_are_more_frequent_than_major(prepared):
     assert shifts >= ms
 
 
-def test_entries_require_same_candle_confluence(strategy, params, prepared):
+def test_entries_require_same_candle_confluence(prepared):
+    """The core rule (HVB + structure break on the same candle) is v4's entry.
+
+    v5 keeps that rule as its *setup* but enters on the pullback into the box, so
+    the same-candle assertion belongs to the pinned break-entry version.
+    """
+    strategy = get_strategy("tdi_shift_v4")
+    params = strategy.resolve_params({})
+    prepared = strategy.prepare(prepared, params)
     triggers = strategy.rules(prepared, params)
     both = prepared["hvb_up"] | prepared["hvb_down"]
     structure = prepared["shift_up"] | prepared["shift_down"] | prepared["ms_up"] | prepared["ms_down"]
@@ -117,7 +125,9 @@ def test_hvb_rejects_slow_crawls(prepared):
     assert not (prepared.loc[slow, "hvb_up"]).any()
 
 
-def test_long_and_short_directions_are_mirrored(strategy, params):
+def test_long_and_short_directions_are_mirrored():
+    """Mirror check on the break-entry rule (v4), where entries are the break bar."""
+    strategy = get_strategy("tdi_shift_v4")
     relaxed = strategy.resolve_params(
         {"hvb_step": 0.5, "hvb_margin": 0.0, "confluence_window": 3}
     )
@@ -133,15 +143,13 @@ def test_long_and_short_directions_are_mirrored(strategy, params):
 
 
 def test_no_stop_loss(strategy, params, prepared):
-    """There is no stop loss. The only level is the exit target (next swing)."""
+    """v1 has no stop loss; the newest version does (that is tested separately)."""
+    if getattr(strategy, "stop_columns", None):
+        pytest.skip("this version defines a structural stop")
     assert strategy.uses_stops is False
     for side in ("LONG", "SHORT"):
         targets = strategy.targets(prepared, params, side)
         assert targets.stop is None
-    signal = build_signal("BTCUSDT", "15m", "tdi_shift", limit=600)
-    plan = signal["plan"]
-    assert plan["stop"] is None
-    assert signal["strategy"]["uses_stops"] is False
 
 
 def test_signal_payload_carries_the_tdi_pane():
@@ -163,7 +171,7 @@ def test_strategy_is_registered_and_default():
 
     ids = [s["id"] for s in list_strategies()]
     # Every published version stays available, newest is the default.
-    assert {"tdi_shift_v1", "tdi_shift_v2", "tdi_shift_v3", "tdi_shift_v4"}.issubset(set(ids))
-    assert DEFAULT_STRATEGY == "tdi_shift_v4"
+    assert {"tdi_shift_v1", "tdi_shift_v2", "tdi_shift_v3", "tdi_shift_v4", "tdi_shift_v5"}.issubset(set(ids))
+    assert DEFAULT_STRATEGY == "tdi_shift_v5"
     # The earlier strategies stay available side by side.
     assert {"donchian", "ema_trend", "custom"}.issubset(set(ids))

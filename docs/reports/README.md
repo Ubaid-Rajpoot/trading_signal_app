@@ -11,6 +11,7 @@ unreachable) and says nothing about the real market.
 | [`winrate-v2-balanced.md`](winrate-v2-balanced.md) | v2 (`filter_mode: balanced`) | 30 days | demo | 5 |
 | [`winrate-v3.md`](winrate-v3.md) | v3 (HVB on volume) | 30 days | demo | 9 |
 | [`v4-real-btcusdt.md`](v4-real-btcusdt.md) | v4 (liquidity exit) | 180 days | **real dataset** | 173 |
+| [`v5-real-btcusdt.md`](v5-real-btcusdt.md) | v5 (stop + box target) | 180 days | **real dataset** | 84 |
 | [`edge-audit-btcusdt.md`](edge-audit-btcusdt.md) | v1 entries vs alternatives | 180 days | **real dataset** | — |
 
 ## What the numbers mean

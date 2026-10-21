@@ -479,7 +479,9 @@ def build_signal(
             **targets.as_dict(plan_side, price_decimals=6),
             "is_live": bool(bias != "NEUTRAL"),
             "note": (
-                "No stop loss. The trade runs to the next swing level (liquidity)."
+                "Stop beyond the broken structure, target at the previous swing level."
+                if getattr(strategy, "stop_columns", None)
+                else "No stop loss. The trade runs to the next swing level (liquidity)."
                 if getattr(strategy, "level_columns", None)
                 else (
                     "No stop loss or take profit - this system reports the setup only"
