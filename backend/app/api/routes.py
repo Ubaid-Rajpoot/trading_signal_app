@@ -100,9 +100,12 @@ def signal(
     strategy: str = Query("tdi_shift"),
     params: str | None = Query(None, description="JSON object of strategy parameter overrides"),
     limit: int = Query(400, ge=100, le=1000),
+    replay: int = Query(0, ge=0, le=100000, description="shift the window back N bars (real datasets)"),
 ) -> dict[str, Any]:
     try:
-        return sanitize(build_signal(symbol, timeframe, strategy, _params(params), limit=limit))
+        return sanitize(
+            build_signal(symbol, timeframe, strategy, _params(params), limit=limit, replay_bars=replay)
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except MarketDataError as exc:

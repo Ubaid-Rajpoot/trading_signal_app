@@ -267,12 +267,13 @@ def build_signal(
     limit: int = 400,
     candles: pd.DataFrame | None = None,
     source: str | None = None,
+    replay_bars: int = 0,
 ) -> dict[str, Any]:
     strategy: Strategy = get_strategy(strategy_id)
     resolved = strategy.resolve_params(params)
 
     if candles is None:
-        candles, source = get_candles(symbol, timeframe, limit)
+        candles, source = get_candles(symbol, timeframe, limit, replay_bars=replay_bars)
     source = source or "live"
 
     # Volume context is useful in every strategy's confidence score.
@@ -453,6 +454,7 @@ def build_signal(
         "strategy": {"id": strategy.id, "name": strategy.name, "uses_stops": strategy.uses_stops},
         "params": resolved,
         "source": source,
+        "replay_bars": int(replay_bars or 0),
         "generated_at": int(time.time() * 1000),
         "bar_time": prev_time,
         "price": round(price, 8),

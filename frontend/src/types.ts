@@ -39,7 +39,7 @@ export interface Meta {
   symbols: { symbol: string; base: string; name: string }[]
   default_watchlist: string[]
   default_strategy: string
-  provider: { mode: 'live' | 'demo'; reason: string }
+  provider: { mode: 'live' | 'demo' | 'dataset'; reason: string; datasets?: string[] }
   settings: Settings
 }
 
@@ -229,7 +229,8 @@ export interface Signal {
   timeframe_label: string
   strategy: { id: string; name: string; uses_stops: boolean }
   params: Record<string, number | boolean | string>
-  source: 'live' | 'cache' | 'demo'
+  source: 'live' | 'cache' | 'demo' | 'dataset'
+  replay_bars?: number
   generated_at: number
   bar_time: number
   price: number

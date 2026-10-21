@@ -20,6 +20,7 @@ import pandas as pd
 
 from ...config import BINANCE_HOSTS, CACHE_DIR, HTTP_TIMEOUT, TIMEFRAMES, USER_AGENT
 from ..utils_paths import history_cache_path
+from . import real
 from .synthetic import generate_candles
 
 _MAX_BARS_PER_REQUEST = 1000
@@ -145,8 +146,9 @@ def get_history(
 ) -> tuple[pd.DataFrame, str]:
     """Return ``(candles, source)`` for the last ``days`` days.
 
-    source is ``live`` (downloaded now), ``cache`` (previously downloaded) or
-    ``demo`` (deterministic synthetic candles - NOT real market data).
+    source is ``live`` (downloaded now), ``dataset`` (real candles from a local
+    Binance dump), ``cache`` (previously downloaded) or ``demo`` (deterministic
+    synthetic candles - NOT real market data).
     """
     if timeframe not in TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'")
@@ -156,6 +158,16 @@ def get_history(
     start_ms = now_ms - days * 24 * 3600 * 1000
 
     path = history_cache_path(symbol, timeframe, days)
+
+    # A real dataset on disk is the best offline option: it is genuine exchange
+    # data, so it beats both a stale cache and the synthetic feed.
+    if real.has_dataset(symbol) and not refresh:
+        try:
+            frame, source = real.get_dataset_history(symbol, timeframe, days)
+            if len(frame) > 10:
+                return frame, source
+        except Exception:
+            pass
 
     if path.exists() and not refresh:
         try:
@@ -201,6 +213,13 @@ def probe(symbol: str, timeframe: str, days: int = 30, allow_demo: bool = True) 
 
     def iso(ms: int) -> str:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    dataset = None
+    if real.has_dataset(symbol):
+        try:
+            dataset = real.coverage(symbol)
+        except Exception:
+            dataset = None
 
     if timeframe not in TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'")
@@ -278,12 +297,14 @@ def probe(symbol: str, timeframe: str, days: int = 30, allow_demo: bool = True) 
         "bars_expected": bars_expected,
         "hosts": hosts,
         "hosts_ok": [h["host"] for h in hosts if h["ok"]],
+        "dataset": dataset,
         "cache": cache,
         "source": source,
+        "dataset": real.has_dataset(symbol),
         "bars": int(len(df)),
         "first_candle": iso(int(df["time"].iloc[0])),
         "last_candle": iso(int(df["time"].iloc[-1])),
         "first_close": round(float(df["close"].iloc[0]), 2),
         "last_close": round(float(df["close"].iloc[-1]), 2),
-        "is_real": source in ("live", "cache"),
+        "is_real": source in ("live", "dataset", "cache"),
     }

@@ -24,7 +24,36 @@ pip install -r requirements.txt -r requirements-dev.txt
 cd frontend && npm install && cd ..
 ```
 
-## 2. Prove the data is real *before* looking at any signal
+## 2. Real candles without touching the exchange
+
+If the exchange is blocked (or you just want a fixed window you can replay), put
+real Binance klines on disk and the whole app uses them automatically:
+
+```bash
+# a) you already have Binance dumps (CSV or the monthly ZIP)
+python scripts/fetch_real_data.py --import ~/Downloads/BTCUSDT-1m-2025-01.zip
+
+# b) download from data.binance.vision (needs that host to be reachable)
+python scripts/fetch_real_data.py --binance-vision BTCUSDT --months 2025-01,2025-02
+
+# c) download a GitHub mirror of the same data
+python scripts/fetch_real_data.py --mirror BTCUSDT
+
+python scripts/fetch_real_data.py --list
+```
+
+Everything lands in `backend/data/cache/datasets/<SYMBOL>/`. One 1-minute import
+gives every timeframe (1m/3m/5m/15m/30m/1h/4h/1d) by resampling, and the header
+badge switches to **Real data (dataset)**. Nothing is fabricated: the source is
+reported as `dataset` in every API response, report and probe.
+
+The chart tab also gets a **rewind** box: step back N bars and see exactly what
+the engine said at that moment — the honest way to check a rule against your own
+screenshots.
+
+This sandbox ships with BTCUSDT 1-minute data for 2025-01-01 → 2025-06-29.
+
+## 3. Prove the data is real *before* looking at any signal
 
 This is the step that matters. It asks the exchange directly and tells you what
 would be used:
@@ -44,7 +73,7 @@ If it says `FAIL ... TLS/SSL connection has been closed`, Binance is blocked for
 your network — see [troubleshooting](#7-if-binance-is-blocked). **Do not trust
 any number until this line says LIVE.**
 
-## 3. Scan the market
+## 4. Scan the market
 
 ```bash
 # top 100 USDT pairs by turnover, the 5 scalping timeframes
@@ -81,7 +110,7 @@ python scripts/scan.py --list-symbols --top 100
 `live` = Binance `exchangeInfo` + 24h turnover. `curated` = the built-in list,
 which is what you get offline.
 
-## 4. Start the app
+## 5. Start the app
 
 ```bash
 ./scripts/dev.sh          # API on :8000, UI on :5173 (Vite proxies /api)
@@ -98,7 +127,7 @@ The radar has a scan scope selector:
 For anything bigger than that, use `scripts/scan.py`; it is the same code path
 without the browser in the middle.
 
-## 5. Measure it
+## 6. Measure it
 
 ```bash
 # the actual win rate of each version, 30 days, 5 timeframes
@@ -115,7 +144,7 @@ python scripts/winrate.py --symbol BTCUSDT --days 30 --strategy tdi_shift_v3
 Downloads are paged and cached under `backend/data/cache/history/`, so the second
 run is instant and works offline afterwards.
 
-## 6. Day-to-day
+## 7. Day-to-day
 
 | Task | Command |
 |---|---|
@@ -124,7 +153,7 @@ run is instant and works offline afterwards.
 | Build the UI into the API | `./scripts/build.sh` |
 | Run the nightly scanner on a timer (Linux/macOS) | `crontab -e` → `*/15 * * * * cd /path/to/trading_signal_app && .venv/bin/python scripts/scan.py --top 100 --real-only --out /tmp/scan.md` |
 
-## 7. If Binance is blocked
+## 8. If Binance is blocked
 
 Some networks (and some countries) block `api.binance.com`. In order:
 
@@ -141,7 +170,7 @@ Until one of those works, the app will fall back to demo candles and **say so** 
 every place a number appears — the header badge, the win-rate row, the report
 footer, and `--real-only` will refuse to print anything.
 
-## 8. Two things to understand about the numbers
+## 9. Two things to understand about the numbers
 
 * **HVB needs real volume.** `HVB` (High Volume Breakout) means the purple line
   crosses the centre band *on a volume spike* — 1.5× the 20-bar average by

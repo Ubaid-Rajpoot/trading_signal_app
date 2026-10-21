@@ -26,6 +26,7 @@ from ...config import (
     TIMEFRAMES,
     USER_AGENT,
 )
+from . import real
 from .synthetic import generate_candles
 
 _LOCK = threading.Lock()
@@ -118,6 +119,20 @@ def fetch_binance(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
 
 def provider_status() -> dict:
     """Cheap health snapshot used by the UI banner."""
+    symbols = real.dataset_symbols()
+    if symbols:
+        try:
+            info = real.coverage(symbols[0])
+            return {
+                "mode": "dataset",
+                "reason": (
+                    f"Real Binance candles from a local dataset: "
+                    f"{', '.join(symbols)} {info['first']} to {info['last']}"
+                ),
+                "datasets": symbols,
+            }
+        except Exception:
+            pass
     with _LOCK:
         failed_at = _PROVIDER_STATE["live_failed_at"]
     if failed_at and time.time() - failed_at < _PROVIDER_TTL:
@@ -130,12 +145,29 @@ def get_candles(
     timeframe: str = "1h",
     limit: int = 400,
     force_refresh: bool = False,
+    replay_bars: int = 0,
 ) -> tuple[pd.DataFrame, str]:
-    """Return ``(candles, source)`` where source is live | cache | demo."""
+    """Return ``(candles, source)``.
+
+    source is ``live`` (exchange now), ``dataset`` (real candles from a local
+    Binance dump), ``cache`` (previously downloaded) or ``demo`` (synthetic).
+
+    ``replay_bars`` shifts the window back N bars. It only applies to a dataset
+    (which has a fixed end), so you can inspect any moment of real history as if
+    you were watching it live.
+    """
     symbol = symbol.upper().strip()
     if timeframe not in TIMEFRAMES:
         raise MarketDataError(f"Unsupported timeframe '{timeframe}'")
     limit = max(30, min(int(limit), 1500))
+    if replay_bars:
+        replay_bars = max(0, int(replay_bars))
+        frame, _ = real.get_dataset_history(symbol, timeframe)
+        end = len(frame) - replay_bars
+        window = frame.iloc[max(0, end - limit):end].reset_index(drop=True)
+        if window.empty:
+            raise MarketDataError(f"replay {replay_bars} bars is past the start of the data")
+        return window, "dataset"
 
     key = (symbol, timeframe, limit)
     now = time.time()
@@ -160,6 +192,18 @@ def get_candles(
         except Exception:
             with _LOCK:
                 _PROVIDER_STATE["live_failed_at"] = now
+
+    # Real candles already on disk beat both a stale cache and synthetic data.
+    if real.has_dataset(symbol):
+        try:
+            frame, _ = real.get_dataset_history(symbol, timeframe)
+            if len(frame) >= 30:
+                window = frame.tail(limit).reset_index(drop=True)
+                with _LOCK:
+                    _MEMORY_CACHE[key] = (now, window, "dataset")
+                return window.copy(), "dataset"
+        except Exception:
+            pass
 
     # Fall back to a recent disk cache before fabricating data.
     cached = _read_csv_cache(symbol, timeframe, max_age=tf_seconds * 3)

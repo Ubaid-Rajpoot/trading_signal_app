@@ -31,7 +31,7 @@ def _caveat(sources: list[str]) -> str:
             "NO DATA - the exchange was unreachable and no cached candles exist, so there is "
             "nothing to measure. Connect to the internet and run again."
         )
-    if set(sources) <= {"live", "cache"}:
+    if set(sources) <= {"live", "dataset", "cache"}:
         return "Real exchange data (Binance klines)."
     return (
         "DEMO DATA - the exchange was unreachable, so these candles are synthetic. "
@@ -159,7 +159,7 @@ def report(
         "params": get_strategy(strategy).resolve_params(params or {}),
         "generated_at": int(time.time() * 1000),
         "sources": sources,
-        "is_real_data": sources == ["live"] or sources == ["cache"] or sources == ["cache", "live"],
+        "is_real_data": bool(sources) and set(sources) <= {"live", "dataset", "cache"},
         "rows": rows,
         "summary": {
             "timeframes_tested": len(valid),

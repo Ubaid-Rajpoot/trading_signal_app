@@ -86,6 +86,14 @@ Tests:
 
 ---
 
+## Real data, even without the exchange
+
+`backend/data/cache/datasets/<SYMBOL>/` holds real Binance kline files; one
+1-minute import is resampled to every timeframe and reported as `dataset`
+(never `demo`). Import with `python scripts/fetch_real_data.py --import <zip>`
+or `--binance-vision` / `--mirror`. The chart tab has a **rewind** box to replay
+any moment of that real history. This checkout ships BTCUSDT 1m for Jan–Jun 2025.
+
 ## Scan the market
 
 ```bash

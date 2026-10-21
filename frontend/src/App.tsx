@@ -29,6 +29,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('radar')
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [timeframe, setTimeframe] = useState('1h')
+  const [replay, setReplay] = useState(0)
   const [strategyId, setStrategyId] = useState('donchian')
 
   const [signal, setSignal] = useState<Signal | null>(null)
@@ -61,11 +62,11 @@ export default function App() {
   }, [])
 
   /* ---------------------------------------------------------------- fetch */
-  const loadSignal = useCallback(async (sym: string, tf: string, strat: string) => {
+  const loadSignal = useCallback(async (sym: string, tf: string, strat: string, rewind = 0) => {
     const id = ++requestId.current
     setLoadingSignal(true)
     try {
-      const data = await api.signal(sym, tf, strat)
+      const data = await api.signal(sym, tf, strat, undefined, rewind)
       if (id !== requestId.current) return
       setSignal(data)
       setError(null)
@@ -91,8 +92,8 @@ export default function App() {
 
   useEffect(() => {
     if (!meta) return
-    loadSignal(symbol, timeframe, strategyId)
-  }, [meta, symbol, timeframe, strategyId, loadSignal])
+    loadSignal(symbol, timeframe, strategyId, replay)
+  }, [meta, symbol, timeframe, strategyId, replay, loadSignal])
 
   useEffect(() => {
     if (!meta || !settings) return
@@ -104,12 +105,12 @@ export default function App() {
     if (!meta || !settings || tab !== 'dashboard') return
     const interval = Math.max(20, settings.refresh_seconds) * 1000
     const timer = setInterval(() => {
-      loadSignal(symbol, timeframe, strategyId)
+      loadSignal(symbol, timeframe, strategyId, replay)
       loadScan(settings.watchlist, timeframe, strategyId)
     }, interval)
     const ticker = setInterval(() => setTick((t) => t + 1), 1000)
     return () => { clearInterval(timer); clearInterval(ticker) }
-  }, [meta, settings, tab, symbol, timeframe, strategyId, loadSignal, loadScan])
+  }, [meta, settings, tab, symbol, timeframe, strategyId, replay, loadSignal, loadScan])
 
   const refresh = () => {
     if (!settings) return
@@ -171,9 +172,16 @@ export default function App() {
         </nav>
 
         <div className="topbar-right">
-          <span className={`badge ${meta.provider.mode === 'live' ? 'live' : 'demo'}`} title={meta.provider.reason}>
+          <span
+            className={`badge ${meta.provider.mode === 'live' ? 'live' : meta.provider.mode === 'dataset' ? 'live' : 'demo'}`}
+            title={meta.provider.reason}
+          >
             <span className={`dot ${meta.provider.mode === 'live' ? 'pulse' : ''}`} />
-            {meta.provider.mode === 'live' ? 'Live market data' : 'Demo data'}
+            {meta.provider.mode === 'live'
+              ? 'Live market data'
+              : meta.provider.mode === 'dataset'
+                ? 'Real data (dataset)'
+                : 'Demo data'}
           </span>
           {tab === 'dashboard' && (
             <>
@@ -191,6 +199,21 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              {meta.provider.mode === 'dataset' && (
+                <label className="hstack tiny muted" style={{ gap: 6 }} title="Rewind the real dataset by N bars and see what the engine said then">
+                  rewind
+                  <input
+                    className="input sm mono"
+                    style={{ width: 78 }}
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={replay}
+                    onChange={(e) => setReplay(Math.max(0, Number(e.target.value) || 0))}
+                  />
+                  bars
+                </label>
+              )}
               <button className="btn sm" onClick={refresh} disabled={loadingSignal}>
                 {loadingSignal ? <Spinner /> : 'Refresh'}
               </button>
@@ -320,7 +343,11 @@ export default function App() {
 
       <footer className="footer">
         SignalForge · research tool, not financial advice. Signals are generated from historical price data
-        {meta.provider.mode === 'demo' ? ' — current feed is simulated demo data.' : '.'}
+        {meta.provider.mode === 'demo'
+          ? ' — current feed is simulated demo data.'
+          : meta.provider.mode === 'dataset'
+            ? ' — real Binance candles from a local dataset (not live).'
+            : '.'}
       </footer>
     </div>
   )

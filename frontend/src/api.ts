@@ -44,8 +44,22 @@ const qs = (params: Record<string, string | number | undefined>) => {
 export const api = {
   meta: () => request<Meta>('/meta'),
   health: () => request<{ status: string; provider: { mode: string; reason: string }; stats: Record<string, unknown> }>('/health'),
-  signal: (symbol: string, timeframe: string, strategy: string, params?: Record<string, unknown>) =>
-    request<Signal>(`/signal${qs({ symbol, timeframe, strategy, params: params && Object.keys(params).length ? JSON.stringify(params) : undefined })}`),
+  signal: (
+    symbol: string,
+    timeframe: string,
+    strategy: string,
+    params?: Record<string, unknown>,
+    replay = 0,
+  ) =>
+    request<Signal>(
+      `/signal${qs({
+        symbol,
+        timeframe,
+        strategy,
+        params: params && Object.keys(params).length ? JSON.stringify(params) : undefined,
+        replay: replay || undefined,
+      })}`,
+    ),
   scan: (symbols: string[], timeframe: string, strategy: string, params?: Record<string, unknown>) =>
     request<ScanResponse>(
       `/scan${qs({
