@@ -25,10 +25,32 @@ _LOCK = threading.Lock()
 _TTL = 600.0
 
 
-def _run_one(symbol: str, timeframe: str, days: int, strategy_id: str, params: dict | None) -> dict[str, Any]:
+def _caveat(sources: list[str]) -> str:
+    if not sources:
+        return (
+            "NO DATA - the exchange was unreachable and no cached candles exist, so there is "
+            "nothing to measure. Connect to the internet and run again."
+        )
+    if set(sources) <= {"live", "cache"}:
+        return "Real exchange data (Binance klines)."
+    return (
+        "DEMO DATA - the exchange was unreachable, so these candles are synthetic. "
+        "Win rate here tests the code, not the market. Run the same report with "
+        "internet access to get real numbers."
+    )
+
+
+def _run_one(
+    symbol: str,
+    timeframe: str,
+    days: int,
+    strategy_id: str,
+    params: dict | None,
+    allow_demo: bool = True,
+) -> dict[str, Any]:
     strategy = get_strategy(strategy_id)
     resolved = strategy.resolve_params(params or {})
-    candles, source = get_history(symbol, timeframe, days)
+    candles, source = get_history(symbol, timeframe, days, allow_demo=allow_demo)
     prepared = strategy.prepare(candles, resolved)
     triggers = strategy.rules(prepared, resolved)
 
@@ -90,9 +112,17 @@ def report(
     strategy: str = "tdi_shift",
     params: dict | None = None,
     refresh: bool = False,
+    allow_demo: bool = True,
 ) -> dict[str, Any]:
     tfs = [tf for tf in (timeframes or SCAN_TIMEFRAMES) if tf in TIMEFRAMES]
-    key = (symbol.upper(), days, tuple(tfs), strategy, tuple(sorted((params or {}).items())))
+    key = (
+        symbol.upper(),
+        days,
+        tuple(tfs),
+        strategy,
+        tuple(sorted((params or {}).items())),
+        allow_demo,
+    )
     now = time.time()
     if not refresh:
         with _LOCK:
@@ -103,7 +133,7 @@ def report(
     rows: list[dict[str, Any]] = []
     for tf in tfs:
         try:
-            rows.append(_run_one(symbol, tf, days, strategy, params))
+            rows.append(_run_one(symbol, tf, days, strategy, params, allow_demo))
         except Exception as exc:  # one timeframe must not kill the report
             rows.append({"timeframe": tf, "label": TIMEFRAMES[tf]["label"], "error": str(exc)})
 
@@ -129,14 +159,82 @@ def report(
             "win_rate_pct": round(total_wins / total_trades * 100, 2) if total_trades else None,
             "best_timeframe": max(valid, key=lambda r: r["win_rate_pct"])["timeframe"] if valid else None,
         },
-        "caveat": (
-            "DEMO DATA - the exchange was unreachable, so these candles are synthetic. "
-            "Win rate here tests the code, not the market. Run the same report with "
-            "internet access to get real numbers."
-            if not (sources and set(sources) <= {"live", "cache"})
-            else "Real exchange data."
-        ),
+        "caveat": _caveat(sources),
     }
     with _LOCK:
         _CACHE[key] = (now, payload)
     return payload
+
+
+def trades_detail(
+    symbol: str = "BTCUSDT",
+    days: int = 30,
+    timeframe: str = "15m",
+    strategy: str = "tdi_shift",
+    params: dict | None = None,
+    allow_demo: bool = True,
+) -> dict[str, Any]:
+    """Every trade of one timeframe, with real timestamps.
+
+    This is the audit trail for the win rate: each row contains the entry and
+    exit candle times, so any single trade can be checked by eye on a chart.
+    """
+    from datetime import datetime, timezone
+
+    def iso(ms: int) -> str:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    strategy_obj = get_strategy(strategy)
+    resolved = strategy_obj.resolve_params(params or {})
+    candles, source = get_history(symbol, timeframe, days, allow_demo=allow_demo)
+    prepared = strategy_obj.prepare(candles, resolved)
+    triggers = strategy_obj.rules(prepared, resolved)
+
+    warm = max(int(strategy_obj.required_bars(resolved)) - 60, 20)
+    if len(prepared) > warm + 50:
+        prepared = prepared.iloc[warm:].reset_index(drop=True)
+        triggers = type(triggers)(
+            triggers.long_entry.iloc[warm:].reset_index(drop=True),
+            triggers.long_exit.iloc[warm:].reset_index(drop=True),
+            triggers.short_entry.iloc[warm:].reset_index(drop=True),
+            triggers.short_exit.iloc[warm:].reset_index(drop=True),
+        )
+
+    config = BacktestConfig(initial_equity=10_000, fee_bps=5, slippage_bps=2, cash_fraction=1.0)
+    result = run_backtest(
+        prepared,
+        triggers,
+        strategy_obj,
+        resolved,
+        config,
+        timeframe_seconds=int(TIMEFRAMES[timeframe]["seconds"]),
+        include_curve=False,
+    )
+    trades = [
+        {
+            "side": t.side,
+            "entry_time_utc": iso(t.entry_time),
+            "exit_time_utc": iso(t.exit_time),
+            "entry_price": round(float(t.entry_price), 2),
+            "exit_price": round(float(t.exit_price), 2),
+            "bars_held": int(t.bars_held),
+            "pnl": round(float(t.pnl), 2),
+            "pnl_pct": round(float(t.pnl_pct), 2),
+            "exit_reason": t.exit_reason,
+        }
+        for t in result.trades
+    ]
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    return {
+        "symbol": symbol.upper(),
+        "timeframe": timeframe,
+        "days": days,
+        "source": source,
+        "bars": int(len(prepared)),
+        "first_candle_utc": iso(prepared["time"].iloc[0]),
+        "last_candle_utc": iso(prepared["time"].iloc[-1]),
+        "trades": trades,
+        "wins": wins,
+        "losses": len(trades) - wins,
+        "win_rate_pct": round(wins / len(trades) * 100, 2) if trades else None,
+    }

@@ -104,6 +104,41 @@ Click any cell to open that chart. The radar rescans every 60 seconds.
 opens on the setup and closes on the opposite TDI cross, which is how the setup
 is meant to be read.
 
+How it is computed, in five steps (all in this repo, no external dataset):
+
+1. **Get candles** — `backend/app/core/data/history.py::get_history()`.
+   Cache first, then live Binance `/api/v3/klines` (paged 1000 at a time),
+   then a labelled demo feed.
+2. **Prepare** — `strategy.prepare()` adds RSI, the TDI lines and the swings.
+3. **Detect** — `strategy.rules()` returns buy/sell/sell-exit booleans per candle.
+   Every boolean only looks at candles up to that one (checked by
+   `tests/test_no_lookahead.py`).
+4. **Simulate** — `backtest.run_backtest()` walks the candles once, in order,
+   entering on a signal and leaving on the exit signal.
+5. **Count** — `wins = trades with pnl > 0`, `win_rate = wins / trades`.
+
+### Checking the data for yourself
+
+```bash
+# host-by-host data trail: did the exchange answer? is there a cache?
+python scripts/winrate.py --symbol BTCUSDT --days 30 --explain
+
+# list every trade with entry/exit timestamps, to spot-check on a chart
+python scripts/winrate.py --symbol BTCUSDT --days 30 --trades
+
+# refuse to run without real exchange data (exit code 1, never prints demo numbers)
+python scripts/winrate.py --symbol BTCUSDT --days 30 --real-only
+```
+
+The same trail is available over HTTP:
+
+```bash
+curl "http://localhost:8000/api/data-source?symbol=BTCUSDT&timeframe=15m&days=30"
+```
+
+It returns each host with `ok` true/false and the reason, the cache file and its
+recorded source, and what `get_history` would actually use.
+
 ```bash
 # from the command line, real Binance data (needs internet)
 python scripts/winrate.py --symbol BTCUSDT --days 30
@@ -264,6 +299,7 @@ Environment variables:
 | GET | `/api/scan` | Watchlist scan, ranked by actionability |
 | GET | `/api/radar` | Symbol × timeframe setup grid (status, side, level to break, distance) |
 | GET | `/api/winrate` | 30-day win-rate study per timeframe (`days`, `timeframes`, `refresh`) |
+| GET | `/api/data-source` | Where the candles come from: host-by-host check, cache state, resolved source |
 | POST | `/api/backtest` | Run a backtest |
 | GET | `/api/signals` | Stored signal history |
 | GET/PUT | `/api/settings` | Read/update settings |

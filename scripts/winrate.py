@@ -10,6 +10,12 @@
     # test other parameter values
     python scripts/winrate.py --symbol ETHUSDT --params '{"hvb_step": 2.0, "confluence_window": 1}'
 
+    # show exactly where the candles come from, host by host
+    python scripts/winrate.py --symbol BTCUSDT --days 30 --explain
+
+    # refuse to run unless the exchange really answered (never prints demo numbers)
+    python scripts/winrate.py --symbol BTCUSDT --days 30 --real-only
+
 The CSV cache lives in backend/data/cache/history/, so the second run is instant
 and works offline.
 """
@@ -26,6 +32,37 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app.core import winrate  # noqa: E402
+from app.core.data.history import probe  # noqa: E402
+
+
+def explain(symbol: str, days: int, timeframes: list[str], allow_demo: bool) -> None:
+    """Print the data trail for every timeframe: hosts, cache, candles, source."""
+    for tf in timeframes:
+        try:
+            info = probe(symbol, tf, days, allow_demo=allow_demo)
+        except Exception as exc:
+            print(f"[{tf}] no data: {type(exc).__name__}: {exc}")
+            continue
+        print(f"\n[{tf}] window {info['window']['start']} -> {info['window']['end']}")
+        print(f"      want ~{info['bars_expected']:,} bars of {info['bar_seconds']}s")
+        for h in info["hosts"]:
+            mark = "OK  " if h["ok"] else "FAIL"
+            print(f"      {mark} {h['host']:<38} {h['ms']:>5} ms  {h['detail']}")
+        c = info["cache"]
+        if c["exists"]:
+            print(
+                f"      cache {c['path']}\n"
+                f"            {c['bars']:,} bars {c['from']} -> {c['to']} "
+                f"(fetched {c.get('fetched_at')}, recorded source {c.get('recorded_source')})"
+            )
+        else:
+            print(f"      cache {c['path']}  (empty)")
+        verdict = "REAL exchange data" if info["is_real"] else "DEMO / synthetic - NOT market data"
+        print(
+            f"      => using {info['bars']:,} bars {info['first_candle']} -> {info['last_candle']}"
+            f" | close {info['first_close']:,} -> {info['last_close']:,}"
+        )
+        print(f"      => source: {info['source'].upper()}  ({verdict})")
 
 
 def main() -> int:
@@ -37,6 +74,13 @@ def main() -> int:
     ap.add_argument("--params", default="{}", help="JSON overrides for the strategy")
     ap.add_argument("--refresh", action="store_true", help="ignore caches and re-download")
     ap.add_argument("--out", default="", help="write a markdown report to this path")
+    ap.add_argument("--explain", action="store_true", help="show where the candles come from")
+    ap.add_argument(
+        "--real-only",
+        action="store_true",
+        help="fail instead of falling back to demo candles (use this for real results)",
+    )
+    ap.add_argument("--trades", action="store_true", help="list every trade of the first timeframe")
     args = ap.parse_args()
 
     try:
@@ -45,13 +89,26 @@ def main() -> int:
         print("--params must be valid JSON", file=sys.stderr)
         return 2
 
+    tfs = [t.strip() for t in args.timeframes.split(",") if t.strip()]
+    allow_demo = not args.real_only
+
+    if args.explain:
+        print(f"DATA TRAIL - {args.symbol.upper()}, last {args.days} days")
+        print("=" * 60)
+        explain(args.symbol, args.days, tfs, allow_demo)
+        print()
+
+    if args.real_only:
+        print("--real-only: demo fallback disabled, only live downloads / real caches count\n")
+
     result = winrate.report(
         symbol=args.symbol,
         days=args.days,
-        timeframes=[t.strip() for t in args.timeframes.split(",") if t.strip()],
+        timeframes=tfs,
         strategy=args.strategy,
         params=params,
         refresh=args.refresh,
+        allow_demo=allow_demo,
     )
 
     header = f"{args.symbol.upper()} · {args.days} days · {args.strategy}"
@@ -75,6 +132,35 @@ def main() -> int:
     print(f"Overall win rate: {s['win_rate_pct']}%   Best timeframe: {s['best_timeframe']}")
     print(f"Data: {', '.join(result['sources'])}")
     print(result["caveat"])
+
+    if args.trades:
+        print()
+        try:
+            detail = winrate.trades_detail(
+                symbol=args.symbol,
+                days=args.days,
+                timeframe=tfs[0],
+                strategy=args.strategy,
+                params=params,
+                allow_demo=allow_demo,
+            )
+        except Exception as exc:
+            print(f"No trade list: {type(exc).__name__}: {exc}")
+            detail = None
+        if detail is None:
+            return 1 if args.real_only else 0
+        print(f"Each trade on {tfs[0]} (verify any of these on TradingView):")
+        print(
+            f"{'#':<4}{'side':<7}{'entry (UTC)':<19}{'entry px':>11}"
+            f"   {'exit (UTC)':<19}{'exit px':>11}{'bars':>6}{'pnl %':>8}  exit reason"
+        )
+        for i, t in enumerate(detail["trades"], 1):
+            print(
+                f"{i:<4}{t['side']:<7}{t['entry_time_utc']:<19}{t['entry_price']:>11,.2f}"
+                f"   {t['exit_time_utc']:<19}{t['exit_price']:>11,.2f}{t['bars_held']:>6}"
+                f"{t['pnl_pct']:>8.2f}  {t['exit_reason']}"
+            )
+        print(f"wins: {detail['wins']}   losses: {detail['losses']}   win rate: {detail['win_rate_pct']}%")
 
     if args.out:
         out = Path(args.out)
@@ -105,6 +191,13 @@ def main() -> int:
         out.write_text("\n".join(lines))
         print(f"\nMarkdown report written to {out}")
 
+    if args.real_only and not result["is_real_data"]:
+        print(
+            "\nFAILED: no real exchange data available, so no trustworthy win rate could be "
+            "produced. Numbers above are demo only.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

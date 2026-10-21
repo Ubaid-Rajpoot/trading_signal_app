@@ -110,3 +110,67 @@ def test_backtest_metrics_are_json_safe_for_signal_only_mode():
 
     report = winrate.report("DOGEUSDT", days=7, timeframes=["15m"], refresh=True)
     json.dumps(sanitize(report))  # would raise on NaN / numpy leakage
+
+
+def test_probe_reports_the_data_trail(monkeypatch, tmp_path):
+    from app.core.data import history
+
+    monkeypatch.setattr(history, "history_cache_path", lambda *a: tmp_path / "none.csv")
+    info = history.probe("BTCUSDT", "15m", days=30)
+
+    assert info["symbol"] == "BTCUSDT"
+    assert info["timeframe"] == "15m"
+    assert info["bars_expected"] == 2880
+    assert info["bars"] > 2000
+    assert info["first_candle"] < info["last_candle"]
+    # one entry per configured host, each with a verdict
+    assert {h["host"] for h in info["hosts"]} == set(history.BINANCE_HOSTS)
+    assert all({"ok", "ms", "detail"} <= set(h) for h in info["hosts"])
+    assert info["source"] in ("live", "cache", "demo")
+    assert info["is_real"] is (info["source"] in ("live", "cache"))
+
+
+def test_probe_never_claims_demo_is_real(monkeypatch, tmp_path):
+    from app.core.data import history
+
+    monkeypatch.setattr(history, "history_cache_path", lambda *a: tmp_path / "none.csv")
+    monkeypatch.setattr(history, "BINANCE_HOSTS", ["https://127.0.0.1:9"])
+    info = history.probe("BTCUSDT", "1h", days=2)
+    assert info["hosts_ok"] == []
+    assert info["source"] == "demo"
+    assert info["is_real"] is False
+
+
+def test_real_only_refuses_to_invent_numbers(monkeypatch, tmp_path):
+    """--real-only must fail loudly rather than report demo win rates."""
+    from app.core import winrate
+    from app.core.data import history
+
+    monkeypatch.setattr(history, "history_cache_path", lambda *a: tmp_path / "none.csv")
+    monkeypatch.setattr(history, "BINANCE_HOSTS", ["https://127.0.0.1:9"])
+    monkeypatch.setattr(winrate, "get_history", history.get_history)
+
+    payload = winrate.report("BTCUSDT", days=2, timeframes=["15m"], allow_demo=False, refresh=True)
+    assert payload["rows"][0].get("error")
+    assert payload["summary"]["trades"] == 0
+    assert payload["is_real_data"] is False
+    assert payload["caveat"].startswith("NO DATA")
+
+
+def test_trades_detail_is_auditable(monkeypatch, tmp_path):
+    """Every trade row carries timestamps so it can be checked on a chart."""
+    from app.core import winrate
+    from app.core.data import history
+
+    monkeypatch.setattr(history, "history_cache_path", lambda *a: tmp_path / "none.csv")
+    detail = winrate.trades_detail("BTCUSDT", days=30, timeframe="15m")
+
+    assert detail["source"] == "demo"
+    assert detail["wins"] + detail["losses"] == len(detail["trades"])
+    if detail["trades"]:
+        t = detail["trades"][0]
+        assert t["entry_time_utc"] <= t["exit_time_utc"]
+        assert t["entry_price"] > 0 and t["exit_price"] > 0
+        assert t["exit_reason"]
+        expected = round(detail["wins"] / len(detail["trades"]) * 100, 2)
+        assert detail["win_rate_pct"] == expected

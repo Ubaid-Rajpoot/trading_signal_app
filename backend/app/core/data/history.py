@@ -188,3 +188,102 @@ def get_history(
     bars_needed = max(int(days * 24 * 3600 / seconds), 200)
     demo = generate_candles(symbol, timeframe, limit=bars_needed)
     return demo, "demo"
+
+
+def probe(symbol: str, timeframe: str, days: int = 30, allow_demo: bool = True) -> dict:
+    """Explain exactly where the candles for this window would come from.
+
+    Hits the exchange directly (one small request per host), reports the cache,
+    then reports what ``get_history`` would actually return. Used by
+    ``scripts/winrate.py --explain`` so a data source can never be a mystery.
+    """
+    from datetime import datetime, timezone
+
+    def iso(ms: int) -> str:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'")
+    symbol = symbol.upper()
+    seconds = int(TIMEFRAMES[timeframe]["seconds"])
+    interval = str(TIMEFRAMES[timeframe]["interval"])
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 3600 * 1000
+    path = history_cache_path(symbol, timeframe, days)
+
+    # --- 1. do the exchanges answer at all? ---------------------------------
+    hosts = []
+    for host in BINANCE_HOSTS:
+        t0 = time.time()
+        try:
+            with httpx.Client(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
+                resp = client.get(
+                    f"{host}/api/v3/klines",
+                    params={"symbol": symbol, "interval": interval, "limit": 2},
+                )
+            ok = resp.status_code == 200
+            sample = resp.json()[-1] if ok and resp.json() else None
+            hosts.append(
+                {
+                    "host": host,
+                    "ok": ok,
+                    "ms": int((time.time() - t0) * 1000),
+                    "detail": (
+                        f"HTTP {resp.status_code}, last close {float(sample[4]):,.2f} at {iso(int(sample[0]))}"
+                        if sample
+                        else f"HTTP {resp.status_code}: {resp.text[:100]}"
+                    ),
+                }
+            )
+        except Exception as exc:
+            hosts.append(
+                {
+                    "host": host,
+                    "ok": False,
+                    "ms": int((time.time() - t0) * 1000),
+                    "detail": f"{type(exc).__name__}: {str(exc)[:110]}",
+                }
+            )
+
+    # --- 2. is there a cache? ------------------------------------------------
+    cache = {"path": str(path), "exists": False}
+    if path.exists():
+        try:
+            cached, meta = _read_cache(path)
+            cache.update(
+                {
+                    "exists": True,
+                    "bars": int(len(cached)),
+                    "covers_window": _cache_covers(cached, start_ms, now_ms, timeframe),
+                    "from": iso(int(cached["time"].iloc[0])),
+                    "to": iso(int(cached["time"].iloc[-1])),
+                    "fetched_at": (
+                        iso(int(meta["fetched_at"])) if meta.get("fetched_at") else "unknown"
+                    ),
+                    "recorded_source": meta.get("source", "unknown"),
+                }
+            )
+        except Exception as exc:
+            cache["error"] = str(exc)
+
+    # --- 3. what would actually be used? ------------------------------------
+    df, source = get_history(symbol, timeframe, days, allow_demo=allow_demo)
+    bars_expected = int(days * 24 * 3600 / seconds)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "days": days,
+        "window": {"start": iso(start_ms), "end": iso(now_ms)},
+        "bar_seconds": seconds,
+        "bars_expected": bars_expected,
+        "hosts": hosts,
+        "hosts_ok": [h["host"] for h in hosts if h["ok"]],
+        "cache": cache,
+        "source": source,
+        "bars": int(len(df)),
+        "first_candle": iso(int(df["time"].iloc[0])),
+        "last_candle": iso(int(df["time"].iloc[-1])),
+        "first_close": round(float(df["close"].iloc[0]), 2),
+        "last_close": round(float(df["close"].iloc[-1]), 2),
+        "is_real": source in ("live", "cache"),
+    }

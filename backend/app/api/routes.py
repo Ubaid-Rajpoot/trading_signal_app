@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from ..config import APP_NAME, APP_VERSION, DEFAULT_SYMBOLS, DEFAULT_WATCHLIST, SCAN_TIMEFRAMES, TIMEFRAMES
 from ..core import backtest_service, winrate as winrate_service
 from ..core.alerts import notifier, scheduler
+from ..core.data.history import probe as history_probe
 from ..core.data.providers import MarketDataError, provider_status
 from ..core.signals import build_signal, scan
 from ..core.store import (
@@ -146,6 +147,23 @@ def backtest(payload: BacktestRequest) -> dict[str, Any]:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except (MarketDataError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/data-source")
+def data_source(
+    symbol: str = Query("BTCUSDT"),
+    timeframe: str = Query("15m"),
+    days: int = Query(30, ge=1, le=120),
+) -> dict[str, Any]:
+    """Where the candles for this window come from - hosts, cache, source.
+
+    Exposed so the data trail is inspectable from the UI or curl instead of
+    being taken on trust.
+    """
+    try:
+        return sanitize(history_probe(symbol, timeframe, days))
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
