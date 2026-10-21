@@ -6,10 +6,11 @@ const STATUS_STYLE: Record<string, { bg: string; colour: string; label: string }
   ARMED: { bg: 'linear-gradient(180deg, #ffcf6b, #f5b544)', colour: '#241a02', label: 'ARMED' },
   FORMING: { bg: 'rgba(56,189,248,0.16)', colour: '#8fb7ff', label: 'FORMING' },
   IDLE: { bg: 'rgba(255,255,255,0.04)', colour: 'var(--muted)', label: 'NO SETUP' },
+  BLOCKED: { bg: 'rgba(245,181,68,0.14)', colour: 'var(--amber)', label: 'SETUP BLOCKED' },
 }
 
 export default function SignalPanel({ signal }: { signal: Signal }) {
-  const { setup, plan, state } = signal
+  const { setup, plan, state, regime } = signal
   const tone = actionTone(signal.action)
   const style = STATUS_STYLE[setup.status] ?? STATUS_STYLE.IDLE
   const tdi = setup.tdi
@@ -39,6 +40,51 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
       </div>
 
       <div className="muted small" style={{ marginTop: 12 }}>{setup.text}</div>
+
+      {/* Market context - the v2 filter: trade only inside structure, in a trend */}
+      {regime && (
+        <div className="plan-grid" style={{ marginTop: 12 }}>
+          <div className="plan-box">
+            <div className="k">Market</div>
+            <div className="v" style={{ color: regime.regime === 'TRENDING' ? 'var(--green)' : 'var(--amber)' }}>
+              {regime.regime === 'TRENDING' ? `TRENDING ${regime.trend}` : regime.regime}
+            </div>
+            <div className="tiny muted">{regime.reason}</div>
+          </div>
+          <div className="plan-box">
+            <div className="k">Trend strength</div>
+            <div className="v mono">{regime.adx != null ? `ADX ${regime.adx.toFixed(0)}` : '—'}</div>
+            <div className="tiny muted">
+              efficiency {regime.efficiency != null ? regime.efficiency.toFixed(2) : '—'} ·{' '}
+              {regime.bars_since_bos != null ? `${regime.bars_since_bos.toFixed(0)} bars since break` : 'no break yet'}
+            </div>
+          </div>
+          <div className="plan-box">
+            <div className="k">Internal structure</div>
+            <div className="v" style={{ color: regime.structure_ready ? 'var(--green)' : 'var(--muted)' }}>
+              {regime.structure_ready ? 'READY' : 'NONE'}
+            </div>
+            <div className="tiny muted">
+              {regime.structure_atr != null ? `${regime.structure_atr.toFixed(1)} ATR tall` : 'no minor swings yet'}
+            </div>
+          </div>
+          <div className="plan-box">
+            <div className="k">Liquidity</div>
+            <div className="v" style={{ color: regime.liquidity_above || regime.liquidity_below ? 'var(--amber)' : 'var(--muted)' }}>
+              {regime.liquidity_above && regime.liquidity_below
+                ? 'BOTH SIDES'
+                : regime.liquidity_above
+                  ? 'POOL ABOVE'
+                  : regime.liquidity_below
+                    ? 'POOL BELOW'
+                    : 'CLEAR'}
+            </div>
+            <div className="tiny muted">
+              {regime.liquidity_above || regime.liquidity_below ? 'equal highs/lows - price usually sweeps them' : 'no clustered levels'}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="ring-wrap">
         <Ring

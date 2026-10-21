@@ -2,14 +2,14 @@ import type { StrategySchema } from '../types'
 
 interface Props {
   schema: StrategySchema
-  values: Record<string, number | boolean>
-  onChange: (next: Record<string, number | boolean>) => void
+  values: Record<string, number | boolean | string>
+  onChange: (next: Record<string, number | boolean | string>) => void
   compact?: boolean
 }
 
 export default function ParamsEditor({ schema, values, onChange, compact = false }: Props) {
-  const set = (key: string, value: number | boolean) => onChange({ ...values, [key]: value })
-  const reset = () => onChange({ ...schema.defaults } as Record<string, number | boolean>)
+  const set = (key: string, value: number | boolean | string) => onChange({ ...values, [key]: value })
+  const reset = () => onChange({ ...schema.defaults } as Record<string, number | boolean | string>)
 
   return (
     <div className="stack" style={{ gap: 10 }}>
@@ -20,6 +20,18 @@ export default function ParamsEditor({ schema, values, onChange, compact = false
       <div className={compact ? 'grid-3' : 'grid-2'} style={{ gap: 10 }}>
         {schema.params.map((param) => {
           const value = values[param.key] ?? param.default
+          if (param.kind === 'select') {
+            return (
+              <div className="field" key={param.key} title={param.help}>
+                <label>{param.label}</label>
+                <select className="select" value={String(value)} onChange={(e) => set(param.key, e.target.value)}>
+                  {(param.options ?? []).map((opt) => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+              </div>
+            )
+          }
           if (param.kind === 'bool') {
             return (
               <div key={param.key} className="field" style={{ justifyContent: 'center' }}>

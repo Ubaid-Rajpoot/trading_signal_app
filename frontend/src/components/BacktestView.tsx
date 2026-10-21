@@ -29,7 +29,7 @@ export default function BacktestView({ meta, initialSymbol, initialTimeframe, in
   const [sideFilter, setSideFilter] = useState<'ALL' | 'LONG' | 'SHORT'>('ALL')
 
   const schema = useMemo(() => meta.strategies.find((s) => s.id === strategyId) ?? meta.strategies[0], [meta, strategyId])
-  const [params, setParams] = useState<Record<string, number | boolean>>({ ...schema.defaults })
+  const [params, setParams] = useState<Record<string, number | boolean | string>>({ ...schema.defaults })
 
   const run = async () => {
     setLoading(true)
@@ -87,7 +87,9 @@ export default function BacktestView({ meta, initialSymbol, initialTimeframe, in
                 setParams({ ...next.defaults })
               }}
             >
-              {meta.strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              {meta.strategies.map((s) => (
+                <option key={s.id} value={s.id}>{s.name} · v{s.version}</option>
+              ))}
             </select>
           </Field>
           <Field label="History (bars)" hint="Max 1000 per exchange request">

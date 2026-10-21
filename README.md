@@ -23,7 +23,8 @@ file, and everything else — charting, scanning, backtesting, alerting — reus
 | **Setup radar** | The main screen: a symbol × timeframe grid (1m / 3m / 5m / 15m / 30m) showing whether a setup is **triggered / armed / forming / absent** on each instrument right now |
 | **Chart view** | Candles with swing levels, the TDI sub-pane (purple RSI, base line, bands, HVB markers) and a rule-by-rule explanation of the current state |
 | **Win-rate study** | 30 days of history across the five scalping timeframes, with hit rate, profit factor, returns and drawdown per timeframe |
-| **Signal engine** | Setup state (triggered / armed / forming / idle), which swing level still has to break, how far price is from it, and the TDI values behind it |
+| **Signal engine** | Setup state (triggered / armed / forming / blocked / idle), which swing level still has to break, how far price is from it, and the TDI values behind it |
+| **Structure filter** | v2 only trades setups that form inside external or internal structure, with the external trend, outside ranges, and away from liquidity build-ups |
 | **Backtester** | Next-bar fills, intrabar stop/target checks, fees + slippage, fixed-fractional risk, full trade log, equity curve vs buy & hold, Sharpe/Sortino/PF/expectancy |
 | **Alerts** | Background scanner persists each actionable signal once per bar, delivers to Telegram and/or a JSON webhook, logs every attempt |
 | **Persistence** | SQLite for settings, signal history and alert log — no external services |
@@ -95,6 +96,7 @@ setup building on this instrument and timeframe right now?
 | **SETUP** | HVB crossed the base line **and** the swing broke, on the same candle |
 | **ARMED** | The HVB printed, price still has to break a swing high/low |
 | **FORMING** | Price is near a swing level and/or the purple line is heading for the base line |
+| **BLOCKED** | A setup is forming but the v2 rules forbid it — the market is ranging, the setup is against the trend, there is no internal structure, or liquidity is stacked in front of it |
 | **—** | Nothing on this instrument right now |
 
 Click any cell to open that chart. The radar rescans every 60 seconds.
@@ -158,6 +160,21 @@ works offline.
 > (`live`, `cache` or `demo`). If the exchange is unreachable the app falls back
 > to a deterministic demo feed; the report then says **DEMO DATA** in red,
 > because those numbers say nothing about the real market.
+
+## Strategy versions
+
+The trader's system ships in versions, and every version stays available in the
+strategy dropdown:
+
+| Version | id | Status |
+|---|---|---|
+| v1.0 | `tdi_shift_v1` | frozen — HVB + same-candle structure break, no filters |
+| v2.0 | `tdi_shift_v2` | **default** — v1 + structure / trend / range / liquidity filters |
+
+`tdi_shift` resolves to the latest version, so old links keep working. v1 is
+frozen so its results stay reproducible; the commit is tagged `strategy-v1`.
+Details, thresholds and how to compare them:
+[`docs/strategy-versions.md`](docs/strategy-versions.md).
 
 ## How the signal engine works
 
@@ -344,6 +361,7 @@ backend/
     core/
       indicators.py         pure-pandas TA including TDI
       swings.py             swing pivots, SHIFT and MS detection
+      market_structure.py   trend / range / structure / liquidity gates
       signals.py            signal + setup state
       winrate.py            win-rate study
       backtest.py           event-driven backtester (stops optional)
@@ -352,7 +370,8 @@ backend/
       utils_paths.py        cache paths
       strategies/
         base.py             Strategy / TriggerSet / Targets framework
-        tdi_shift.py        the trader's system (default)
+        tdi_shift_v1.py     the trader's system, v1 (frozen)
+        tdi_shift.py        the trader's system, v2 (default)
         donchian.py · ema_trend.py · custom.py
       data/
         history.py          paged downloads + CSV cache

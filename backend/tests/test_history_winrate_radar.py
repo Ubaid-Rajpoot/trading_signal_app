@@ -88,7 +88,9 @@ def test_setup_level_is_on_the_correct_side():
     for tf in ("1m", "5m", "15m"):
         signal = build_signal("BTCUSDT", tf, "tdi_shift", limit=500)
         setup = signal["setup"]
-        assert setup["status"] in ("TRIGGERED", "ARMED", "FORMING", "IDLE")
+        assert setup["status"] in ("TRIGGERED", "ARMED", "FORMING", "IDLE", "BLOCKED")
+        if setup["status"] == "BLOCKED":
+            assert setup["blocked_reason"]
         if setup["level"] is not None and setup["direction"]:
             if setup["direction"] == "LONG":
                 assert setup["level"] > signal["price"]
@@ -100,7 +102,7 @@ def test_setup_level_is_on_the_correct_side():
 def test_scan_rows_expose_setup_fields():
     result = scan(["BTCUSDT", "ETHUSDT"], "5m", "tdi_shift")
     for row in result["rows"]:
-        assert row.get("setup_status") in ("TRIGGERED", "ARMED", "FORMING", "IDLE")
+        assert row.get("setup_status") in ("TRIGGERED", "ARMED", "FORMING", "IDLE", "BLOCKED")
 
 
 def test_backtest_metrics_are_json_safe_for_signal_only_mode():

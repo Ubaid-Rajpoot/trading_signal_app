@@ -49,8 +49,8 @@ class SettingsPatch(BaseModel):
 
 class BacktestRequest(BaseModel):
     symbol: str = "BTCUSDT"
-    timeframe: str = "1h"
-    strategy: str = "donchian"
+    timeframe: str = "15m"
+    strategy: str = "tdi_shift"
     params: dict[str, Any] = Field(default_factory=dict)
     bars: int = Field(default=800, ge=100, le=1000)
     initial_equity: float = Field(default=10_000, gt=0)
@@ -95,8 +95,8 @@ def meta() -> dict[str, Any]:
 @router.get("/signal")
 def signal(
     symbol: str = Query("BTCUSDT"),
-    timeframe: str = Query("1h"),
-    strategy: str = Query("donchian"),
+    timeframe: str = Query("15m"),
+    strategy: str = Query("tdi_shift"),
     params: str | None = Query(None, description="JSON object of strategy parameter overrides"),
     limit: int = Query(400, ge=100, le=1000),
 ) -> dict[str, Any]:
@@ -111,8 +111,8 @@ def signal(
 @router.get("/scan")
 def scan_endpoint(
     symbols: str = Query("", description="Comma-separated symbols; defaults to the saved watchlist"),
-    timeframe: str = Query("1h"),
-    strategy: str = Query("donchian"),
+    timeframe: str = Query("15m"),
+    strategy: str = Query("tdi_shift"),
     params: str | None = Query(None),
 ) -> dict[str, Any]:
     if symbols.strip():
@@ -224,6 +224,8 @@ def radar(
                     "change_pct": signal["change_pct"],
                     "tdi": signal["setup"]["tdi"],
                     "text": signal["setup"]["text"],
+                    "blocked_reason": signal["setup"].get("blocked_reason"),
+                    "regime": (signal.get("regime") or {}).get("state"),
                     "source": signal["source"],
                 }
             except Exception as exc:
@@ -237,6 +239,7 @@ def radar(
         if cell.get("status") in ("TRIGGERED", "ARMED", "FORMING")
     ]
     actionable.sort(key=lambda r: ({"TRIGGERED": 0, "ARMED": 1, "FORMING": 2}.get(r["status"], 3), r["symbol"]))
+    blocked = sum(1 for row in grid for cell in row["cells"].values() if cell.get("status") == "BLOCKED")
     return sanitize(
         {
             "generated_at": int(time.time() * 1000),
@@ -244,6 +247,7 @@ def radar(
             "timeframes": tfs,
             "grid": grid,
             "actionable": actionable,
+            "blocked_count": blocked,
         }
     )
 

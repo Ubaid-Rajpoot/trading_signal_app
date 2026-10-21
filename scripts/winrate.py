@@ -126,10 +126,26 @@ def main() -> int:
             f"{wr:>8}{row['total_return_pct']:>10}{pf:>7}{row['max_drawdown_pct']:>9}  {row.get('source')}"
         )
 
+    if any(row.get("filters") for row in result["rows"]):
+        print()
+        print("Filter effect (setups the previous version would have taken):")
+        for row in result["rows"]:
+            f = row.get("filters")
+            if not f:
+                continue
+            print(f"  {row['timeframe']:<4} raw {f['raw']:>4}  taken {f['taken']:>4}  blocked {f['raw'] - f['taken']:>4}")
+            for why, count in sorted(f["blocked"].items(), key=lambda kv: -kv[1]):
+                print(f"        {count:>4}x {why}")
+
     s = result["summary"]
     print()
     print(f"Trades: {s['trades']}   Wins: {s['wins']}   Losses: {s['losses']}")
     print(f"Overall win rate: {s['win_rate_pct']}%   Best timeframe: {s['best_timeframe']}")
+    if s.get("low_sample") and s["trades"]:
+        print(
+            f"WARNING: only {s['trades']} trades - too few to judge a win rate. "
+            "Use a longer window or more symbols."
+        )
     print(f"Data: {', '.join(result['sources'])}")
     print(result["caveat"])
 

@@ -27,12 +27,13 @@ class ParamSpec:
 
     key: str
     label: str
-    kind: Literal["int", "float", "bool"] = "int"
+    kind: Literal["int", "float", "bool", "select"] = "int"
     default: Any = None
     min: float | None = None
     max: float | None = None
     step: float | None = None
     help: str = ""
+    options: list[str] = field(default_factory=list)  # for kind="select"
 
 
 @dataclass
@@ -103,6 +104,12 @@ class Strategy:
     # False = no stop loss / take profit at all; the strategy's own exit trigger
     # is the only way out (used by the TDI + shift setup system).
     uses_stops: bool = True
+    # Versioning: every published rule set keeps its own id so old results stay
+    # reproducible. ``frozen`` marks a version that must never be edited again.
+    version: str = "1.0"
+    version_note: str = ""
+    supersedes: str = ""
+    frozen: bool = False
     params: list[ParamSpec] = []
     plot_lines: list[dict[str, str]] = []  # {column, label, colour}
     pane: dict[str, Any] | None = None  # optional oscillator sub-chart (e.g. TDI)
@@ -122,6 +129,11 @@ class Strategy:
             try:
                 if spec.kind == "bool":
                     value: Any = raw if isinstance(raw, bool) else str(raw).lower() in ("1", "true", "yes", "on")
+                elif spec.kind == "select":
+                    text = str(raw)
+                    if spec.options and text not in spec.options:
+                        continue
+                    value = text
                 elif spec.kind == "int":
                     value = int(round(float(raw)))
                 else:
@@ -145,6 +157,10 @@ class Strategy:
             "timeframe_hint": cls.timeframe_hint,
             "allows_short": cls.allows_short,
             "uses_stops": cls.uses_stops,
+            "version": cls.version,
+            "version_note": cls.version_note,
+            "supersedes": cls.supersedes,
+            "frozen": cls.frozen,
             "params": [
                 {
                     "key": p.key,
@@ -155,6 +171,7 @@ class Strategy:
                     "max": p.max,
                     "step": p.step,
                     "help": p.help,
+                    "options": p.options,
                 }
                 for p in cls.params
             ],
@@ -169,6 +186,14 @@ class Strategy:
 
     def rules(self, data: pd.DataFrame, params: dict[str, Any]) -> TriggerSet:
         raise NotImplementedError
+
+    def filter_report(self, data: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any] | None:
+        """Optional: how many raw setups the version's filters removed, and why.
+
+        Used by the win-rate study to show the effect of a version's filters
+        next to the trades it actually took. ``None`` = no filtering to report.
+        """
+        return None
 
     def targets(self, data: pd.DataFrame, params: dict[str, Any], side: Signal) -> Targets:
         """Default: ATR stop + ladder of R-multiple targets."""

@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import TIMEFRAMES
+from . import market_structure as ms
 from .data.providers import MarketDataError, get_candles
 from .strategies import Strategy, get_strategy
 from .strategies.base import Targets
@@ -207,6 +208,24 @@ def _setup_block(
     elif direction == "SHORT":
         level = level_down
 
+    # v2-style strategies publish a per-bar gate; a setup that fails it is shown
+    # as BLOCKED so the radar never advertises a trade the rules forbid.
+    blocked_reason = None
+    if direction and status in ("FORMING", "ARMED") and "setup_ok_long" in prepared.columns:
+        column = "setup_ok_long" if direction == "LONG" else "setup_ok_short"
+        if not bool(prepared[column].iloc[-1]):
+            row = prepared.iloc[-1]
+            if row.get("regime") != ms.TRENDING:
+                blocked_reason = f"market is {str(row.get('regime') or 'unknown').lower()} - {row.get('regime_reason')}"
+            elif (row.get("liq_above") if direction == "LONG" else row.get("liq_below")):
+                blocked_reason = "liquidity build-up in front of the setup"
+            elif (row.get("trend_dir") or 0) * (1 if direction == "LONG" else -1) <= 0:
+                blocked_reason = "setup is against the external trend"
+            else:
+                blocked_reason = "no internal structure to break"
+            status = "BLOCKED"
+            text = f"Setup forming, but blocked: {blocked_reason}."
+
     distance_pct = round((level - price) / price * 100, 3) if (level and price) else None
 
     return {
@@ -216,6 +235,7 @@ def _setup_block(
         "distance_pct": distance_pct,
         "hvb_bars_ago": bars_ago,
         "text": text,
+        "blocked_reason": blocked_reason,
         "tdi": {
             "purple": round(purple, 3) if purple is not None else None,
             "base": round(base, 3) if base is not None else None,
@@ -410,9 +430,11 @@ def build_signal(
         confidence_label = "Conviction"
 
     setup = _setup_block(prepared, triggers, strategy, resolved, entry_fired, state, action, price)
+    regime = ms.describe(prepared.iloc[-1]) if "regime" in prepared.columns else None
 
     return {
         "setup": setup,
+        "regime": regime,
         "symbol": symbol.upper(),
         "timeframe": timeframe,
         "timeframe_label": TIMEFRAMES.get(timeframe, {}).get("label", timeframe),

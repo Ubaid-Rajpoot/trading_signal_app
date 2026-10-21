@@ -7,8 +7,9 @@ const STATUS_META: Record<string, { label: string; colour: string; bg: string; o
   TRIGGERED: { label: 'SETUP', colour: '#04140f', bg: '#2fd6a3', order: 0 },
   ARMED: { label: 'ARMED', colour: '#241a02', bg: '#f5b544', order: 1 },
   FORMING: { label: 'FORMING', colour: '#8fb7ff', bg: 'rgba(56,189,248,0.16)', order: 2 },
-  IDLE: { label: '—', colour: 'var(--muted-2)', bg: 'rgba(255,255,255,0.03)', order: 3 },
-  ERROR: { label: 'ERR', colour: 'var(--red)', bg: 'var(--red-soft)', order: 4 },
+  BLOCKED: { label: 'BLOCKED', colour: 'var(--amber)', bg: 'rgba(245,181,68,0.10)', order: 3 },
+  IDLE: { label: '—', colour: 'var(--muted-2)', bg: 'rgba(255,255,255,0.03)', order: 4 },
+  ERROR: { label: 'ERR', colour: 'var(--red)', bg: 'var(--red-soft)', order: 5 },
 }
 
 interface Props {
@@ -56,9 +57,16 @@ export default function SetupRadar({ meta, watchlist, strategyId, onOpen }: Prop
         }
       >
         <div className="tiny muted" style={{ marginBottom: 12 }}>
-          Har cell batata hai ke us instrument + timeframe par abhi kya ho raha hai. Kisi bhi cell par click
-          karke chart khol sakte hain.
+          Har cell batata hai ke us instrument + timeframe par abhi kya ho raha hai. <strong>BLOCKED</strong> ka
+          matlab: setup ban raha hai lekin rules mana kar rahe hain (market range me hai, trend ke khilaf hai, ya
+          liquidity build-up saamne hai). Kisi bhi cell par click karke chart khol sakte hain.
         </div>
+        {data && data.blocked_count > 0 && (
+          <div className="tiny" style={{ marginBottom: 8, color: 'var(--amber)' }}>
+            {data.blocked_count} setup{data.blocked_count === 1 ? '' : 's'} blocked by the structure filter right now —
+            v1 would have traded them.
+          </div>
+        )}
 
         {error && <ErrorBox message={error} onRetry={load} />}
 
@@ -84,7 +92,7 @@ export default function SetupRadar({ meta, watchlist, strategyId, onOpen }: Prop
                       <td key={tf} className="num" style={{ padding: 4 }}>
                         <button
                           className="radar-cell"
-                          style={{ background: meta.bg, color: meta.colour }}
+                          style={{ background: meta.bg, color: meta.colour, opacity: cell.status === 'BLOCKED' ? 0.75 : 1 }}
                           disabled={!clickable}
                           onClick={() => onOpen(row.symbol, tf)}
                           title={cell.text || cell.error || `${row.symbol} ${tf}`}

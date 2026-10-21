@@ -65,6 +65,13 @@ def _run_one(
             triggers.short_exit.iloc[warm:].reset_index(drop=True),
         )
 
+    # How many raw (v1) setups did this version's filters remove, and why?
+    filters = None
+    try:
+        filters = strategy.filter_report(prepared, resolved)
+    except Exception:
+        filters = None
+
     config = BacktestConfig(initial_equity=10_000, fee_bps=5, slippage_bps=2, cash_fraction=1.0)
     result = run_backtest(
         prepared,
@@ -102,6 +109,7 @@ def _run_one(
         "avg_bars_held": m.get("avg_bars_held"),
         "first_bar": m.get("start"),
         "last_bar": m.get("end"),
+        "filters": filters,
     }
 
 
@@ -146,6 +154,8 @@ def report(
         "symbol": symbol.upper(),
         "days": days,
         "strategy": strategy,
+        "strategy_id": get_strategy(strategy).id,
+        "strategy_version": get_strategy(strategy).version,
         "params": get_strategy(strategy).resolve_params(params or {}),
         "generated_at": int(time.time() * 1000),
         "sources": sources,
@@ -158,6 +168,9 @@ def report(
             "losses": total_trades - total_wins,
             "win_rate_pct": round(total_wins / total_trades * 100, 2) if total_trades else None,
             "best_timeframe": max(valid, key=lambda r: r["win_rate_pct"])["timeframe"] if valid else None,
+            "low_sample": total_trades < 30,
+            "raw_setups": sum((r.get("filters") or {}).get("raw", 0) for r in valid),
+            "taken_setups": sum((r.get("filters") or {}).get("taken", 0) for r in valid),
         },
         "caveat": _caveat(sources),
     }
@@ -199,6 +212,13 @@ def trades_detail(
             triggers.short_entry.iloc[warm:].reset_index(drop=True),
             triggers.short_exit.iloc[warm:].reset_index(drop=True),
         )
+
+    # How many raw (v1) setups did this version's filters remove, and why?
+    filters = None
+    try:
+        filters = strategy.filter_report(prepared, resolved)
+    except Exception:
+        filters = None
 
     config = BacktestConfig(initial_equity=10_000, fee_bps=5, slippage_bps=2, cash_fraction=1.0)
     result = run_backtest(

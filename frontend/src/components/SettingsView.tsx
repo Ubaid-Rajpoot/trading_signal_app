@@ -17,7 +17,7 @@ export default function SettingsView({ meta, settings, onSaved }: Props) {
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ channel: string; status: string; detail: string } | null>(null)
-  const [strategyParams, setStrategyParams] = useState<Record<string, number | boolean>>({})
+  const [strategyParams, setStrategyParams] = useState<Record<string, number | boolean | string>>({})
 
   const schema = meta.strategies.find((s) => s.id === draft.strategy) ?? meta.strategies[0]
 
@@ -87,7 +87,9 @@ export default function SettingsView({ meta, settings, onSaved }: Props) {
                   if (found) setStrategyParams({ ...found.defaults })
                 }}
               >
-                {meta.strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {meta.strategies.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name} · v{s.version}</option>
+                ))}
               </select>
             </Field>
             <Field label="Default timeframe">

@@ -15,6 +15,8 @@ by the app.
 | [`charts/btc-3m-tdgm-ubaid-01.png`](charts/btc-3m-tdgm-ubaid-01.png) | BTC 3m — same settings, level retest. |
 | [`charts/btc-3m-tdgm-ubaid-02.png`](charts/btc-3m-tdgm-ubaid-02.png) | BTC 3m — same settings, HVB marker on the base-line cross. |
 | [`charts/btc-3m-wick-then-body-break.png`](charts/btc-3m-wick-then-body-break.png) | The break rule: *"broken by wick and then by next candle body and still working"* — a body close counts, a wick poke does not. |
+| [`charts/valid-setup-downtrend-examples.png`](charts/valid-setup-downtrend-examples.png) | **v2**: two downtrend examples of a *valid* setup — impulse leg, compact correction (orange levels), break, continuation. |
+| [`charts/setup-inside-structure-zone.png`](charts/setup-inside-structure-zone.png) | The same two examples with the structure zone circled: the setup forms **inside** that structure, not in open space. |
 
 ## Book
 
@@ -36,4 +38,6 @@ define this strategy are:
 | TDI maths (`TDIGM`) | `backend/app/core/indicators.py` → `tdi()` |
 | HVB (purple line breaks the base line with speed) | `backend/app/core/strategies/tdi_shift.py` |
 | SHIFT (minor swing) / MS (major swing) | `backend/app/core/swings.py` |
+| Trend / range / liquidity filters (v2) | `backend/app/core/market_structure.py` |
 | The rule in plain words | [`../strategy-spec.md`](../strategy-spec.md) |
+| Version history | [`../strategy-versions.md`](../strategy-versions.md) |

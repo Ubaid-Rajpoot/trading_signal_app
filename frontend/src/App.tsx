@@ -178,7 +178,11 @@ export default function App() {
           {tab === 'dashboard' && (
             <>
               <select className="select" value={strategyId} onChange={(e) => setStrategyId(e.target.value)}>
-                {meta.strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {meta.strategies.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} · v{s.version}{s.frozen ? ' (frozen)' : ''}
+                  </option>
+                ))}
               </select>
               <div className="segmented">
                 {(meta.scan_timeframes ?? meta.timeframes.map((t) => t.value)).map((tf) => (

@@ -102,6 +102,36 @@ as fallback) plus an ATR buffer. **Targets:** 1R / `target_r`R / 1.6×`target_r`
 - The chart draws the swing levels on price and a live **TDI sub-pane**
   underneath (purple RSI, base line, blue bands, yellow HVB markers).
 
+## 5b. v2 — the structure / trend filter (current default)
+
+Your refinement, in your words:
+
+> "Ye setup external ya internal structure ke andar ban jaye to valid hai, aur
+> agar range me bane ya jahan PDF ke mutabiq build-up ho raha hai — liquidity ban
+> rahi hai — wahan ye kaam nahi karta. Market trendy ho, ranging na ho."
+
+The drawings in [`reference/charts/valid-setup-downtrend-examples.png`](reference/charts/valid-setup-downtrend-examples.png)
+and [`reference/charts/setup-inside-structure-zone.png`](reference/charts/setup-inside-structure-zone.png)
+show the shape: impulse leg down → compact correction (a minor high and a minor
+low) → break of that correction → continuation. Mirror it for an uptrend.
+
+v2 keeps every v1 rule and adds four gates, all on the same candle:
+
+| Gate | Rule | Rejects |
+|---|---|---|
+| **Direction** | external trend (last major break) must match the trade | counter-trend entries |
+| **Inside structure** | both minor pivots are newer than the last major break, and the structure is 0.4–6 ATR tall | setups with no structure around them |
+| **Not ranging** | fresh break ≤ 120 bars, ADX ≥ 18, efficiency ratio ≥ 0.20 | everything inside chop |
+| **No liquidity build-up** | ≥ 3 equal highs/lows within 0.25 ATR in 30 bars blocks that side | setups aimed into a pool |
+
+The efficiency ratio is the part that matters most: a **wide range keeps breaking
+major swings in both directions**, so "the last break was down" alone still
+counts in chop. Net travel ÷ total travel over 40 bars separates the two.
+
+Implementation: [`backend/app/core/market_structure.py`](../backend/app/core/market_structure.py).
+Version history: [`strategy-versions.md`](strategy-versions.md). v1 stays
+available and frozen as `tdi_shift_v1`.
+
 ## 6. Signal frequency (measured, honest numbers)
 
 On the synthetic demo feed (smoother than real crypto), TDI(50) crosses its
@@ -120,3 +150,4 @@ If that is too strict for your taste, the levers (all in the UI) are:
 | 2 | Longs + shorts, or long only on spot? |
 | 3 | Any session / news filter (London / NY open)? |
 | 4 | Do you want the **strong / weak high-low** and **failure swing** labels from the book on the chart too? |
+| 5 | v2 blocks a lot of setups in chop (that is the point). Is the current strictness right, or should the range test be looser on 1m/3m? |

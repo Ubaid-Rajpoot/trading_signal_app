@@ -4,23 +4,29 @@ export type Bias = 'LONG' | 'SHORT' | 'NEUTRAL'
 export interface ParamSpec {
   key: string
   label: string
-  kind: 'int' | 'float' | 'bool'
+  kind: 'int' | 'float' | 'bool' | 'select'
   default: number | boolean
   min: number | null
   max: number | null
   step: number | null
   help: string
+  options: string[]
 }
 
 export interface StrategySchema {
   id: string
   name: string
   description: string
+  version: string
+  version_note: string
+  supersedes: string
+  frozen: boolean
+  uses_stops: boolean
   market: string
   timeframe_hint: string
   allows_short: boolean
   params: ParamSpec[]
-  defaults: Record<string, number | boolean>
+  defaults: Record<string, number | boolean | string>
   plot_lines: { column: string; label: string; colour: string }[]
 }
 
@@ -78,17 +84,18 @@ export interface ChartPayload {
 }
 
 export interface Setup {
-  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE'
+  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE' | 'BLOCKED'
   direction: 'LONG' | 'SHORT' | null
   level: number | null
   distance_pct: number | null
   hvb_bars_ago: number | null
   text: string
+  blocked_reason?: string | null
   tdi: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
 }
 
 export interface RadarCell {
-  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE' | 'ERROR'
+  status: 'TRIGGERED' | 'ARMED' | 'FORMING' | 'IDLE' | 'BLOCKED' | 'ERROR'
   direction?: 'LONG' | 'SHORT' | null
   level?: number | null
   distance_pct?: number | null
@@ -96,8 +103,31 @@ export interface RadarCell {
   change_pct?: number
   tdi?: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
   text?: string
+  blocked_reason?: string | null
+  regime?: string | null
   source?: string
   error?: string
+}
+
+export interface Regime {
+  state: string
+  trend: 'UP' | 'DOWN' | 'NONE'
+  regime: 'TRENDING' | 'RANGING' | 'UNKNOWN'
+  reason: string
+  adx: number | null
+  efficiency: number | null
+  bars_since_bos: number | null
+  structure_atr: number | null
+  structure_ready: boolean
+  ext_high: number | null
+  ext_low: number | null
+  int_high: number | null
+  int_low: number | null
+  liquidity_above: boolean
+  liquidity_below: boolean
+  long_ok: boolean
+  short_ok: boolean
+  blocked: string | null
 }
 
 export interface RadarResponse {
@@ -106,6 +136,7 @@ export interface RadarResponse {
   timeframes: string[]
   grid: { symbol: string; cells: Record<string, RadarCell> }[]
   actionable: ({ symbol: string; timeframe: string } & RadarCell)[]
+  blocked_count: number
 }
 
 export interface WinRateRow {
@@ -125,6 +156,7 @@ export interface WinRateRow {
   max_drawdown_pct?: number
   exposure_pct?: number
   avg_bars_held?: number
+  filters?: { raw: number; taken: number; blocked: Record<string, number> } | null
   error?: string
 }
 
@@ -132,12 +164,22 @@ export interface WinRateReport {
   symbol: string
   days: number
   strategy: string
-  params: Record<string, number | boolean>
+  params: Record<string, number | boolean | string>
   generated_at: number
   sources: string[]
   is_real_data: boolean
   rows: WinRateRow[]
-  summary: { timeframes_tested: number; trades: number; wins: number; losses: number; win_rate_pct: number | null; best_timeframe: string | null }
+  summary: {
+    timeframes_tested: number
+    trades: number
+    wins: number
+    losses: number
+    win_rate_pct: number | null
+    best_timeframe: string | null
+    low_sample?: boolean
+    raw_setups?: number
+    taken_setups?: number
+  }
   caveat: string
 }
 
@@ -178,11 +220,12 @@ export interface DataSourceInfo {
 
 export interface Signal {
   setup: Setup
+  regime: Regime | null
   symbol: string
   timeframe: string
   timeframe_label: string
   strategy: { id: string; name: string; uses_stops: boolean }
-  params: Record<string, number | boolean>
+  params: Record<string, number | boolean | string>
   source: 'live' | 'cache' | 'demo'
   generated_at: number
   bar_time: number
@@ -279,7 +322,7 @@ export interface BacktestResult {
   timeframe: string
   source: string
   strategy: { id: string; name: string }
-  params: Record<string, number | boolean>
+  params: Record<string, number | boolean | string>
   metrics: BacktestMetrics
   trades: Trade[]
   equity_curve: { time: number; equity: number; price: number }[]

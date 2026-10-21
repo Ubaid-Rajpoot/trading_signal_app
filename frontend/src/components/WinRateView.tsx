@@ -57,7 +57,9 @@ export default function WinRateView({ meta }: { meta: Meta }) {
           </Field>
           <Field label="Strategy">
             <select className="select" value={strategy} onChange={(e) => setStrategy(e.target.value)}>
-              {meta.strategies.map((st) => <option key={st.id} value={st.id}>{st.name}</option>)}
+              {meta.strategies.map((st) => (
+                <option key={st.id} value={st.id}>{st.name} · v{st.version}</option>
+              ))}
             </select>
           </Field>
           <div className="field" style={{ justifyContent: 'flex-end' }}>
@@ -159,6 +161,21 @@ export default function WinRateView({ meta }: { meta: Meta }) {
             <StatTile label="Data source" value={report.sources.join(', ') || '—'} sub={report.is_real_data ? 'real exchange candles' : 'synthetic demo feed'} />
           </div>
 
+          {s?.low_sample && (
+            <div className="error-box">
+              <strong>Too few trades.</strong> Only {s.trades} setups were taken in this window, so the win rate above
+              is not statistically meaningful. Use a longer window or a lower-threshold version.
+            </div>
+          )}
+
+          {s?.raw_setups != null && s.raw_setups > 0 && (
+            <div className="tiny muted">
+              Structure filter: <strong>{s.raw_setups}</strong> raw setups (previous version) →{' '}
+              <strong>{s.taken_setups}</strong> taken by this version. The rest were blocked as ranging,
+              against-trend, outside structure or into liquidity.
+            </div>
+          )}
+
           <Section
             title={`${report.symbol} · last ${report.days} days`}
             right={<span className="tiny muted">generated {fmtTime(report.generated_at)}</span>}
@@ -171,7 +188,7 @@ export default function WinRateView({ meta }: { meta: Meta }) {
                     <th>TF</th><th className="num">Bars</th><th className="num">Trades</th><th className="num">Wins</th>
                     <th className="num">Losses</th><th className="num">Win rate</th><th className="num">Return</th>
                     <th className="num">Buy &amp; hold</th><th className="num">Avg win</th><th className="num">Avg loss</th>
-                    <th className="num">PF</th><th className="num">Max DD</th><th>Source</th>
+                    <th className="num">PF</th><th className="num">Max DD</th><th className="num">Setups</th><th>Source</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -179,7 +196,7 @@ export default function WinRateView({ meta }: { meta: Meta }) {
                     <tr key={row.timeframe}>
                       <td className="mono">{row.timeframe}</td>
                       {row.error ? (
-                        <td colSpan={12} className="muted">error: {row.error}</td>
+                        <td colSpan={13} className="muted">error: {row.error}</td>
                       ) : (
                         <>
                           <td className="num">{row.bars?.toLocaleString()}</td>
@@ -195,6 +212,9 @@ export default function WinRateView({ meta }: { meta: Meta }) {
                           <td className="num neg">{fmtPct(row.avg_loss_pct)}</td>
                           <td className="num">{row.profit_factor != null ? row.profit_factor.toFixed(2) : '—'}</td>
                           <td className="num neg">{fmtPct(row.max_drawdown_pct)}</td>
+                          <td className="num tiny">
+                            {row.filters ? `${row.filters.taken} / ${row.filters.raw}` : `${row.trades ?? 0}`}
+                          </td>
                           <td><span className={`chip ${row.source === 'demo' ? 'exit' : 'buy'}`}>{row.source}</span></td>
                         </>
                       )}
