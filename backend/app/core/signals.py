@@ -310,11 +310,10 @@ def build_signal(
     price = _f(last["close"], 0.0) or 0.0
     plan_side = side or ("LONG" if (trend_ref is None or price >= trend_ref) else "SHORT")
     # Stop-less systems only report the setup; no entry/stop/target ladder.
-    targets = (
-        strategy.targets(prepared, resolved, plan_side)
-        if getattr(strategy, "uses_stops", True)
-        else Targets()
-    )
+    # v4 has no stop loss but does trade to a level (the next swing high/low),
+    # so "has levels" is what matters here, not "uses stops".
+    has_levels = bool(getattr(strategy, "uses_stops", True) or getattr(strategy, "level_columns", None))
+    targets = strategy.targets(prepared, resolved, plan_side) if has_levels else Targets()
     confidence, confidence_notes = _confidence(prepared, bias if bias != "NEUTRAL" else plan_side)
     unrealized = None
     if state_info["entry_price"] and state != "FLAT":
@@ -480,9 +479,13 @@ def build_signal(
             **targets.as_dict(plan_side, price_decimals=6),
             "is_live": bool(bias != "NEUTRAL"),
             "note": (
-                "No stop loss or take profit - this system reports the setup only"
-                if not getattr(strategy, "uses_stops", True)
-                else ("Live setup" if bias != "NEUTRAL" else "Illustrative levels from the current bias")
+                "No stop loss. The trade runs to the next swing level (liquidity)."
+                if getattr(strategy, "level_columns", None)
+                else (
+                    "No stop loss or take profit - this system reports the setup only"
+                    if not getattr(strategy, "uses_stops", True)
+                    else ("Live setup" if bias != "NEUTRAL" else "Illustrative levels from the current bias")
+                )
             ),
         },
         "indicators": {

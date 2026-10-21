@@ -86,6 +86,17 @@ Tests:
 
 ---
 
+## The trader's system — v4
+
+`tdi_shift_v4` is the current default: HVB (aggressive centre-band break, no
+volume requirement) on the same candle as a swing break, in the direction of the
+trend, never in a range; exit at the next swing high/low (liquidity). v1–v3 stay
+available in the strategy picker and are frozen.
+
+Measured on six months of real BTCUSDT: `docs/reports/v4-real-btcusdt.md` —
+including the control test (random entries with the same exit lose money), and
+the finding that 1m is unprofitable.
+
 ## Real data, even without the exchange
 
 `backend/data/cache/datasets/<SYMBOL>/` holds real Binance kline files; one

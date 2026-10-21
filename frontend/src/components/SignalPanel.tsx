@@ -166,8 +166,9 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
         </div>
       </div>
 
-      {/* Only strategies that actually use a stop show one */}
-      {signal.strategy.uses_stops && plan?.entry != null && (
+      {/* Level-based plans: a stop if the strategy uses one, and the target it
+          actually trades to (v4 exits at the next swing level, not on a stop). */}
+      {plan?.entry != null && (signal.strategy.uses_stops || (plan.take_profits?.length ?? 0) > 0) && (
         <div style={{ marginTop: 16 }}>
           <div className="hstack" style={{ marginBottom: 8 }}>
             <span className="tiny muted" style={{ textTransform: 'uppercase', letterSpacing: '0.09em', fontWeight: 600 }}>
@@ -176,13 +177,15 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
             <span className="pill-tag">{plan.is_live ? 'Live' : 'Illustrative'}</span>
           </div>
           <div className="plan-grid">
-            <div className="plan-box">
-              <div className="k">Stop</div>
-              <div className="v neg">{fmtPrice(plan.stop)}</div>
-            </div>
+            {plan.stop != null && (
+              <div className="plan-box">
+                <div className="k">Stop</div>
+                <div className="v neg">{fmtPrice(plan.stop)}</div>
+              </div>
+            )}
             {plan.take_profits.slice(0, 2).map((tp, i) => (
               <div className="plan-box" key={i}>
-                <div className="k">Target {i + 1}</div>
+                <div className="k">{signal.strategy.uses_stops ? `Target ${i + 1}` : 'Exit · next liquidity'}</div>
                 <div className="v pos">{fmtPrice(tp)}</div>
               </div>
             ))}

@@ -132,16 +132,15 @@ def test_long_and_short_directions_are_mirrored(strategy, params):
         assert row["tdi_fast"] < row["tdi_mbl"] or row["hvb_down"]
 
 
-def test_no_stop_loss_or_take_profit(strategy, params, prepared):
-    """The system reports setups only - there is no risk plan to compute."""
+def test_no_stop_loss(strategy, params, prepared):
+    """There is no stop loss. The only level is the exit target (next swing)."""
     assert strategy.uses_stops is False
     for side in ("LONG", "SHORT"):
         targets = strategy.targets(prepared, params, side)
         assert targets.stop is None
-        assert not targets.take_profits
     signal = build_signal("BTCUSDT", "15m", "tdi_shift", limit=600)
     plan = signal["plan"]
-    assert plan["stop"] is None and not plan["take_profits"]
+    assert plan["stop"] is None
     assert signal["strategy"]["uses_stops"] is False
 
 
@@ -164,7 +163,7 @@ def test_strategy_is_registered_and_default():
 
     ids = [s["id"] for s in list_strategies()]
     # Every published version stays available, newest is the default.
-    assert {"tdi_shift_v1", "tdi_shift_v2", "tdi_shift_v3"}.issubset(set(ids))
-    assert DEFAULT_STRATEGY == "tdi_shift_v3"
+    assert {"tdi_shift_v1", "tdi_shift_v2", "tdi_shift_v3", "tdi_shift_v4"}.issubset(set(ids))
+    assert DEFAULT_STRATEGY == "tdi_shift_v4"
     # The earlier strategies stay available side by side.
     assert {"donchian", "ema_trend", "custom"}.issubset(set(ids))

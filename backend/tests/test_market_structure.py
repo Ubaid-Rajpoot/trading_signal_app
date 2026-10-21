@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from app.core import market_structure as ms
+from app.core.strategies import DEFAULT_STRATEGY
 from app.core.strategies import get_strategy
 
 # Relaxed TDI thresholds so the tests exercise the *filters*, not the rarity of
@@ -110,10 +111,11 @@ def test_old_id_resolves_to_the_latest_version():
     from app.core.strategies import DEFAULT_STRATEGY
 
     assert get_strategy("tdi_shift").id == DEFAULT_STRATEGY
-    assert DEFAULT_STRATEGY == "tdi_shift_v3"
+    assert DEFAULT_STRATEGY == "tdi_shift_v4"
     # pinned versions never move
     assert get_strategy("tdi_shift_v1").id == "tdi_shift_v1"
     assert get_strategy("tdi_shift_v2").id == "tdi_shift_v2"
+    assert get_strategy("tdi_shift_v3").id == "tdi_shift_v3"
 
 
 def test_v1_behaviour_is_unchanged(v1):
@@ -279,7 +281,8 @@ def test_v3_is_v2_plus_volume():
     for key in ("require_trend", "reject_ranging", "require_structure", "reject_liquidity"):
         assert p3[key] == p2[key]
     assert v3.supersedes == v2.id
-    assert get_strategy("tdi_shift").id == v3.id
+    # tdi_shift now means the newest version, which is v4
+    assert get_strategy("tdi_shift").id == DEFAULT_STRATEGY
 
 
 def test_v3_params_are_relaxed_but_explicit_values_win():

@@ -12,8 +12,10 @@ from .ema_trend import EmaTrend
 from .tdi_shift import TdiShift
 from .tdi_shift_v1 import TdiShiftV1
 from .tdi_shift_v3 import TdiShiftV3
+from .tdi_shift_v4 import TdiShiftV4
 
 _REGISTRY: dict[str, type[Strategy]] = {
+    TdiShiftV4.id: TdiShiftV4,
     TdiShiftV3.id: TdiShiftV3,
     TdiShift.id: TdiShift,
     TdiShiftV1.id: TdiShiftV1,
@@ -25,10 +27,10 @@ _REGISTRY: dict[str, type[Strategy]] = {
 # Old ids keep working: ``tdi_shift`` now means "the latest version of the
 # trader's system". Pinned ids (e.g. tdi_shift_v1) never move.
 _ALIASES: dict[str, str] = {
-    "tdi_shift": TdiShiftV3.id,
+    "tdi_shift": TdiShiftV4.id,
 }
 
-DEFAULT_STRATEGY = TdiShiftV3.id
+DEFAULT_STRATEGY = TdiShiftV4.id
 
 
 def resolve_id(strategy_id: str | None) -> str:
@@ -60,7 +62,7 @@ def list_strategies() -> list[dict]:
 def list_versions() -> list[dict]:
     """Version history of the trader's TDI system (v1 first, then newer)."""
     rows = []
-    for cls in (TdiShiftV1, TdiShift, TdiShiftV3):
+    for cls in (TdiShiftV1, TdiShift, TdiShiftV3, TdiShiftV4):
         rows.append(
             {
                 "id": cls.id,

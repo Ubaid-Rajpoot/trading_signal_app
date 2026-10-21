@@ -155,6 +155,8 @@ def run_backtest(
     atr = prepared["atr"].to_numpy(dtype=float) if "atr" in prepared else np.full(n, np.nan)
 
     use_stops = bool(getattr(strategy, "uses_stops", True))
+    level_columns = getattr(strategy, "level_columns", None)
+    max_bars = int(params.get("max_bars", 0) or 0)
     long_entry = triggers.long_entry.to_numpy()
     long_exit = triggers.long_exit.to_numpy()
     short_entry = triggers.short_entry.to_numpy()
@@ -219,6 +221,18 @@ def run_backtest(
                     side = pending
                     equity_before = equity
                     equity -= abs(price * qty) * fee
+                    # A strategy can name the price levels it trades to - v4 uses
+                    # the nearest swing high/low ahead (the next liquidity), so
+                    # the target is read from the signal bar, not invented here.
+                    target = None
+                    if level_columns:
+                        column = level_columns[0] if side == "LONG" else level_columns[1]
+                        if column in prepared.columns:
+                            value = prepared[column].iloc[i - 1]
+                            if np.isfinite(value) and not (side == "LONG" and value <= price) and not (
+                                side == "SHORT" and value >= price
+                            ):
+                                target = float(value)
                     position = OpenPosition(
                         side=side,
                         entry_index=i,
@@ -226,7 +240,7 @@ def run_backtest(
                         entry_price=price,
                         qty=qty,
                         stop=float("nan"),
-                        target=None,
+                        target=target,
                         risk_per_unit=float("nan"),
                         equity_before=equity_before,
                     )
@@ -266,11 +280,11 @@ def run_backtest(
             side = position.side
             if use_stops:
                 hit_stop = lo[i] <= position.stop if side == "LONG" else h[i] >= position.stop
-                hit_target = position.target is not None and (
-                    h[i] >= position.target if side == "LONG" else lo[i] <= position.target
-                )
             else:
-                hit_stop = hit_target = False
+                hit_stop = False
+            hit_target = position.target is not None and (
+                h[i] >= position.target if side == "LONG" else lo[i] <= position.target
+            )
             if hit_stop:
                 close_position(i, position.stop, "stop")
             elif hit_target:
@@ -278,6 +292,10 @@ def run_backtest(
                 close_position(i, position.target, "target")
             elif (side == "LONG" and long_exit[i]) or (side == "SHORT" and short_exit[i]):
                 close_position(i, c[i], "signal")
+            elif max_bars and i - position.entry_index >= max_bars:
+                # A trade with no stop needs a clock, otherwise a loser can sit
+                # open forever and flatter the win rate by never closing.
+                close_position(i, c[i], "max_bars")
 
         # -------------------------------------------------- 3) new signals
         if position is None and i < n - 1:

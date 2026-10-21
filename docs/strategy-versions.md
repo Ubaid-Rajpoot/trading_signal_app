@@ -146,3 +146,25 @@ python scripts/winrate.py --days 30 --strategy tdi_shift_v2
 
 Use `--real-only` on a machine with internet access so the numbers come from
 Binance rather than the demo feed.
+
+## v4 — 4.0 (current)
+
+The trader's corrections, after he pointed out that the earlier versions were not
+his system:
+
+* **Volume is out.** HVB = the purple line breaking the centre band aggressively
+  (≥ `hvb_step` RSI points in 2 bars). No volume multiple is required. The
+  toggle `hvb_use_volume` still exists and defaults to off.
+* **Location is opened up.** A setup may form at the big trend's structure
+  *or* inside internal structure. `require_structure` defaults to off.
+* **Exit at the next liquidity.** The trade runs to the nearest confirmed swing
+  high (long) / swing low (short). The old "purple line crosses back" exit is off
+  unless `exit_on_tdi_cross` is switched on.
+* **A clock, not a stop.** `max_bars` (200) closes a trade that never reaches its
+  level. `invalidate_on_structure` (off) exits when price closes back through the
+  broken swing.
+
+Trend and range filters stay: the trade must agree with the external trend, and a
+ranging market still produces nothing.
+
+Measured on real BTCUSDT, Jan–Jun 2025: `docs/reports/v4-real-btcusdt.md`.
