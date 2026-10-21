@@ -141,6 +141,41 @@ export interface WinRateReport {
   caveat: string
 }
 
+export interface DataSourceHost {
+  host: string
+  ok: boolean
+  ms: number
+  detail: string
+}
+
+export interface DataSourceInfo {
+  symbol: string
+  timeframe: string
+  days: number
+  window: { start: string; end: string }
+  bar_seconds: number
+  bars_expected: number
+  hosts: DataSourceHost[]
+  hosts_ok: string[]
+  cache: {
+    path: string
+    exists: boolean
+    bars?: number
+    covers_window?: boolean
+    from?: string
+    to?: string
+    fetched_at?: string
+    recorded_source?: string
+  }
+  source: string
+  bars: number
+  first_candle: string
+  last_candle: string
+  first_close: number
+  last_close: number
+  is_real: boolean
+}
+
 export interface Signal {
   setup: Setup
   symbol: string

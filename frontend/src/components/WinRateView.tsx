@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { Meta, WinRateReport } from '../types'
+import type { DataSourceInfo, Meta, WinRateReport } from '../types'
 import { ErrorBox, Field, Section, Spinner, StatTile, fmtPct, fmtTime } from './ui'
 
 export default function WinRateView({ meta }: { meta: Meta }) {
@@ -10,6 +10,24 @@ export default function WinRateView({ meta }: { meta: Meta }) {
   const [report, setReport] = useState<WinRateReport | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [trail, setTrail] = useState<DataSourceInfo | null>(null)
+  const [trailLoading, setTrailLoading] = useState(false)
+  const [trailError, setTrailError] = useState<string | null>(null)
+  const [showTrail, setShowTrail] = useState(false)
+
+  // Ask the backend, step by step, where the candles would come from.
+  const checkData = async () => {
+    setShowTrail(true)
+    setTrailLoading(true)
+    setTrailError(null)
+    try {
+      setTrail(await api.dataSource(symbol, meta.scan_timeframes[0] ?? '15m', days))
+    } catch (err) {
+      setTrailError(err instanceof Error ? err.message : 'Data check failed')
+    } finally {
+      setTrailLoading(false)
+    }
+  }
 
   const run = async (refresh = false) => {
     setLoading(true)
@@ -48,6 +66,9 @@ export default function WinRateView({ meta }: { meta: Meta }) {
                 {loading ? <><Spinner /> Running…</> : 'Run study'}
               </button>
               <button className="btn ghost" onClick={() => run(true)} disabled={loading} title="Ignore cached candles and download again">Redownload</button>
+              <button className="btn ghost" onClick={checkData} disabled={trailLoading} title="Show where the candles come from">
+                {trailLoading ? <><Spinner /> Checking…</> : 'Check data'}
+              </button>
             </div>
           </div>
         </div>
@@ -56,6 +77,61 @@ export default function WinRateView({ meta }: { meta: Meta }) {
           setup and closes on the opposite TDI cross.
         </div>
       </Section>
+
+      {showTrail && (
+        <Section
+          title="Where the candles come from"
+          right={
+            <button className="btn ghost sm" onClick={() => setShowTrail(false)}>
+              Hide
+            </button>
+          }
+        >
+          {trailError && <div className="error-box">{trailError}</div>}
+          {trailLoading && !trail && <div className="tiny muted"><Spinner /> asking the exchange…</div>}
+          {trail && (
+            <div className="stack" style={{ gap: 12 }}>
+              <div className="tiny muted">
+                Window {trail.window.start} → {trail.window.end} · about {trail.bars_expected.toLocaleString()} candles
+                of {trail.bar_seconds}s
+              </div>
+              <div className="table-wrap">
+                <table className="data">
+                  <thead>
+                    <tr>
+                      <th>Exchange host</th><th>Reachable</th><th className="num">Latency</th><th>Answer</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trail.hosts.map((host) => (
+                      <tr key={host.host}>
+                        <td className="mono tiny">{host.host}</td>
+                        <td>
+                          <span className={`chip ${host.ok ? 'buy' : 'exit'}`}>{host.ok ? 'yes' : 'no'}</span>
+                        </td>
+                        <td className="num">{host.ms} ms</td>
+                        <td className="tiny muted">{host.detail}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="tiny muted mono">
+                cache: {trail.cache.path}
+                {trail.cache.exists
+                  ? ` · ${trail.cache.bars?.toLocaleString()} bars, downloaded ${trail.cache.fetched_at}`
+                  : ' · empty (nothing downloaded yet)'}
+              </div>
+              <div className="tiny">
+                Using <strong>{trail.bars.toLocaleString()}</strong> candles {trail.first_candle} → {trail.last_candle},
+                close {trail.first_close.toLocaleString()} → {trail.last_close.toLocaleString()} · source{' '}
+                <span className={`chip ${trail.is_real ? 'buy' : 'exit'}`}>{trail.source}</span>
+                {!trail.is_real && ' — synthetic, not market data'}
+              </div>
+            </div>
+          )}
+        </Section>
+      )}
 
       {error && <ErrorBox message={error} onRetry={() => run(false)} />}
 

@@ -1,5 +1,6 @@
 import type {
   BacktestResult,
+  DataSourceInfo,
   RadarResponse,
   WinRateReport,
   Meta,
@@ -60,6 +61,8 @@ export const api = {
     request<RadarResponse>(`/radar${qs({ symbols: symbols.join(','), timeframes: timeframes.join(','), strategy })}`),
   winrate: (symbol: string, days: number, strategy: string, refresh = false) =>
     request<WinRateReport>(`/winrate${qs({ symbol, days, strategy, refresh: refresh ? 'true' : undefined })}`),
+  dataSource: (symbol: string, timeframe: string, days: number) =>
+    request<DataSourceInfo>(`/data-source${qs({ symbol, timeframe, days })}`),
   settings: () => request<Settings>('/settings'),
   saveSettings: (patch: Partial<Settings>) =>
     request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(patch) }),
