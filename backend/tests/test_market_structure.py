@@ -107,8 +107,13 @@ def test_v1_is_frozen_and_v2_supersedes_it(v1, v2):
 
 
 def test_old_id_resolves_to_the_latest_version():
-    assert get_strategy("tdi_shift").id == "tdi_shift_v2"
+    from app.core.strategies import DEFAULT_STRATEGY
+
+    assert get_strategy("tdi_shift").id == DEFAULT_STRATEGY
+    assert DEFAULT_STRATEGY == "tdi_shift_v3"
+    # pinned versions never move
     assert get_strategy("tdi_shift_v1").id == "tdi_shift_v1"
+    assert get_strategy("tdi_shift_v2").id == "tdi_shift_v2"
 
 
 def test_v1_behaviour_is_unchanged(v1):
@@ -246,3 +251,39 @@ def test_explicit_threshold_beats_the_preset(v2):
     assert resolved["adx_min"] == 30.0
     # an unknown preset name falls back to strict instead of crashing
     assert v2.resolve_params({"filter_mode": "nonsense"})["er_min"] == 0.2
+
+
+# ------------------------------------------------------- v3: HVB on volume
+def test_v3_requires_a_volume_spike():
+    v3 = get_strategy("tdi_shift_v3")
+    df = trending(4000, -1, seed=17)
+    resolved = v3.resolve_params({**RELAXED, "hvb_volume_mult": 1.25})
+    prepared = v3.prepare(df, resolved)
+
+    # every HVB bar must be a volume spike
+    for column in ("hvb_up", "hvb_down"):
+        for bar in prepared[column].to_numpy().nonzero()[0]:
+            assert prepared["hvb_volume_ratio"].iloc[bar] >= resolved["hvb_volume_mult"]
+
+    # switching the volume requirement off can only add HVBs
+    loose = v3.prepare(df, {**resolved, "hvb_use_volume": False})
+    assert int(loose["hvb_up"].sum() + loose["hvb_down"].sum()) >= int(
+        prepared["hvb_up"].sum() + prepared["hvb_down"].sum()
+    )
+
+
+def test_v3_is_v2_plus_volume():
+    """v3 must keep every v2 gate: it only changes what counts as an HVB."""
+    v2, v3 = get_strategy("tdi_shift_v2"), get_strategy("tdi_shift_v3")
+    p2, p3 = v2.resolve_params({}), v3.resolve_params({})
+    for key in ("require_trend", "reject_ranging", "require_structure", "reject_liquidity"):
+        assert p3[key] == p2[key]
+    assert v3.supersedes == v2.id
+    assert get_strategy("tdi_shift").id == v3.id
+
+
+def test_v3_params_are_relaxed_but_explicit_values_win():
+    v3 = get_strategy("tdi_shift_v3")
+    assert v3.resolve_params({})["hvb_step"] == 2.0
+    assert v3.resolve_params({"hvb_step": 4.0})["hvb_step"] == 4.0
+    assert v3.resolve_params({})["hvb_volume_mult"] == 1.5

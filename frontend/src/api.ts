@@ -57,8 +57,19 @@ export const api = {
     ),
   backtest: (body: Record<string, unknown>) =>
     request<BacktestResult>('/backtest', { method: 'POST', body: JSON.stringify(body) }),
-  radar: (symbols: string[], timeframes: string[], strategy: string) =>
-    request<RadarResponse>(`/radar${qs({ symbols: symbols.join(','), timeframes: timeframes.join(','), strategy })}`),
+  radar: (symbols: string[], timeframes: string[], strategy: string, scope = 'watchlist') =>
+    request<RadarResponse>(
+      `/radar${qs({
+        // scope=top means "the whole market": the backend picks the universe,
+        // so an explicit symbol list must not override it.
+        symbols: scope === 'top' ? undefined : symbols.join(','),
+        timeframes: timeframes.join(','),
+        strategy,
+        scope,
+        limit: scope === 'top' ? 25 : undefined,
+      })}`,
+    ),
+  symbols: (limit = 50) => request<{ symbols: string[]; source: string }>(`/symbols${qs({ limit })}`),
   winrate: (symbol: string, days: number, strategy: string, refresh = false) =>
     request<WinRateReport>(`/winrate${qs({ symbol, days, strategy, refresh: refresh ? 'true' : undefined })}`),
   dataSource: (symbol: string, timeframe: string, days: number) =>

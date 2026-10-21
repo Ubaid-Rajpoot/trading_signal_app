@@ -163,8 +163,8 @@ def test_strategy_is_registered_and_default():
     from app.core.strategies import DEFAULT_STRATEGY, list_strategies
 
     ids = [s["id"] for s in list_strategies()]
-    # Both published versions stay available, newest is the default.
-    assert {"tdi_shift_v1", "tdi_shift_v2"}.issubset(set(ids))
-    assert DEFAULT_STRATEGY == "tdi_shift_v2"
+    # Every published version stays available, newest is the default.
+    assert {"tdi_shift_v1", "tdi_shift_v2", "tdi_shift_v3"}.issubset(set(ids))
+    assert DEFAULT_STRATEGY == "tdi_shift_v3"
     # The earlier strategies stay available side by side.
     assert {"donchian", "ema_trend", "custom"}.issubset(set(ids))

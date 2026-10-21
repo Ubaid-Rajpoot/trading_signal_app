@@ -23,19 +23,20 @@ export default function SetupRadar({ meta, watchlist, strategyId, onOpen }: Prop
   const [data, setData] = useState<RadarResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [scope, setScope] = useState<'watchlist' | 'top'>('watchlist')
   const timeframes = meta.scan_timeframes
 
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      setData(await api.radar(watchlist, timeframes, strategyId))
+      setData(await api.radar(watchlist, timeframes, strategyId, scope))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Radar scan failed')
     } finally {
       setLoading(false)
     }
-  }, [watchlist.join(','), timeframes.join(','), strategyId])
+  }, [watchlist.join(','), timeframes.join(','), strategyId, scope])
 
   useEffect(() => {
     load()
@@ -51,6 +52,15 @@ export default function SetupRadar({ meta, watchlist, strategyId, onOpen }: Prop
         title="Setup radar"
         right={
           <div className="hstack" style={{ gap: 8 }}>
+            <select
+              className="select sm"
+              value={scope}
+              onChange={(e) => setScope(e.target.value as 'watchlist' | 'top')}
+              title="Scan just the watchlist, or the top 25 pairs by turnover"
+            >
+              <option value="watchlist">My watchlist ({watchlist.length})</option>
+              <option value="top">Top 25 by volume</option>
+            </select>
             <span className="tiny muted">{data ? `scanned ${fmtAgo(data.generated_at)}` : ''}</span>
             <button className="btn sm ghost" onClick={load}>{loading ? <Spinner /> : 'Rescan'}</button>
           </div>
@@ -61,6 +71,13 @@ export default function SetupRadar({ meta, watchlist, strategyId, onOpen }: Prop
           matlab: setup ban raha hai lekin rules mana kar rahe hain (market range me hai, trend ke khilaf hai, ya
           liquidity build-up saamne hai). Kisi bhi cell par click karke chart khol sakte hain.
         </div>
+        {scope === 'top' && (
+          <div className="tiny muted" style={{ marginBottom: 8 }}>
+            Scanning 25 pairs × {timeframes.length} timeframes. Each cell is a full rule evaluation, so this
+            takes a few seconds. For the whole market use{' '}
+            <code className="mono">python scripts/scan.py --top 100</code>.
+          </div>
+        )}
         {data && data.blocked_count > 0 && (
           <div className="tiny" style={{ marginBottom: 8, color: 'var(--amber)' }}>
             {data.blocked_count} setup{data.blocked_count === 1 ? '' : 's'} blocked by the structure filter right now —

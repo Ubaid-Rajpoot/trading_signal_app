@@ -8,7 +8,8 @@ app (the strategy dropdown lists them with their version number).
 | Version | id | Status | What it does |
 |---|---|---|---|
 | **v1.0** | `tdi_shift_v1` | **frozen** — do not edit | HVB + same-candle SHIFT/MS, nothing else |
-| **v2.0** | `tdi_shift_v2` | current default | v1 + structure / trend / range / liquidity filters |
+| **v2.0** | `tdi_shift_v2` | frozen | v1 + structure / trend / range / liquidity filters |
+| **v3.0** | `tdi_shift_v3` | current default | v2 + HVB now requires a **volume spike** |
 
 `tdi_shift` (the old id) now resolves to the **latest** version, so old links and
 saved settings keep working. Pinned ids never move: `tdi_shift_v1` will always be
@@ -34,6 +35,35 @@ Exit when the purple line crosses back. No stop loss, no take profit.
 
 The problem you pointed out: **it fires anywhere**, including inside a range.
 That is what v2 fixes.
+
+## v3.0 — HVB means HIGH VOLUME break
+
+Your correction:
+
+> "HVB ka matlab hai ke centre wala band break ho high volume ke saath."
+
+HVB is *High Volume Breakout* (book p.93). v1 and v2 measured "aggression" only
+in RSI points, which is why HVB was so rare — one per ~500 bars on smooth data.
+In v3 the volume does the work:
+
+| Condition | Default | Note |
+|---|---|---|
+| purple line crosses the Market Base Line | required | unchanged |
+| **volume spike** | ≥ **1.5×** the 20-bar average | this is what makes it an HVB |
+| speed floor | ≥ 2 RSI points in 2 bars | relaxed from 4.0, since volume now carries the weight |
+| finish past the band | ≥ 1 RSI point | unchanged |
+
+Set `hvb_step: 0` to ignore speed entirely, or `hvb_use_volume: false` to go back
+to v2's RSI-only definition. Volume is measured as
+`volume / SMA(volume, 20)` per bar, lag-free.
+
+All v2 structure gates are unchanged, and v3 is a strict subset of v2 — a test
+asserts it only adds the volume requirement.
+
+> **Why HVB looked missing on the demo feed:** synthetic candles had random volume
+> and smooth prices, so no bar could be a genuine volume breakout. The demo
+> generator now expands volume on impulsive candles (like a real tape), which is
+> why HVB counts went up even offline. Real candles are the only honest test.
 
 ## v2.0 — inside structure, with the trend, never in a range
 

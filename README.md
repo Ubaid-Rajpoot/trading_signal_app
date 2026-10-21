@@ -86,6 +86,23 @@ Tests:
 
 ---
 
+## Scan the market
+
+```bash
+# top 100 USDT pairs by turnover, 5 timeframes, real data or nothing
+python scripts/scan.py --top 100 --real-only
+```
+
+Prints one row per instrument and timeframe that has something to say — SETUP,
+ARMED, FORMING — plus the BLOCKED rows with the reason, and per-timeframe counts.
+The universe comes from Binance (`exchangeInfo` + 24h turnover, cached a day) and
+falls back to the built-in list offline. `--json`, `--out`, `--workers`, `--all`
+and `--list-symbols` are available; the same scan is in the UI with the
+**Top 25 by volume** scope.
+
+**Running it with real data on your own machine:**
+[`docs/running-locally.md`](docs/running-locally.md).
+
 ## Setup radar & win-rate study
 
 **Setup radar** is where you look first. Each cell answers one question: is the
@@ -169,10 +186,12 @@ strategy dropdown:
 | Version | id | Status |
 |---|---|---|
 | v1.0 | `tdi_shift_v1` | frozen — HVB + same-candle structure break, no filters |
-| v2.0 | `tdi_shift_v2` | **default** — v1 + structure / trend / range / liquidity filters |
+| v2.0 | `tdi_shift_v2` | frozen — v1 + structure / trend / range / liquidity filters |
+| v3.0 | `tdi_shift_v3` | **default** — HVB now requires a real volume spike (High Volume Breakout), same structure gates |
 
-`tdi_shift` resolves to the latest version, so old links keep working. v1 is
-frozen so its results stay reproducible; the commit is tagged `strategy-v1`.
+`tdi_shift` resolves to the latest version, so old links keep working. Published
+versions are frozen so their results stay reproducible; the v1 commit is tagged
+`strategy-v1`.
 Details, thresholds and how to compare them:
 [`docs/strategy-versions.md`](docs/strategy-versions.md).
 

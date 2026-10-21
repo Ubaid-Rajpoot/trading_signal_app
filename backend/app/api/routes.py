@@ -13,6 +13,7 @@ from ..config import APP_NAME, APP_VERSION, DEFAULT_SYMBOLS, DEFAULT_WATCHLIST, 
 from ..core import backtest_service, winrate as winrate_service
 from ..core.alerts import notifier, scheduler
 from ..core.data.history import probe as history_probe
+from ..core.data.symbols import universe as symbol_universe
 from ..core.data.providers import MarketDataError, provider_status
 from ..core.signals import build_signal, scan
 from ..core.store import (
@@ -150,6 +151,16 @@ def backtest(payload: BacktestRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/symbols")
+def symbols(
+    limit: int = Query(50, ge=1, le=500),
+    quote: str = Query("USDT"),
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    """The scan universe: tradable pairs ordered by 24h turnover."""
+    return sanitize(symbol_universe(quote.upper(), limit, refresh))
+
+
 @router.get("/data-source")
 def data_source(
     symbol: str = Query("BTCUSDT"),
@@ -200,13 +211,21 @@ def radar(
     timeframes: str = Query("", description="Comma-separated; defaults to 1m,3m,5m,15m,30m"),
     strategy: str = Query("tdi_shift"),
     params: str | None = Query(None),
+    scope: str = Query("watchlist", description="watchlist | top (the whole market by turnover)"),
+    limit: int = Query(25, ge=1, le=40, description="how many symbols when scope=top"),
 ) -> dict[str, Any]:
     from ..config import SCAN_TIMEFRAMES
 
-    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()] or get_settings().get("watchlist", [])
     tfs = [t.strip() for t in timeframes.split(",") if t.strip()] or SCAN_TIMEFRAMES
-    if len(wanted) > 12 or len(tfs) > 8:
-        raise HTTPException(status_code=400, detail="At most 12 symbols and 8 timeframes per radar scan")
+    explicit = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if explicit:
+        wanted = explicit
+    elif scope == "top":
+        wanted = symbol_universe("USDT", limit)["symbols"]
+    else:
+        wanted = get_settings().get("watchlist", [])
+    if len(wanted) > 40 or len(tfs) > 8:
+        raise HTTPException(status_code=400, detail="At most 40 symbols and 8 timeframes per radar scan")
 
     resolved = _params(params)
     grid: list[dict[str, Any]] = []
@@ -225,6 +244,7 @@ def radar(
                     "tdi": signal["setup"]["tdi"],
                     "text": signal["setup"]["text"],
                     "blocked_reason": signal["setup"].get("blocked_reason"),
+                    "hvb_last_bars": signal["setup"].get("hvb_last_bars"),
                     "regime": (signal.get("regime") or {}).get("state"),
                     "source": signal["source"],
                 }
@@ -245,6 +265,7 @@ def radar(
             "generated_at": int(time.time() * 1000),
             "symbols": wanted,
             "timeframes": tfs,
+            "scope": "custom" if explicit else scope,
             "grid": grid,
             "actionable": actionable,
             "blocked_count": blocked,

@@ -190,9 +190,14 @@ def generate_candles(
     high = body_hi + wick * (0.2 + wick_b)
     low = np.maximum(body_lo - wick * (0.2 + wick_a), 1e-9)
 
+    # Volume must behave like a real tape: it expands on impulsive candles and
+    # dries up on quiet ones. Without this the demo feed can never show an HVB,
+    # because a volume breakout is the whole point of the pattern.
     bar_move = np.abs(np.diff(np.log(closes), prepend=np.log(closes[0])))
+    normal_move = np.maximum(np.median(bar_move), 1e-9)
+    impulse = bar_move / normal_move
     base_vol = 1_500_000 if closes[-1] > 1 else 40_000_000
-    volume = base_vol * (0.35 + vol_noise) * (1 + 55 * bar_move)
+    volume = base_vol * (0.55 + 0.5 * vol_noise) * (0.55 + 0.65 * impulse)
 
     return pd.DataFrame(
         {

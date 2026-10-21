@@ -89,6 +89,7 @@ export interface Setup {
   level: number | null
   distance_pct: number | null
   hvb_bars_ago: number | null
+  hvb_last_bars?: number | null
   text: string
   blocked_reason?: string | null
   tdi: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
@@ -104,6 +105,7 @@ export interface RadarCell {
   tdi?: { purple: number | null; base: number | null; slow: number | null; side: string | null } | null
   text?: string
   blocked_reason?: string | null
+  hvb_last_bars?: number | null
   regime?: string | null
   source?: string
   error?: string
@@ -137,6 +139,7 @@ export interface RadarResponse {
   grid: { symbol: string; cells: Record<string, RadarCell> }[]
   actionable: ({ symbol: string; timeframe: string } & RadarCell)[]
   blocked_count: number
+  scope?: string
 }
 
 export interface WinRateRow {

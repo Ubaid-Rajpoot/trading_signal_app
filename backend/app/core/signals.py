@@ -163,6 +163,17 @@ def _setup_block(
     level_up = min(highs) if highs else None
     level_down = max(lows) if lows else None
 
+    # When did an HVB last print, whichever direction? A FORMING/BLOCKED state
+    # means "before the HVB" - showing the distance makes that obvious.
+    hvb_last_bars: int | None = None
+    if has_tdi:
+        both = (prepared["hvb_up"] | prepared["hvb_down"]).to_numpy()
+        hits = both.nonzero()[0]
+        if hits.size:
+            hvb_last_bars = int(len(both) - 1 - hits[-1])
+        else:
+            hvb_last_bars = -1  # never in this window
+
     status = "IDLE"
     direction: str | None = None
     level: float | None = None
@@ -234,6 +245,7 @@ def _setup_block(
         "level": round(float(level), 8) if level else None,
         "distance_pct": distance_pct,
         "hvb_bars_ago": bars_ago,
+        "hvb_last_bars": hvb_last_bars,
         "text": text,
         "blocked_reason": blocked_reason,
         "tdi": {

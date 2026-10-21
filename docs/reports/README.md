@@ -9,8 +9,13 @@ unreachable) and says nothing about the real market.
 | [`winrate-v1.md`](winrate-v1.md) | v1 (classic) | 30 days | demo | 76 |
 | [`winrate-v2.md`](winrate-v2.md) | v2 (strict) | 30 days | demo | 1 |
 | [`winrate-v2-balanced.md`](winrate-v2-balanced.md) | v2 (`filter_mode: balanced`) | 30 days | demo | 5 |
+| [`winrate-v3.md`](winrate-v3.md) | v3 (HVB on volume) | 30 days | demo | 9 |
 
 ## What the numbers mean
+
+v3 lifts the demo trade count from 1 (v2) to 9, because HVB is now defined by
+volume rather than an RSI-travel threshold. On the demo feed the volume is
+synthetic, so this is a code check only.
 
 v2 keeps only 1 of the 55 raw setups on this demo window, because the demo feed
 is mean-reverting noise: most HVB breaks there are counter-trend or happen in

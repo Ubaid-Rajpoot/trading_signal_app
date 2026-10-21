@@ -100,6 +100,14 @@ export default function SignalPanel({ signal }: { signal: Signal }) {
                 <strong style={{ color: setup.direction === 'LONG' ? 'var(--green)' : 'var(--red)' }}>{setup.direction}</strong>
               </span>
             )}
+            {setup.hvb_last_bars != null && (
+              <span className="chip-item" style={{ fontSize: 11.5 }} title="Bars since the last High Volume Breakout on this chart">
+                <span className="muted">Last HVB</span>
+                <strong className="mono">
+                  {setup.hvb_last_bars < 0 ? 'none yet' : setup.hvb_last_bars === 0 ? 'this bar' : `${setup.hvb_last_bars} bars ago`}
+                </strong>
+              </span>
+            )}
             {setup.hvb_bars_ago != null && (
               <span className="chip-item" style={{ fontSize: 11.5 }}>
                 <span className="muted">HVB</span>
