@@ -1,4 +1,7 @@
 fastapi>=0.110
-uvicorn>=0.27
+uvicorn[standard]>=0.27
+httpx>=0.26
 websockets>=12
-httpx>=0.27
+# tests only
+pytest>=7.4
+pytest-asyncio>=0.23

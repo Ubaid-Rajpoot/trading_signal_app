@@ -134,21 +134,86 @@ def crossed_below(prev_a, prev_b, a, b) -> bool:
     return prev_a >= prev_b and a < b
 
 
-def hvb_signal(points: list[TdiPoint], index: int, min_points: float = 0.0) -> str | None:
-    """``"up"`` / ``"down"`` when the purple line breaks the base line at ``index``.
+CENTRE_REFERENCES = {"mbl": "middle of the volatility bands", "fifty": "50 midline"}
 
-    ``min_points`` optionally demands the break be aggressive: the distance
-    between the fast line and the base line must reach this many RSI points.
+
+def centre_of(point: TdiPoint, reference: str = "mbl") -> float | None:
+    """The centre band the price line has to cross.
+
+    ``mbl``   = the middle of the volatility bands (the TDIGM ``mid``), i.e.
+                ``(upper + lower) / 2`` = ``SMA(RSI, bandLength)``.
+    ``fifty`` = the TDI's central axis, the 50 level.
+    """
+    if reference == "fifty":
+        return 50.0 if point.fast is not None else None
+    return point.mbl
+
+
+def line_speed(points: list[TdiPoint], index: int, window: int = 50) -> float | None:
+    """How fast the price line moved into this candle, in its own units.
+
+    ``|fast - fast_prev| / mean(|fast - fast_prev|)`` over the last ``window``
+    candles. 1.0 = an average step, 3.0 = three times its normal stride. This is
+    what "tezi" (speed) has to mean in code: an absolute number of RSI points
+    cannot, because the line is much twitchier on 1m than on 1h.
+    """
+    if index < 1:
+        return None
+    window = max(2, int(window))
+    start = max(1, index - window + 1)
+    steps = []
+    for i in range(start, index + 1):
+        a, b = points[i - 1].fast, points[i].fast
+        if a is None or b is None:
+            continue
+        steps.append(abs(b - a))
+    if not steps:
+        return None
+    typical = sum(steps) / len(steps)
+    now = abs(points[index].fast - points[index - 1].fast)
+    if typical <= 0:
+        return 0.0 if now == 0 else None
+    return now / typical
+
+
+def hvb_signal(
+    points: list[TdiPoint],
+    index: int,
+    min_points: float = 0.0,
+    reference: str = "mbl",
+    min_speed: float = 0.0,
+    speed_window: int = 50,
+) -> str | None:
+    """``"up"`` / ``"down"`` when the price line breaks the CENTRE band here.
+
+    Three gates, all needed by the trader's definition:
+
+    1. **the centre band only.** ``centre_of`` is ``(upper + lower) / 2`` (the
+       yellow market base line) or the 50 axis. The upper/lower bands take no
+       part in the rule - touching them is not an HVB, and the line does not
+       have to reach them either.
+    2. **crossed on this candle**: previous candle on the other side, this
+       candle strictly beyond.
+    3. **with speed.** ``min_points`` = how far beyond the centre the line
+       closed, ``min_speed`` = how big this candle's step was compared with the
+       line's average step. A drift back through the band is not an HVB.
     """
     if index < 1 or index >= len(points):
         return None
     prev, now = points[index - 1], points[index]
-    if crossed_above(prev.fast, prev.mbl, now.fast, now.mbl):
-        if min_points <= 0 or (now.fast is not None and now.mbl is not None and now.fast - now.mbl >= min_points):
-            return "up"
-    if crossed_below(prev.fast, prev.mbl, now.fast, now.mbl):
-        if min_points <= 0 or (now.fast is not None and now.mbl is not None and now.mbl - now.fast >= min_points):
-            return "down"
+    prev_centre = centre_of(prev, reference)
+    centre = centre_of(now, reference)
+    if prev.fast is None or now.fast is None or prev_centre is None or centre is None:
+        return None
+
+    speed = line_speed(points, index, speed_window) if min_speed > 0 else None
+    if min_speed > 0 and (speed is None or speed < min_speed):
+        return None
+
+    if crossed_above(prev.fast, prev_centre, now.fast, centre) and (now.fast - centre) >= min_points:
+        return "up"
+    if crossed_below(prev.fast, prev_centre, now.fast, centre) and (centre - now.fast) >= min_points:
+        return "down"
     return None
 
 
@@ -272,6 +337,11 @@ class TdiTracker:
             if len(self.points) > self.maxlen:
                 self.points.pop(0)
         return point
+
+    @property
+    def history(self) -> list[TdiPoint]:
+        """The points kept in memory, oldest first (for the UI sparkline)."""
+        return self.points
 
     @property
     def last(self) -> TdiPoint | None:

@@ -113,13 +113,18 @@ the finding that 1m is unprofitable.
 or `--binance-vision` / `--mirror`. The chart tab has a **rewind** box to replay
 any moment of that real history. This checkout ships BTCUSDT 1m for Jan–Jun 2025.
 
-## Live break + HVB bot (separate, standalone)
+## Liquidity sweep scanner (separate, standalone)
 
-`tdigm-live/` is a small standalone scanner for the trader's TDIGM setting
-(50, 50, 1, 9): it streams Binance klines, builds every timeframe, and alerts when
-a candle closes beyond the last 20 highs/lows **and** the purple line crosses the
-centre band on that same candle. It has no other purpose, no backtest and no
-orders. See [`tdigm-live/README.md`](tdigm-live/README.md).
+`tdigm-live/` is a standalone real-time scanner for the trader's own setup: a
+swing high/low is **swept**, price then **closes through the opposite swing**,
+and the TDIGM (50, 50, 1, 9) **HVB** prints on that same closed candle. The HVB
+is the price line crossing the **centre band only** (never the outer bands) and
+doing it **with speed**, and a setup is only published when the market is
+**trending**, not ranging. It shows
+entry, stop beyond the sweep and the liquidity target, streams MEXC (or Binance)
+klines, builds every timeframe from 1m, ships filters that are saved to
+`config.json`, and lets you add any of the exchange's symbols from the page. No
+orders, no backtest. See [`tdigm-live/README.md`](tdigm-live/README.md).
 
 ## Scan the market
 

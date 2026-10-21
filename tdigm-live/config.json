@@ -13,15 +13,56 @@
     "SUIUSDT",
     "PEPEUSDT"
   ],
-  "timeframes": ["1m", "5m", "15m", "30m", "1h"],
+  "exchange": "mexc",
+  "max_symbols": 500,
+  "timeframes": [
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h"
+  ],
   "tdi": {
     "rsi_period": 50,
     "band_period": 50,
     "fast_period": 1,
     "slow_period": 9,
-    "band_mult": 1.6185
+    "band_mult": 1.6185,
+    "hvb_reference": "mbl"
+  },
+  "structure": {
+    "pivot_len": 5,
+    "sweep_max_wait": 60,
+    "level_max_age": 180,
+    "max_levels": 40,
+    "target_mode": "range"
+  },
+  "filters": {
+    "structure": true,
+    "hvb": true,
+    "hvb_min_points": 1.0,
+    "hvb_min_speed": 1.5,
+    "regime": true,
+    "regime_adx_min": 20.0,
+    "regime_er_min": 0.1,
+    "regime_direction": "any",
+    "break": false,
+    "sides": [
+      "long",
+      "short"
+    ],
+    "min_rr": 0.0,
+    "max_bars_since_sweep": 0,
+    "trend": "off",
+    "trend_ema": 50,
+    "sessions": [],
+    "cooldown_minutes": 0
   },
   "break_lookback": 20,
   "hvb_min_points": 0,
-  "server": { "host": "0.0.0.0", "port": 8700 }
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8700
+  },
+  "preview_max_symbols": 200
 }
