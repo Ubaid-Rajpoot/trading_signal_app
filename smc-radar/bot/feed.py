@@ -105,6 +105,12 @@ class BaseFeed:
             self._generation += 1
         return removed
 
+    def force_reconnect(self) -> None:
+        """Drop the sockets and rebuild them (used when the stream goes silent)."""
+        self._generation += 1
+        self.connected = False
+        self.status = "reconnecting (stalled stream)"
+
     def exchange_interval(self, timeframe: str) -> str | None:
         return self.tf_map.get(timeframe, timeframe)
 
@@ -441,11 +447,18 @@ class ReplayFeed(BaseFeed):
         symbols: list[str] | None = None,
         speed: float = 20.0,
         loop: bool = True,
+        skip: int = 0,
+        ticks: int = 1,
         **kwargs: object,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.speed = max(0.1, float(speed))
         self.loop = loop
+        self.skip = max(0, int(skip))  # bars already handed over as a pre-roll
+        # how many partial updates each recorded candle is shown as. The prices
+        # are interpolated between that candle's own open/high/low/close - a
+        # replay has no ticks, and inventing any is not allowed.
+        self.ticks = max(1, int(ticks))
         self.files = self._discover(symbols)
         if not self.files:
             raise FeedError(f"no CSV files found in {self.data_dir}")
@@ -466,6 +479,41 @@ class ReplayFeed(BaseFeed):
     async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
         return []  # the replay warms up by playing
 
+    def file_for(self, symbol: str) -> Path | None:
+        return next((path for sym, path in self.files if sym == symbol.upper()), None)
+
+    def first_bars(self, symbol: str, limit: int) -> list[dict]:
+        """The first ``limit`` closed 1m bars, for a pre-roll before streaming."""
+        path = self.file_for(symbol)
+        if path is None or limit <= 0:
+            return []
+        rows: list[dict] = []
+        with path.open(newline="") as handle:
+            for row in csv.reader(handle):
+                if len(row) < 6:
+                    continue
+                raw_time = int(row[0])
+                open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
+                if open_time < 10**12:
+                    open_time *= 1000
+                rows.append(
+                    {
+                        "symbol": symbol.upper(),
+                        "open_time": open_time,
+                        "close_time": open_time + 59_999,
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5]),
+                        "trades": 0,
+                        "closed": True,
+                    }
+                )
+                if len(rows) >= limit:
+                    break
+        return rows
+
     async def universe(self) -> list[dict]:
         raise FeedError(
             "replay mode has no exchange symbol list - run `python run.py serve --exchange mexc` "
@@ -476,14 +524,14 @@ class ReplayFeed(BaseFeed):
         while True:
             for symbol, path in self.files:
                 with path.open(newline="") as handle:
-                    for row in csv.reader(handle):
-                        if len(row) < 6:
+                    for index, row in enumerate(csv.reader(handle)):
+                        if len(row) < 6 or index < self.skip:
                             continue
                         raw_time = int(row[0])
                         open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
                         if open_time < 10**12:  # seconds
                             open_time *= 1000
-                        yield {
+                        bar = {
                             "symbol": symbol,
                             "open_time": open_time,
                             "close_time": open_time + 59_999,
@@ -495,6 +543,23 @@ class ReplayFeed(BaseFeed):
                             "trades": 0,
                             "closed": True,
                         }
+                        if self.ticks > 1:
+                            for k in range(1, self.ticks):
+                                p = k / self.ticks
+                                o = bar["open"]
+                                close_p = o + (bar["close"] - o) * p
+                                high_p = max(o, close_p, o + (bar["high"] - o) * p)
+                                low_p = min(o, close_p, o + (bar["low"] - o) * p)
+                                yield {
+                                    **bar,
+                                    "high": high_p,
+                                    "low": low_p,
+                                    "close": close_p,
+                                    "volume": bar["volume"] * p,
+                                    "closed": False,
+                                }
+                                await asyncio.sleep(1.0 / (self.speed * self.ticks))
+                        yield bar
                         await asyncio.sleep(1.0 / self.speed)
             if not self.loop:
                 return

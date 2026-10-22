@@ -8,7 +8,8 @@ keeps each one on screen — with the time it formed — **until price mitigates
 ```bash
 cd smc-radar
 python run.py serve                       # live: MEXC, every symbol you add
-python run.py replay data/btc 40          # replay recorded real candles
+python run.py replay data/btc 40          # replay recorded candles: 2400 loaded first,
+                                          # and each candle shown forming (--ticks 4)
 python run.py check                       # can this machine reach the exchange?
 python run.py universe --top 20           # what the exchange lists, biggest first
 python tools/scan_now.py --preset top20   # one-shot scan, prints a table
@@ -80,15 +81,37 @@ its resolution time and price; the tape keeps the record; only a zone older than
 * **Cards** — symbol, timeframe, pattern, status, level, distance from the live
   price in %, formation time + age, block bounds, session, the evidence list,
   condition count, and the mitigation/invalidation line once it happens.
-* **Chart** — clicking a card draws that instrument and timeframe from the
-  scanner's own candles: the zone block, the level, the swept and break levels,
-  the mitigation/invalidation marker, and the live price.
+* **Chart** — a real chart, opened automatically on the newest active zone.
+  It holds **1000 candles** (deep history, not just the detection window), draws
+  the zone block, the exact level, the swept and break levels, the
+  mitigation/invalidation marker and the live price, and it grows the candle
+  that is still forming in front of you. **Scroll** to zoom, **drag** to pan back
+  through history, **drag the right edge** to rescale price, **double-click**
+  (or `reset`) to follow the newest candle again. Touch: one finger pans, two
+  fingers pinch. A crosshair shows OHLC for the candle under the cursor.
 * **Live tape** — every formation and every resolution as it happens.
 * **Symbols drawer** — search the exchange's list, add pairs, add the top 50 or
   every pair, remove pairs. The list is written to `config.json`.
 * **Settings drawer** — every threshold in the table below, applied live to
   every instrument (the map is re-read from its own candles, so what you see is
   what the new setting would have found) and written to `config.json`.
+
+## 2b. Live, continuous data — how it keeps coming
+
+The first version needed a restart to show anything new. That is fixed in five
+places, each one measurable:
+
+| what | where | what it does |
+|---|---|---|
+| **push + heartbeat** | `bot/server.py` | every candle and tick is pushed; a 5-second heartbeat pushes the state even when nothing moved, so a page never goes stale |
+| **three transports** | `web/index.html` | websocket first, **server-sent events** (`/api/stream`) if a proxy eats websockets, **polling** every 3s if even that fails. A watchdog notices 6s of silence, and rebuilds both pushes after 15s |
+| **stall reconnect** | `heartbeat` in `bot/server.py` + `BaseFeed.force_reconnect` | if the exchange socket stays open but silent for 120s, the feed is rebuilt automatically |
+| **forming candle** | `bot/engine.py` (`_apply_tick`, `engine.bars`) | the exchange's unfinished 1m candle updates the charts on every tick; the detection map waits for the close, because a wick that is not final cannot confirm a pattern |
+| **incremental refresh** | `/api/candles?since=` | an open chart asks only for candles it has not seen, so it can follow the market all day |
+
+`python tools/smoke.sh` proves all of this against a running server: the state
+advances on its own, the candle endpoint serves a deep history, the incremental
+refresh returns only new bars, and both SSE and the websocket push.
 
 ## 3. Settings (all of them are in `config.json`)
 
@@ -110,8 +133,9 @@ its resolution time and price; the tape keeps the record; only a zone older than
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 19 passed
+../.venv/bin/python -m pytest tests -q                 # 26 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
+PORT=8891 bash tools/smoke.sh                          # end-to-end HTTP/WS/SSE checks
 ```
 
 The scan above runs on **real Binance 1-minute candles** for BTCUSDT,
@@ -136,18 +160,34 @@ Tests (`tests/test_map.py`, `tests/test_engine.py`) pin the definitions:
 * the engine turns real candles into every timeframe, keeps 240 bars, pushes a
   JSON state, and a settings change from the UI lands in `config.json`.
 
-The page was smoke-tested headlessly against the running replay server
-(nine tabs, cards with formation time and evidence, chart with candles and zone
-block, tab filtering, both drawers, live tape).
+The page was smoke-tested headlessly against the running replay server, three
+times over, once per transport:
+
+* **websocket** — nine tabs, cards with formation time and evidence, canvas
+  chart, wheel zoom in **and** out, price-axis drag, drag-to-pan back through
+  history, crosshair, reset-to-follow, self-refreshing chart, resolved-zone
+  toggle;
+* **server-sent events** (websocket blocked) — the map keeps advancing;
+* **polling** (websocket and EventSource both unavailable) — the map keeps
+  advancing.
+
+The chart's own drawing was checked by counting what the canvas actually
+received on the last frame (candles, zone block, level lines), and the growing
+candle path by a test that feeds an unfinished 1m bar and reads it back through
+`engine.bars()` and `snapshot()["price"]`.
 
 ## 5. Honest limits
 
 * **The exchange is not reachable from the machine this was built on.** MEXC's
-  REST and websocket are blocked in the build sandbox, so the live path was
-  verified only up to "the server starts, serves the page, and reports the feed
-  as reconnecting" — every chart, zone and number above comes from real recorded
-  candles, not from a live feed. `python run.py check` tells you in one line
-  whether your machine can reach it.
+  REST and websocket are blocked in the build sandbox, so the *connectivity*
+  path was verified only up to "the server starts, serves the page, and reports
+  the feed as reconnecting". Everything else — deep history, the forming candle,
+  the push, the three transports, the reconnect logic — is covered by the tests
+  and the smoke script above, and every number on the page comes from real
+  recorded candles rather than from a live feed. `python run.py check` tells you
+  in one line whether your machine can reach MEXC. If your MEXC stream shows
+  "live" and the candle count keeps climbing, the live path is working; if the
+  badge says reconnecting, the network is the problem, not the page.
 * **Sessions are UTC** and overlap (London 7–16, NY 12–21). The book does not
   give exchange-local session windows; if your charts use a different session
   clock, change the numbers in Settings.

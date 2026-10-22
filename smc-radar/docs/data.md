@@ -15,12 +15,34 @@ Nothing in this app makes prices up. There are exactly two sources.
 `python run.py check` prints whether this machine can reach both. If it cannot,
 the server still starts and says so on the page.
 
+Warm-up asks the REST endpoint for **1000 candles per timeframe** (the most a
+kline endpoint returns in one call), so the chart opens filled instead of with a
+dozen candles. Symbol added later? The server warms that one in the background
+while the stream keeps running.
+
+The **candle that is still forming** comes from the websocket: MEXC re-sends the
+open bar on every trade, and those updates go to the chart (`closed: false`)
+while the detection map waits for the close.
+
 ## Recorded — replay
 
-`python run.py replay <folder> <bars-per-second>` plays CSV files named
+`python run.py replay <folder> <bars-per-second> [--preroll N]` plays CSV files named
 `<SYMBOL>-....csv` with columns
 `open_time, open, high, low, close, volume` (extra columns are ignored; the
 timestamp may be seconds, milliseconds or microseconds).
+
+`--ticks N` (default 4) shows each recorded candle as N partial updates, so the
+candle can be watched forming offline exactly as it forms live. The partial
+prices are interpolated **between that candle's own open, high, low and close** —
+a recorded file has no ticks and the app does not invent any. `--ticks 1` turns
+the effect off and replays closed candles only.
+
+Before streaming starts, the replay loads the **first 2400 candles** of each file
+through the same code path the live feed uses (`--preroll` changes it, `0`
+disables it), so the replay opens with a deep chart and a warm map and then
+carries on from that point. When the replay loops back to the start, the engine
+notices the time going backwards and rebuilds that instrument instead of
+stacking duplicate candles.
 
 The verification in `README.md` uses real Binance 1-minute data for BTCUSDT,
 1–7 January 2025 (10,080 bars) at:

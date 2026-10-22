@@ -16,8 +16,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import config_store
 from .engine import Engine
@@ -30,6 +30,7 @@ class Hub:
 
     def __init__(self) -> None:
         self.clients: set[WebSocket] = set()
+        self.sse: set[asyncio.Queue] = set()
         self._lock = asyncio.Lock()
 
     async def register(self, ws: WebSocket) -> None:
@@ -41,6 +42,11 @@ class Hub:
             self.clients.discard(ws)
 
     async def send_all(self, message: dict) -> None:
+        for queue in list(self.sse):
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                pass  # the slowest client misses a frame rather than slowing the scanner
         if not self.clients:
             return
         payload = json.dumps(message, default=str)
@@ -106,11 +112,32 @@ def create_app(
             await hub.send_all({"type": "log", "level": "error", "message": f"feed stopped: {exc}"})
             raise
 
+    async def heartbeat() -> None:
+        """Push the state even when nothing changed, so no page ever goes stale.
+
+        It also watches the exchange: a socket can stay open while delivering
+        nothing at all, which looks exactly like "the data stopped and I had to
+        restart the server". After two silent minutes the feed is rebuilt.
+        """
+        while True:
+            await asyncio.sleep(5)
+            try:
+                if engine.source != "replay" and getattr(feed, "connected", False):
+                    last = getattr(feed, "last_message", 0) or 0
+                    if last and time.time() - last > 120:
+                        feed.force_reconnect()
+                        await hub.send_all({"type": "log", "level": "warn",
+                                            "message": "the exchange stream went quiet - reconnecting"})
+                await engine._emit_state(force=True)  # noqa: SLF001 - one scanner, one clock
+            except Exception:
+                pass
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await engine.warmup(feed)
         tasks.append(asyncio.create_task(pump()))
         tasks.append(asyncio.create_task(warmer()))
+        tasks.append(asyncio.create_task(heartbeat()))
         try:
             yield
         finally:
@@ -137,10 +164,44 @@ def create_app(
             "connected": getattr(feed, "connected", None),
             "clients": len(hub.clients),
             "candles_seen": engine.candles_seen,
+            "ticks_seen": engine.ticks_seen,
+            "seq": engine.seq,
+            "last_tick_age": round(time.time() - engine.last_tick_at, 1),
+            "zones": len(engine.zones),
             "symbols": len(engine.symbols),
             "timeframes": engine.timeframes,
-            "zones": len(engine.zones),
         }
+
+    @app.get("/api/stream")
+    async def stream(request: Request) -> StreamingResponse:
+        """Server-sent events: the same push as the websocket, over plain HTTP.
+
+        Some proxies (and some corporate networks) drop websockets silently. The
+        page listens to whichever transport answers, so the map keeps updating
+        without anyone restarting the server.
+        """
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=8)
+        hub.sse.add(queue)
+
+        async def gen():
+            try:
+                yield ": connected\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        message = await asyncio.wait_for(queue.get(), timeout=15)
+                        yield f"data: {json.dumps(message, default=str)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"   # keeps the connection alive through proxies
+            finally:
+                hub.sse.discard(queue)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"cache-control": "no-cache", "x-accel-buffering": "no", "connection": "keep-alive"},
+        )
 
     @app.get("/api/state")
     async def state() -> JSONResponse:
@@ -148,24 +209,54 @@ def create_app(
 
     @app.get("/api/zones")
     async def zones(status: str = "active") -> dict[str, Any]:
+        """``active``, ``mitigated``, ``invalidated``, ``resolved`` or ``all``."""
         if status == "all":
             items = list(engine.zones.values())
+        elif status == "resolved":
+            items = [z for z in engine.zones.values() if z.get("status") != "active"]
         else:
             items = [z for z in engine.zones.values() if z.get("status") == status]
-        items.sort(key=lambda z: -int(z.get("time") or 0))
+        items.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or z.get("time") or 0))
         return {"count": len(items), "items": items[:1000]}
 
     @app.get("/api/candles")
-    async def candles(symbol: str, timeframe: str = "5m", limit: int = 300) -> dict[str, Any]:
-        map_ = engine.maps.get((symbol.upper(), timeframe))
+    async def candles(symbol: str, timeframe: str = "5m", limit: int = 800, since: int = 0) -> dict[str, Any]:
+        """Candles for the chart. ``since`` makes the refresh incremental.
+
+        The page keeps its own copy; while it stays open it only asks for the
+        candles it has not seen, so a chart can follow the market all day
+        without re-downloading a thousand bars every couple of seconds.
+        """
+        symbol = symbol.upper()
+        map_ = engine.maps.get((symbol, timeframe))
         if map_ is None:
-            return {"symbol": symbol.upper(), "timeframe": timeframe, "bars": []}
-        bars = list(map_.bars)[-max(20, min(600, int(limit))) :]
+            return {"symbol": symbol, "timeframe": timeframe, "bars": [], "live": False}
+        bars = engine.bars(symbol, timeframe, limit if not since else 400)
+        if since:
+            history = list(engine.history.get((symbol, timeframe), ()))
+            fresh = [b for b in history if int(b["open_time"]) >= int(since)]
+            live = engine.partial.get((symbol, timeframe))
+            if live is not None:
+                fresh.append(live)
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "price": engine.price_of(symbol),
+                "atr": map_.atr_now(),
+                "live": bool(fresh) and not fresh[-1].get("closed", True),
+                "bar_count": len(history),
+                "server_time": int(time.time() * 1000),
+                "incremental": True,
+                "bars": fresh[-limit:],
+            }
         return {
             "symbol": map_.symbol,
             "timeframe": map_.timeframe,
-            "price": map_.last_price,
+            "price": engine.price_of(symbol) or map_.last_price,
             "atr": map_.atr_now(),
+            "live": bool(bars) and not bars[-1].get("closed", True),
+            "bar_count": len(engine.history.get((symbol, timeframe), ())),
+            "server_time": int(time.time() * 1000),
             "bars": bars,
         }
 

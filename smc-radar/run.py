@@ -97,7 +97,15 @@ async def universe(exchange: str, top: int) -> int:
     return 0
 
 
-def serve(config: dict, feed, source: str, config_path: Path) -> None:
+def serve(
+    config: dict,
+    feed,
+    source: str,
+    config_path: Path,
+    port: int | None = None,
+    host: str | None = None,
+    preroll: int = 0,
+) -> None:
     engine = make_engine(config)
     engine.source = source
     engine.exchange = getattr(feed, "name", "mexc")
@@ -107,10 +115,14 @@ def serve(config: dict, feed, source: str, config_path: Path) -> None:
         available = sorted({symbol for symbol, _ in getattr(feed, "files", [])})
         if available:
             engine.set_symbols(available)
+        if preroll:
+            # A replay should open on a filled chart, like the live app does.
+            loaded = engine.preroll_feed(feed, preroll)
+            print(f"pre-roll: {loaded} recorded candles loaded before streaming")
     app = create_app(config, feed, engine, config_path)
     server = config.get("server", {})
-    host = server.get("host", "0.0.0.0")
-    port = int(server.get("port", 8800))
+    host = host or server.get("host", "0.0.0.0")
+    port = int(port or server.get("port", 8800))
     print(f"source={source}  exchange={engine.exchange}  symbols={len(engine.symbols)}  timeframes={engine.timeframes}")
     print(f"open http://localhost:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
@@ -125,6 +137,10 @@ def main() -> int:
     ap.add_argument("--symbols", default="", help="comma-separated override, e.g. BTCUSDT,ETHUSDT")
     ap.add_argument("--exchange", default="", help="mexc (default) or binance")
     ap.add_argument("--top", type=int, default=20, help="universe: how many to print")
+    ap.add_argument("--port", type=int, default=0, help="override the port from config.json")
+    ap.add_argument("--host", default="", help="override the host from config.json")
+    ap.add_argument("--preroll", type=int, default=2400, help="replay: candles loaded before streaming starts")
+    ap.add_argument("--ticks", type=int, default=4, help="replay: partial updates per candle, so candles form visibly")
     args = ap.parse_args()
 
     config_path = Path(args.config)
@@ -147,18 +163,25 @@ def main() -> int:
         except FeedError as exc:
             print(f"feed error: {exc}")
             return 2
-        serve(config, feed, "live", config_path)
+        serve(config, feed, "live", config_path, args.port or None, args.host or None)
         return 0
 
     data_dir = Path(args.data)
     if not data_dir.is_absolute():
         data_dir = ROOT / data_dir
     try:
-        feed = ReplayFeed(data_dir, config["symbols"], speed=args.speed, loop=True)
+        feed = ReplayFeed(
+            data_dir,
+            config["symbols"],
+            speed=args.speed,
+            loop=True,
+            skip=max(0, args.preroll),
+            ticks=max(1, args.ticks),
+        )
     except FeedError as exc:
         print(f"replay error: {exc}")
         return 2
-    serve(config, feed, "replay", config_path)
+    serve(config, feed, "replay", config_path, args.port or None, args.host or None, max(0, args.preroll))
     return 0
 
 

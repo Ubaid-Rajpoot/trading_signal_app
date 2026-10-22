@@ -70,6 +70,24 @@ class Rollup:
         self.candle["open_time"] = start
         return completed
 
+    def preview(self, bar: dict) -> dict:
+        """The candle that is still forming, without touching the closed state.
+
+        The page needs to see the current candle grow between closes; this
+        merges a (possibly partial) 1m bar into the bucket that is open now.
+        """
+        start = bucket_start(bar["open_time"], self.timeframe)
+        if self.candle is None:
+            candle = dict(bar)
+            candle["open_time"] = start
+        else:
+            candle = merge(self.candle, bar)
+            candle["open_time"] = self.start
+        candle["close_time"] = int(start) + TIMEFRAMES[self.timeframe] - 1
+        candle["timeframe"] = self.timeframe
+        candle["closed"] = False
+        return candle
+
     def flush(self) -> list[dict]:
         """Close whatever is open (used at the end of a replay)."""
         if self.candle is None:
