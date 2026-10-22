@@ -130,6 +130,26 @@ pools), and [`tdigm-live/docs/book-coverage.md`](tdigm-live/docs/book-coverage.m
 audits each book concept: implemented or not, which test proves it, and what it
 measured on real BTC data. See [`tdigm-live/README.md`](tdigm-live/README.md).
 
+## SMC radar — strong highs, algo candles, rejection blocks (separate app)
+
+`smc-radar/` is the second standalone app, next to `tdigm-live` and untouched by
+it. It maps the order-block book's own structures — **strong high/low, very
+strong high/low, algo candle, very strong algo candle, rejection block** — on
+every instrument and every timeframe, and keeps each one on the page with the
+time it formed until price **mitigates** it. Nine tabs (each pattern and its
+low-side mirror), live filters, a chart per zone with the block, the level and
+the mitigation marker, a live tape of formations and resolutions, and settings
+that are written back to `config.json`. Every zone lists the book conditions it
+met, with the page they come from; see
+[`smc-radar/README.md`](smc-radar/README.md).
+
+```bash
+cd smc-radar
+python run.py serve              # live MEXC stream on http://localhost:8800
+python run.py replay data/btc 40  # real recorded candles
+python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
+```
+
 ## Scan the market
 
 ```bash

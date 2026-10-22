@@ -1,0 +1,29 @@
+{
+  "exchange": "mexc",
+  "symbols": [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
+    "LINKUSDT", "TONUSDT", "SUIUSDT", "PEPEUSDT"
+  ],
+  "timeframes": ["1m", "5m", "15m", "30m", "1h"],
+  "max_symbols": 400,
+  "preview_max_symbols": 200,
+  "settings": {
+    "pivot_len": 3,
+    "major_len": 12,
+    "disp_bars": 3,
+    "min_fvg_atr": 0.25,
+    "lookback": 240,
+    "induce_tol": 0.25,
+    "induce_count": 2,
+    "max_zone_age": 2000,
+    "mitigation_mode": "zone",
+    "atr_period": 14,
+    "sessions": [
+      {"name": "Asia", "start": 0, "end": 8},
+      {"name": "London", "start": 7, "end": 16},
+      {"name": "New York", "start": 12, "end": 21}
+    ]
+  },
+  "server": {"host": "0.0.0.0", "port": 8800}
+}

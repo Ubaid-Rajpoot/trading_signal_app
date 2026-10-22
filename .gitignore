@@ -25,3 +25,8 @@ frontend/dist/
 .env.*
 .DS_Store
 *.log
+
+# Downloaded market data (real candles are fetched, never committed)
+data/
+tdigm-live/data/
+smc-radar/data/
