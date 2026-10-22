@@ -458,3 +458,72 @@ def test_server_feeds_itself_from_rest_when_the_socket_never_delivers():
     assert ticks > 0, "the forming candle must arrive as a tick"
     assert price and price > 0
     assert chart_bars >= 2
+
+
+# ------------------------------------------------- what the user actually sees
+def test_btc_1m_algo_candle_high_is_reported_and_reachable_from_the_api():
+    """The reported regression: "1m me algo candle high bta hi nahi raha".
+
+    Pinned against real BTC candles: an algo candle at a high on the 1m
+    timeframe must be detected, must carry its evidence, and must be served by
+    /api/zones both while active and after it is mitigated.
+    """
+    rows = load(4000)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    feed = FakeFeed(rows)
+    asyncio.run(engine.warmup(feed))
+
+    one_min = [z for z in engine.zones.values() if z["timeframe"] == "1m"]
+    algo_highs = [z for z in one_min if z["kind"] in {"algo_bear", "very_strong_algo_bear"}]
+    assert algo_highs, "the 1m map must find algo candles at highs on real BTC data"
+    sample = algo_highs[0]
+    assert sample["side"] == "high"
+    assert sample["evidence"], "every zone explains itself"
+    assert sample["level"] == pytest.approx(sample["top"])
+    resolved = [z for z in algo_highs if z["status"] != "active"]
+    assert resolved, "1m zones resolve quickly - that is why they must stay visible"
+
+    app = create_app({"symbols": ["BTCUSDT"], "timeframes": ["1m"], "max_symbols": 5}, feed, engine, None)
+
+    async def go():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            every = (await client.get("/api/zones", params={"status": "all", "limit": 4000})).json()
+            assert any(z["kind"] in {"algo_bear", "very_strong_algo_bear"} for z in every["items"])
+            only_1m = [z for z in every["items"] if z["timeframe"] == "1m"]
+            assert len(only_1m) == len([z for z in engine.zones.values() if z["timeframe"] == "1m"])
+            since = (await client.get("/api/zones", params={"status": "resolved", "since": sample["time"]})).json()
+            assert since["count"] >= 1
+
+    asyncio.run(go())
+
+
+def test_active_1m_algo_high_appears_while_a_replay_streams():
+    """During streaming (not just warm-up) a fresh 1m algo high becomes active."""
+    from bot.feed import ReplayFeed
+    import shutil
+
+    folder = Path("/tmp/smc-1m-check")
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    shutil.copy(CSV, folder / "BTCUSDT-1m.csv")
+
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    seen_active: list[dict] = []
+
+    async def go():
+        feed = ReplayFeed(folder, ["BTCUSDT"], speed=100_000, loop=False)
+        count = 0
+        async for candle in feed.candles():
+            await engine.on_candle(candle)
+            count += 1
+            for zone in engine.active_zones():
+                if zone["kind"] in {"algo_bear", "very_strong_algo_bear"} and zone["timeframe"] == "1m":
+                    seen_active.append(zone)
+            if count > 2500:
+                break
+        return count
+
+    asyncio.run(go())
+    assert seen_active, "a 1m algo candle high must go ACTIVE while the stream runs"
+    assert any(z["side"] == "high" for z in seen_active)

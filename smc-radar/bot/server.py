@@ -247,16 +247,30 @@ def create_app(
         return JSONResponse(engine.snapshot())
 
     @app.get("/api/zones")
-    async def zones(status: str = "active") -> dict[str, Any]:
-        """``active``, ``mitigated``, ``invalidated``, ``resolved`` or ``all``."""
+    async def zones(status: str = "active", since: int = 0, limit: int = 1000) -> dict[str, Any]:
+        """``active``, ``mitigated``, ``invalidated``, ``resolved`` or ``all``.
+
+        ``since`` (a candle timestamp) keeps the payload to zones that formed or
+        were resolved after that moment - which is what the "recently mitigated"
+        view asks for.
+        """
         if status == "all":
             items = list(engine.zones.values())
         elif status == "resolved":
             items = [z for z in engine.zones.values() if z.get("status") != "active"]
         else:
             items = [z for z in engine.zones.values() if z.get("status") == status]
+        if since:
+            items = [
+                z
+                for z in items
+                if int(z.get("time") or 0) >= since
+                or int(z.get("mitigated_at") or 0) >= since
+                or int(z.get("invalidated_at") or 0) >= since
+            ]
         items.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or z.get("time") or 0))
-        return {"count": len(items), "items": items[:1000]}
+        limit = max(1, min(4000, int(limit)))
+        return {"count": len(items), "items": items[:limit]}
 
     @app.get("/api/candles")
     async def candles(symbol: str, timeframe: str = "5m", limit: int = 800, since: int = 0) -> dict[str, Any]:

@@ -76,8 +76,13 @@ its resolution time and price; the tape keeps the record; only a zone older than
 * **Nine tabs** — All · Strong high · Very strong high · Algo candle · high ·
   Rejection block · high · and the four low-side mirrors. Each tab carries the
   live count of *active* zones of that kind.
-* **Filters** — symbol search, timeframe chips, "only active", weak pairs,
-  sort by newest / closest to price / strongest evidence / symbol.
+* **Filters** — symbol search, timeframe chips, **view: active only / active +
+  recently mitigated (default) / everything**, a window selector (15 min … 24 h),
+  weak pairs, sort by newest / closest to price / strongest evidence / symbol.
+  Active zones always lead the list; a resolved zone keeps its card, dimmed,
+  with the time it formed **and** the time and price that mitigated it. That is
+  what keeps a 1m pattern on screen: a 1m zone is usually mitigated within
+  minutes, so an "active only" list can be empty for it by the time you look.
 * **Cards** — symbol, timeframe, pattern, status, level, distance from the live
   price in %, formation time + age, block bounds, session, the evidence list,
   condition count, and the mitigation/invalidation line once it happens.
@@ -164,6 +169,21 @@ places, each one measurable:
 advances on its own, the candle endpoint serves a deep history, the incremental
 refresh returns only new bars, and both SSE and the websocket push.
 
+### Nothing about detection changed
+
+`bot/map.py` - the file that holds the rules of strong high / very strong high /
+algo candle / rejection block / mitigation - is **byte-identical** to the first
+`smc-radar` commit (`git diff c86edfe HEAD -- smc-radar/bot/map.py` is empty),
+and `config.json` gained only the three `rest_poll_*` keys. Measured on the same
+recorded BTC replay, the first commit found 36 `algo_bear` zones on 1m in its
+first 888 candles; the current code found 84 in 2,820 candles - the same ratio,
+i.e. no rule was lost. What *did* change was how fast the page fills: a deep
+warm-up / replay pre-roll resolves most historical 1m zones before you look, so
+an active-only list could look empty. Hence the "recently mitigated" default
+above, and two regression tests that pin it:
+``test_btc_1m_algo_candle_high_is_reported_and_reachable_from_the_api`` and
+``test_active_1m_algo_high_appears_while_a_replay_streams``.
+
 ## 3. Settings (all of them are in `config.json`)
 
 | key | default | meaning |
@@ -192,10 +212,10 @@ Live-only keys (top level of `config.json`):
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 30 passed
+../.venv/bin/python -m pytest tests -q                 # 32 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
-cd tools/ui && npm i && node chart.mjs && node transports.mjs   # headless browser checks
+cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs
 ```
 
 The scan above runs on **real Binance 1-minute candles** for BTCUSDT,

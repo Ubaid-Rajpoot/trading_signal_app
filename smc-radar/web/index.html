@@ -237,7 +237,22 @@
   <div class="toolbar">
     <div class="field"><label>find</label><input type="search" id="search" placeholder="symbol…" /></div>
     <div class="chips" id="tfChips"></div>
-    <label class="toggle"><input type="checkbox" id="onlyActive" checked /> only active</label>
+    <div class="field"><label>show</label>
+      <select id="showMode">
+        <option value="active">active only</option>
+        <option value="recent" selected>active + recently mitigated</option>
+        <option value="all">everything</option>
+      </select>
+    </div>
+    <div class="field" id="recentField"><label>window</label>
+      <select id="recentWindow">
+        <option value="15">15 min</option>
+        <option value="60">1 hour</option>
+        <option value="120" selected>2 hours</option>
+        <option value="480">8 hours</option>
+        <option value="1440">24 hours</option>
+      </select>
+    </div>
     <label class="toggle"><input type="checkbox" id="showWeak" /> weak pairs</label>
     <div class="spacer"></div>
     <div class="field"><label>sort</label>
@@ -383,7 +398,8 @@ const TABS = [
 ];
 const state = {
   data: null, tab: "all", search: "", tfs: new Set(), sort: "new",
-  onlyActive: true, showWeak: false, selected: null, universe: [], uniError: null,
+  showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
+  historyItems: [], historyAt: 0,
   chartKey: "", lastRender: 0,
 };
 const $ = (id) => document.getElementById(id);
@@ -403,9 +419,22 @@ function fmtTime(ms) {
   const mm = String(d.getUTCMinutes()).padStart(2, "0");
   return `${d.getUTCDate()} ${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${hh}:${mm} UTC`;
 }
+function nowAnchor() {
+  const d = state.data || {};
+  if ((d.source || "live") === "replay") {
+    const times = [(d.active || []).map((z) => z.time), (state.historyItems || []).map((z) => z.time)]
+      .reduce((a, b) => a.concat(b), [])
+      .filter(Boolean);
+    const newest = times.length ? Math.max.apply(null, times) : 0;
+    // a replay's candles are older than the wall clock: use its own newest zone
+    return newest || d.server_time || Date.now();
+  }
+  return d.server_time || Date.now();
+}
+
 function ago(ms) {
   if (!ms) return "";
-  const s = Math.max(0, (Date.now() - ms) / 1000);
+  const s = Math.max(0, (nowAnchor() - ms) / 1000);
   if (s < 90) return Math.round(s) + "s ago";
   if (s < 5400) return Math.round(s / 60) + "m ago";
   if (s < 172800) return Math.round(s / 3600) + "h ago";
@@ -515,21 +544,41 @@ function allZones() {
   const d = state.data;
   if (!d) return [];
   const active = d.active || [];
-  // resolved zones are not pushed with every frame; they are fetched once when
-  // the "only active" filter is switched off (see loadHistory)
-  const hist = state.onlyActive ? [] : (state.historyItems || d.history || []);
+  if (state.showMode === "active") return active;
+  // Resolved zones are fetched on demand. They stay on the list exactly as they
+  // were - dimmed, with the time they formed AND the time/price that mitigated
+  // them - because a 1m zone is often resolved within minutes of forming.
+  let hist = state.historyItems || d.history || [];
+  if (state.showMode === "recent") {
+    // measured against the feed's own clock: for a live feed that is "now", for
+    // a replay it is the newest candle it is playing (nobody wants "650 days ago")
+    const cutoff = nowAnchor() - state.recentMinutes * 60000;
+    hist = hist.filter((z) => {
+      const at = z.mitigated_at || z.invalidated_at || z.time;
+      return at && at >= cutoff;
+    });
+  }
   return active.concat(hist);
 }
 
 async function loadHistory() {
+  if (state.showMode === "active") { drawCards(); return; }
   try {
     const res = await fetch("/api/zones?status=resolved", { cache: "no-store" });
     const body = await res.json();
     state.historyItems = body.items || [];
+    state.historyAt = Date.now();
   } catch (err) {
-    state.historyItems = [];
+    state.historyItems = state.historyItems || [];
   }
   drawCards();
+}
+
+function scheduleHistory() {
+  // keep the resolved list fresh while it is on screen
+  if (state.showMode === "active") return;
+  if (Date.now() - (state.historyAt || 0) < 20000) return;
+  loadHistory();
 }
 function kindsForTab(tabId) {
   const tab = TABS.find((t) => t.id === tabId) || TABS[0];
@@ -551,10 +600,12 @@ function visibleZones() {
     const p = price[z.symbol];
     return p == null ? Infinity : Math.abs(z.level - p) / p;
   };
-  if (state.sort === "near") items.sort((a, b) => dist(a) - dist(b));
-  else if (state.sort === "strength") items.sort((a, b) => (b.strength - a.strength) || (b.time - a.time));
-  else if (state.sort === "symbol") items.sort((a, b) => a.symbol.localeCompare(b.symbol) || (b.time - a.time));
-  else items.sort((a, b) => (b.time - a.time));
+  const rank = (z) => (z.status === "active" ? 0 : 1);
+  items.sort((a, b) => rank(a) - rank(b));   // active zones always lead the list
+  if (state.sort === "near") items.sort((a, b) => rank(a) - rank(b) || dist(a) - dist(b));
+  else if (state.sort === "strength") items.sort((a, b) => rank(a) - rank(b) || (b.strength - a.strength) || (b.time - a.time));
+  else if (state.sort === "symbol") items.sort((a, b) => rank(a) - rank(b) || a.symbol.localeCompare(b.symbol) || (b.time - a.time));
+  else items.sort((a, b) => rank(a) - rank(b) || (b.time - a.time));
   return items;
 }
 
@@ -583,6 +634,7 @@ function onState() {
   drawTabs(active);
   drawTfChips();
   scheduleCards();
+  scheduleHistory();
   drawTape();
   // keep the selected zone in step: it may have been mitigated since we drew it
   if (state.selected) {
@@ -662,7 +714,11 @@ function drawCards() {
   const d = state.data || {};
   const price = d.price || {};
   host.innerHTML = "";
-  $("shown").textContent = `${items.length} shown`;
+  const activeCount = items.filter((z) => z.status === "active").length;
+  const resolvedCount = items.length - activeCount;
+  $("shown").textContent = resolvedCount
+    ? `${items.length} shown · ${activeCount} active · ${resolvedCount} recently mitigated`
+    : `${items.length} shown`;
   $("listMeta").textContent = items.length ? `${items.length} zones` : "";
   if (!items.length) {
     const e = el("div", "empty");
@@ -1125,9 +1181,14 @@ function drawTape() {
 
 /* --------------------------------------------------------------- controls */
 $("search").oninput = (e) => { state.search = e.target.value.trim().toUpperCase(); drawCards(); };
-$("onlyActive").onchange = (e) => {
-  state.onlyActive = e.target.checked;
-  if (!state.onlyActive) loadHistory(); else drawCards();
+$("showMode").onchange = (e) => {
+  state.showMode = e.target.value;
+  $("recentField").style.display = state.showMode === "recent" ? "" : "none";
+  if (state.showMode === "active") drawCards(); else loadHistory();
+};
+$("recentWindow").onchange = (e) => {
+  state.recentMinutes = Number(e.target.value) || 120;
+  loadHistory();
 };
 $("showWeak").onchange = (e) => { state.showWeak = e.target.checked; drawCards(); };
 $("sort").onchange = (e) => { state.sort = e.target.value; drawCards(); };
