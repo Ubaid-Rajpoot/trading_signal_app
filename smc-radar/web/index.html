@@ -1,0 +1,857 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SMC radar · strong highs, algo candles, rejection blocks</title>
+<style>
+  :root {
+    --bg: #070a10; --bg-2: #0c1119; --panel: rgba(18, 24, 36, .82); --panel-solid: #121826;
+    --panel-2: #171f2e; --line: #222c3f; --line-2: #2c3850; --text: #e8eef9;
+    --muted: #8592ab; --muted-2: #5f6c84; --green: #2ee6a8; --green-dim: #0f6b50;
+    --red: #ff5c7a; --red-dim: #7a2436; --amber: #ffb347; --blue: #63a8ff; --purple: #b487ff;
+    --shadow: 0 18px 40px -24px rgba(0, 0, 0, .9);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(900px 500px at 12% -8%, #14233d 0%, transparent 60%),
+      radial-gradient(700px 420px at 92% 0%, #241a3a 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1560px; margin: 0 auto; padding: 18px 20px 70px; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #233049; border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  header.top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center;
+    background: linear-gradient(145deg, #1b3b63, #2a1b4d); border: 1px solid #33456b;
+    box-shadow: inset 0 0 18px rgba(99, 168, 255, .25); font-size: 17px;
+  }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .2px; font-weight: 700; }
+  h1 small { display: block; font-size: 11px; color: var(--muted); font-weight: 500; letter-spacing: .06em; text-transform: uppercase; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel); font-size: 11px; font-weight: 700;
+    letter-spacing: .1em; text-transform: uppercase;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .badge.live { color: var(--green); border-color: #1d5c47; }
+  .badge.live .dot { background: var(--green); animation: pulse 1.8s infinite; }
+  .badge.replay { color: var(--amber); border-color: #6b4c1c; }
+  .badge.replay .dot { background: var(--amber); }
+  .badge.down { color: var(--red); border-color: #6b2233; }
+  .badge.down .dot { background: var(--red); }
+  .badge.exchange { color: var(--blue); border-color: #24466e; letter-spacing: .06em; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(46,230,168,.55); } 70% { box-shadow: 0 0 0 9px rgba(46,230,168,0); } 100% { box-shadow: 0 0 0 0 rgba(46,230,168,0); } }
+  .spacer { flex: 1; }
+  .meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; align-items: center; }
+  .meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .btn {
+    border: 1px solid var(--line-2); background: linear-gradient(180deg, #1a2233, #141b29);
+    padding: 8px 13px; border-radius: 10px; cursor: pointer; font-size: 12.5px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 7px; transition: .15s;
+  }
+  .btn:hover { border-color: #3d4f72; transform: translateY(-1px); }
+  .btn.primary { background: linear-gradient(180deg, #1f6f5a, #14523f); border-color: #2b8a6d; color: #eafff8; }
+  .btn.ghost { background: transparent; }
+  .btn.danger { border-color: #5c2430; color: #ffb3c2; background: transparent; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+  .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+  @media (max-width: 1250px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 700px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+    backdrop-filter: blur(8px); box-shadow: var(--shadow); position: relative; overflow: hidden;
+  }
+  .kpi::after { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent, var(--blue)), transparent); opacity: .75; }
+  .kpi .label { color: var(--muted); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; }
+  .kpi .value { font-size: 23px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.3; }
+  .kpi .sub { color: var(--muted-2); font-size: 11.5px; }
+
+  /* tabs */
+  .tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 12px; }
+  .tab {
+    white-space: nowrap; border: 1px solid var(--line); background: var(--panel); border-radius: 999px;
+    padding: 8px 14px; cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 8px; transition: .15s;
+  }
+  .tab:hover { color: var(--text); border-color: var(--line-2); }
+  .tab.on { color: #08111f; background: linear-gradient(180deg, #8fd0ff, #63a8ff); border-color: #8fd0ff; }
+  .tab .n { background: rgba(255,255,255,.1); border-radius: 999px; padding: 0 7px; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .tab.on .n { background: rgba(0,0,0,.18); }
+  .tab.hi.on { background: linear-gradient(180deg, #ffb3c2, #ff5c7a); border-color: #ffb3c2; }
+  .tab.lo.on { background: linear-gradient(180deg, #7cf3d0, #2ee6a8); border-color: #7cf3d0; }
+
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .field { display: inline-flex; align-items: center; gap: 7px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; font-size: 12.5px; }
+  .field input[type=search], .field select, .field input[type=number], .field input[type=text] { background: transparent; border: 0; outline: 0; min-width: 90px; }
+  .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 5px 9px;
+    font-size: 11.5px; font-weight: 700; cursor: pointer; color: var(--muted); letter-spacing: .03em;
+  }
+  .chip.on { color: #08111f; background: #8fd0ff; border-color: #8fd0ff; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
+  .toggle input { accent-color: #63a8ff; }
+
+  .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr); gap: 14px; align-items: start; }
+  @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; backdrop-filter: blur(8px); box-shadow: var(--shadow); }
+  .panel > h2 {
+    margin: 0; padding: 11px 15px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted); border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px;
+    background: rgba(255,255,255,.012);
+  }
+  .panel > h2 .right { margin-left: auto; display: flex; gap: 8px; align-items: center; text-transform: none; letter-spacing: 0; font-weight: 500; }
+
+  /* zone cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; padding: 12px; max-height: 1120px; overflow-y: auto; }
+  .zone {
+    border: 1px solid var(--line); background: linear-gradient(180deg, rgba(23,31,46,.9), rgba(15,21,32,.9));
+    border-radius: 13px; padding: 11px 12px 10px; cursor: pointer; position: relative; transition: .15s;
+    border-left: 3px solid var(--accent, var(--blue));
+  }
+  .zone:hover { border-color: var(--line-2); transform: translateY(-1px); }
+  .zone.sel { box-shadow: 0 0 0 1px #63a8ff, 0 12px 30px -18px #63a8ff; }
+  .zone.resolved { opacity: .62; }
+  .zone .row1 { display: flex; align-items: center; gap: 8px; }
+  .sym { font-weight: 800; font-size: 14px; letter-spacing: .02em; }
+  .tf { font-size: 10.5px; font-weight: 800; letter-spacing: .07em; color: var(--blue); background: rgba(99,168,255,.1); border: 1px solid #24466e; border-radius: 6px; padding: 1px 6px; }
+  .kindtag { font-size: 10.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 6px; border: 1px solid; }
+  .status { margin-left: auto; font-size: 10.5px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; padding: 2px 7px; border-radius: 6px; }
+  .status.active { color: var(--amber); background: rgba(255,179,71,.1); border: 1px solid #6b4c1c; }
+  .status.mitigated { color: var(--green); background: rgba(46,230,168,.09); border: 1px solid #1d5c47; }
+  .status.invalidated { color: var(--muted); background: rgba(255,255,255,.04); border: 1px solid var(--line); }
+  .zone .lvl { display: flex; align-items: baseline; gap: 9px; margin: 8px 0 2px; }
+  .zone .lvl .px { font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: .01em; }
+  .zone .lvl .dist { font-size: 11.5px; color: var(--muted); }
+  .zone .when { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; display: flex; gap: 10px; flex-wrap: wrap; }
+  .zone .evid { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+  .zone .evid li { font-size: 11.5px; color: #b9c6da; display: flex; gap: 6px; }
+  .zone .evid li::before { content: "▸"; color: var(--accent, var(--blue)); }
+  .zone .bar { margin-top: 9px; height: 4px; border-radius: 99px; background: #1a2436; overflow: hidden; }
+  .zone .bar > i { display: block; height: 100%; background: var(--accent); }
+  .zone .foot { margin-top: 7px; font-size: 11px; color: var(--muted-2); display: flex; gap: 10px; flex-wrap: wrap; }
+  .empty { padding: 34px 18px; text-align: center; color: var(--muted); font-size: 13px; }
+  .empty b { display: block; color: var(--text); margin-bottom: 4px; }
+
+  /* chart */
+  #chartPanel { position: sticky; top: 14px; }
+  #chart { width: 100%; display: block; }
+  .chartmeta { display: flex; gap: 12px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--muted); }
+  .chartmeta b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; padding: 8px 14px; color: var(--muted); font-size: 11px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  .feed { padding: 10px 14px; font-size: 11.5px; color: var(--muted); max-height: 148px; overflow-y: auto; display: grid; gap: 5px; }
+  .feed div { display: flex; gap: 8px; }
+  .feed .t { color: var(--muted-2); font-variant-numeric: tabular-nums; }
+
+  /* drawer */
+  .scrim { position: fixed; inset: 0; background: rgba(4,7,12,.66); backdrop-filter: blur(2px); display: none; z-index: 40; }
+  .scrim.on { display: block; }
+  .drawer {
+    position: fixed; top: 0; right: 0; height: 100%; width: min(520px, 96vw); background: #0b1018;
+    border-left: 1px solid var(--line); z-index: 41; transform: translateX(102%); transition: transform .22s ease;
+    display: flex; flex-direction: column;
+  }
+  .drawer.on { transform: none; }
+  .drawer header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .drawer h3 { margin: 0; font-size: 14px; }
+  .drawer .body { padding: 14px 16px 40px; overflow-y: auto; display: grid; gap: 12px; }
+  .drawer .note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .settings label { display: grid; gap: 4px; font-size: 11.5px; color: var(--muted); }
+  .settings input, .settings select {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 7px 9px; font-size: 13px;
+  }
+  .symlist { display: grid; gap: 6px; max-height: 280px; overflow-y: auto; }
+  .symrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 9px; padding: 6px 9px; font-size: 12.5px; }
+  .symrow .n { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: #16203300; border: 1px solid var(--line-2); background-color: #131b28; color: var(--text); padding: 10px 16px; border-radius: 11px; font-size: 12.5px; opacity: 0; transition: .2s; z-index: 60; max-width: 90vw; }
+  .toast.on { opacity: 1; transform: translateX(-50%); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">◎</div>
+      <div>
+        <h1>SMC radar <small>strong high · very strong high · algo candle · rejection block</small></h1>
+      </div>
+    </div>
+    <span class="badge live" id="srcBadge"><span class="dot"></span><span id="srcText">connecting</span></span>
+    <span class="badge exchange" id="exBadge">mexc</span>
+    <div class="spacer"></div>
+    <div class="meta">
+      <span><b id="mSymbols">0</b> symbols</span>
+      <span><b id="mTfs">–</b></span>
+      <span><b id="mCandles">0</b> candles</span>
+      <span>updated <b id="mUpdated">–</b></span>
+    </div>
+    <button class="btn ghost" id="btnSymbols">Symbols</button>
+    <button class="btn ghost" id="btnSettings">Settings</button>
+    <button class="btn ghost" id="btnHelp">?</button>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi" style="--accent:#63a8ff"><div class="label">Active zones</div><div class="value" id="kActive">0</div><div class="sub" id="kActiveSub">waiting for mitigation</div></div>
+    <div class="kpi" style="--accent:#ff5c7a"><div class="label">Strong high</div><div class="value" id="kSH">0</div><div class="sub">manipulation + break</div></div>
+    <div class="kpi" style="--accent:#ff8fb0"><div class="label">Very strong high</div><div class="value" id="kVSH">0</div><div class="sub">+ strong level + inducement</div></div>
+    <div class="kpi" style="--accent:#b487ff"><div class="label">Very strong algo candle</div><div class="value" id="kVSAC">0</div><div class="sub">grab + shift + FVG + inducement</div></div>
+    <div class="kpi" style="--accent:#ffb347"><div class="label">Rejection block</div><div class="value" id="kRB">0</div><div class="sub">session high/low + inducement</div></div>
+    <div class="kpi" style="--accent:#2ee6a8"><div class="label">Mitigated</div><div class="value" id="kMit">0</div><div class="sub" id="kMitSub">since start</div></div>
+  </section>
+
+  <nav class="tabs" id="tabs"></nav>
+
+  <div class="toolbar">
+    <div class="field"><label>find</label><input type="search" id="search" placeholder="symbol…" /></div>
+    <div class="chips" id="tfChips"></div>
+    <label class="toggle"><input type="checkbox" id="onlyActive" checked /> only active</label>
+    <label class="toggle"><input type="checkbox" id="showWeak" /> weak pairs</label>
+    <div class="spacer"></div>
+    <div class="field"><label>sort</label>
+      <select id="sort">
+        <option value="new">newest</option>
+        <option value="near">closest to price</option>
+        <option value="strength">strongest evidence</option>
+        <option value="symbol">symbol</option>
+      </select>
+    </div>
+    <span class="meta" id="shown"></span>
+  </div>
+
+  <div class="layout">
+    <section class="panel">
+      <h2>Zone map <span class="meta" id="listMeta"></span>
+        <span class="right"><span class="meta" id="listHint">click a zone to draw it</span></span>
+      </h2>
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <div class="stack" style="display:grid;gap:14px">
+      <section class="panel" id="chartPanel">
+        <h2 id="chartTitle">Chart</h2>
+        <svg id="chart" viewBox="0 0 560 360" preserveAspectRatio="none"></svg>
+        <div class="legend">
+          <span><i style="background:#ff5c7a"></i>supply (high)</span>
+          <span><i style="background:#2ee6a8"></i>demand (low)</span>
+          <span><i style="background:#63a8ff"></i>price</span>
+          <span><i style="background:#ffb347"></i>zone block</span>
+        </div>
+        <div class="chartmeta" id="chartMeta">select a zone</div>
+      </section>
+      <section class="panel">
+        <h2>Live tape <span class="right"><span class="meta" id="tapeCount"></span></span></h2>
+        <div class="feed" id="tape"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrim"></div>
+
+<aside class="drawer" id="drawerSettings">
+  <header><h3>Detection settings</h3><div class="spacer"></div><button class="btn ghost" data-close>Close</button></header>
+  <div class="body settings">
+    <p class="note">These are the exact thresholds the map uses. Every zone's card lists the evidence it collected; change a value here and the whole map is re-read with it, then written to <code>config.json</code>.</p>
+    <div class="grid2">
+      <label>minor swing (SHIFT) bars<input type="number" id="s_pivot_len" min="1" max="50" /></label>
+      <label>major swing (MS) bars<input type="number" id="s_major_len" min="2" max="120" /></label>
+      <label>bars allowed for the FVG<input type="number" id="s_disp_bars" min="1" max="20" /></label>
+      <label>min FVG size (× ATR)<input type="number" id="s_min_fvg_atr" step="0.05" min="0" max="5" /></label>
+      <label>equal-level tolerance (× ATR)<input type="number" id="s_induce_tol" step="0.05" min="0" max="5" /></label>
+      <label>equal levels = inducement<input type="number" id="s_induce_count" min="1" max="10" /></label>
+      <label>ATR period<input type="number" id="s_atr_period" min="2" max="200" /></label>
+      <label>zone expiry (bars)<input type="number" id="s_max_zone_age" min="50" max="20000" /></label>
+      <label>mitigation
+        <select id="s_mitigation_mode">
+          <option value="zone">price enters the block</option>
+          <option value="level">price reaches the exact high/low</option>
+        </select>
+      </label>
+      <label>bars kept<input type="number" id="s_lookback" min="120" max="1000" /></label>
+    </div>
+    <div class="grid2">
+      <label>Asia session (UTC start)<input type="number" id="s_asia_start" min="0" max="23" /></label>
+      <label>Asia session (UTC end)<input type="number" id="s_asia_end" min="0" max="24" /></label>
+      <label>London start<input type="number" id="s_london_start" min="0" max="23" /></label>
+      <label>London end<input type="number" id="s_london_end" min="0" max="24" /></label>
+      <label>New York start<input type="number" id="s_ny_start" min="0" max="23" /></label>
+      <label>New York end<input type="number" id="s_ny_end" min="0" max="24" /></label>
+    </div>
+    <div style="display:flex;gap:9px;flex-wrap:wrap">
+      <button class="btn primary" id="btnSaveSettings">Apply &amp; save</button>
+      <button class="btn ghost" data-close>Cancel</button>
+      <span class="meta" id="settingsHint"></span>
+    </div>
+  </div>
+</aside>
+
+<aside class="drawer" id="drawerSymbols">
+  <header><h3>Instruments</h3><div class="spacer"></div><button class="btn ghost" data-close>Close</button></header>
+  <div class="body">
+    <p class="note" id="symNote">Every instrument listed on the exchange can be added; the list is stored in <code>config.json</code> and streamed live.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn primary" id="btnAdd50">Add top 50 by turnover</button>
+      <button class="btn ghost" id="btnAddAll">Add every pair</button>
+      <button class="btn ghost" id="btnRefreshUniverse">Refresh list</button>
+    </div>
+    <div class="field"><label>search</label><input type="search" id="uniSearch" placeholder="btc, eth, sol…" /></div>
+    <div class="symlist" id="uniList"></div>
+    <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:6px 0 0">Streaming now</h3>
+    <div class="symlist" id="activeList"></div>
+  </div>
+</aside>
+
+<aside class="drawer" id="drawerHelp">
+  <header><h3>What this scanner draws</h3><div class="spacer"></div><button class="btn ghost" data-close>Close</button></header>
+  <div class="body">
+    <p class="note">Straight from the order-block book, page references included. A zone stays on the map — with the time it formed — until the price mitigates it.</p>
+    <div id="helpBody" class="note"></div>
+  </div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KINDS = {
+  strong_high:        { label: "Strong high",          short: "SH",   side: "high", color: "#ff5c7a" },
+  very_strong_high:   { label: "Very strong high",     short: "VSH",  side: "high", color: "#ff8fb0" },
+  strong_low:         { label: "Strong low",           short: "SL",   side: "low",  color: "#2ee6a8" },
+  very_strong_low:    { label: "Very strong low",      short: "VSL",  side: "low",  color: "#7cf3d0" },
+  algo_bear:          { label: "Algo candle · high",   short: "AC-high",  side: "high", color: "#b487ff" },
+  algo_bull:          { label: "Algo candle · low",    short: "AC-low",  side: "low",  color: "#a0e0ff" },
+  very_strong_algo_bear:{ label: "Very strong AC · high", short: "VSAC-high", side: "high", color: "#d6b3ff" },
+  very_strong_algo_bull:{ label: "Very strong AC · low",  short: "VSAC-low", side: "low",  color: "#bff0ff" },
+  rejection_block_bear:{ label: "Rejection block · high", short: "RB-high", side: "high", color: "#ffb347" },
+  rejection_block_bull:{ label: "Rejection block · low",  short: "RB-low", side: "low",  color: "#ffd88f" },
+  weak_high:          { label: "Weak high",            short: "wH",   side: "high", color: "#5f6c84" },
+  weak_low:           { label: "Weak low",             short: "wL",   side: "low",  color: "#5f6c84" },
+};
+const TABS = [
+  { id: "all", label: "All", kinds: Object.keys(KINDS) },
+  { id: "strong_high", label: "Strong high", kinds: ["strong_high"], cls: "hi" },
+  { id: "very_strong_high", label: "Very strong high", kinds: ["very_strong_high"], cls: "hi" },
+  { id: "algo_bear", label: "Algo candle · high", kinds: ["algo_bear", "very_strong_algo_bear"], cls: "hi" },
+  { id: "rejection_block_bear", label: "Rejection block · high", kinds: ["rejection_block_bear"], cls: "hi" },
+  { id: "strong_low", label: "Strong low", kinds: ["strong_low"], cls: "lo" },
+  { id: "very_strong_low", label: "Very strong low", kinds: ["very_strong_low"], cls: "lo" },
+  { id: "algo_bull", label: "Algo candle · low", kinds: ["algo_bull", "very_strong_algo_bull"], cls: "lo" },
+  { id: "rejection_block_bull", label: "Rejection block · low", kinds: ["rejection_block_bull"], cls: "lo" },
+];
+const state = {
+  data: null, tab: "all", search: "", tfs: new Set(), sort: "new",
+  onlyActive: true, showWeak: false, selected: null, universe: [], uniError: null,
+  chartKey: "", lastRender: 0,
+};
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+
+function fmtPx(v) {
+  if (v == null || !isFinite(v)) return "–";
+  const a = Math.abs(v);
+  const d = a >= 1000 ? 2 : a >= 100 ? 3 : a >= 1 ? 4 : 6;
+  return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function fmtPct(v) { return (v > 0 ? "+" : "") + v.toFixed(2) + "%"; }
+function fmtTime(ms) {
+  if (!ms) return "–";
+  const d = new Date(ms);
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${d.getUTCDate()} ${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${hh}:${mm} UTC`;
+}
+function ago(ms) {
+  if (!ms) return "";
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 4200);
+}
+
+/* ------------------------------------------------------------------ socket */
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => setBadge("live", "live");
+  ws.onclose = () => { setBadge("down", "reconnecting"); setTimeout(connect, 1500); };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "state") { state.data = msg; onState(); }
+    else if (msg.type === "log") toast(msg.message);
+  };
+  setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 25000);
+}
+function setBadge(cls, text) {
+  const b = $("srcBadge");
+  b.className = "badge " + cls;
+  $("srcText").textContent = text;
+}
+
+/* --------------------------------------------------------------- rendering */
+function allZones() {
+  const d = state.data;
+  if (!d) return [];
+  const active = d.active || [];
+  const hist = state.onlyActive ? [] : (d.history || []);
+  return active.concat(hist);
+}
+function kindsForTab(tabId) {
+  const tab = TABS.find((t) => t.id === tabId) || TABS[0];
+  return new Set(tab.kinds);
+}
+function visibleZones() {
+  const d = state.data;
+  if (!d) return [];
+  const kinds = kindsForTab(state.tab);
+  const price = d.price || {};
+  let items = allZones().filter((z) => kinds.has(z.kind));
+  if (!state.showWeak) items = items.filter((z) => z.kind !== "weak_high" && z.kind !== "weak_low");
+  if (state.tfs.size) items = items.filter((z) => state.tfs.has(z.timeframe));
+  if (state.search) {
+    const q = state.search.toUpperCase();
+    items = items.filter((z) => z.symbol.includes(q));
+  }
+  const dist = (z) => {
+    const p = price[z.symbol];
+    return p == null ? Infinity : Math.abs(z.level - p) / p;
+  };
+  if (state.sort === "near") items.sort((a, b) => dist(a) - dist(b));
+  else if (state.sort === "strength") items.sort((a, b) => (b.strength - a.strength) || (b.time - a.time));
+  else if (state.sort === "symbol") items.sort((a, b) => a.symbol.localeCompare(b.symbol) || (b.time - a.time));
+  else items.sort((a, b) => (b.time - a.time));
+  return items;
+}
+
+function onState() {
+  const d = state.data;
+  if (!d) return;
+  $("srcText").textContent = d.source === "replay" ? "replay" : "live";
+  $("srcBadge").className = "badge " + (d.source === "replay" ? "replay" : "live");
+  $("exBadge").textContent = d.exchange || "–";
+  $("mSymbols").textContent = (d.symbols || []).length;
+  $("mTfs").textContent = (d.timeframes || []).join(" · ");
+  $("mCandles").textContent = (d.candles_seen || 0).toLocaleString();
+  $("mUpdated").textContent = new Date().toLocaleTimeString();
+
+  const active = d.active || [];
+  const byKind = {};
+  active.forEach((z) => { byKind[z.kind] = (byKind[z.kind] || 0) + 1; });
+  $("kActive").textContent = active.length;
+  $("kSH").textContent = byKind.strong_high || 0;
+  $("kVSH").textContent = byKind.very_strong_high || 0;
+  $("kVSAC").textContent = (byKind.very_strong_algo_bear || 0) + (byKind.very_strong_algo_bull || 0);
+  $("kRB").textContent = (byKind.rejection_block_bear || 0) + (byKind.rejection_block_bull || 0);
+  $("kMit").textContent = (d.resolved && d.resolved.mitigated) || 0;
+  $("kActiveSub").textContent = `${byKind.strong_low || 0} strong low · ${byKind.very_strong_low || 0} very strong low`;
+
+  drawTabs(active);
+  drawTfChips();
+  drawCards();
+  drawTape();
+  if (state.selectedZone) { drawChartMeta(state.selectedZone); }
+}
+
+function drawTabs(active) {
+  const host = $("tabs");
+  const counts = {};
+  active.forEach((z) => { counts[z.kind] = (counts[z.kind] || 0) + 1; });
+  host.innerHTML = "";
+  TABS.forEach((tab) => {
+    const n = tab.kinds.reduce((sum, k) => sum + (counts[k] || 0), 0);
+    const b = el("button", "tab" + (tab.cls ? " " + tab.cls : "") + (state.tab === tab.id ? " on" : ""));
+    b.appendChild(el("span", null, tab.label));
+    if (n) b.appendChild(el("span", "n", n));
+    b.onclick = () => { state.tab = tab.id; drawTabs(active); drawCards(); };
+    host.appendChild(b);
+  });
+}
+
+function drawTfChips() {
+  const host = $("tfChips");
+  const tfs = (state.data && state.data.timeframes) || [];
+  host.innerHTML = "";
+  tfs.forEach((tf) => {
+    const c = el("button", "chip" + (state.tfs.has(tf) ? " on" : ""), tf);
+    c.onclick = () => { state.tfs.has(tf) ? state.tfs.delete(tf) : state.tfs.add(tf); drawTfChips(); drawCards(); };
+    host.appendChild(c);
+  });
+}
+
+function statusLine(z) {
+  if (z.status === "active") return "active · waiting for price";
+  if (z.status === "mitigated") return `mitigated ${fmtTime(z.mitigated_at)} at ${fmtPx(z.mitigated_price)}`;
+  if (z.status === "invalidated") return `invalidated ${fmtTime(z.invalidated_at)} · close ${fmtPx(z.invalidated_price)}`;
+  return z.status;
+}
+
+function drawCards() {
+  const host = $("cards");
+  const items = visibleZones();
+  const d = state.data || {};
+  const price = d.price || {};
+  host.innerHTML = "";
+  $("shown").textContent = `${items.length} shown`;
+  $("listMeta").textContent = items.length ? `${items.length} zones` : "";
+  if (!items.length) {
+    const e = el("div", "empty");
+    e.appendChild(el("b", null, d.symbols && d.symbols.length ? "No zone of this kind is active right now" : "Waiting for the first candles"));
+    e.appendChild(el("span", null, d.source === "replay"
+      ? "The replay is still warming up its timeframes — zones appear as candles close."
+      : "The scanner is streaming. A pattern only appears when the book's conditions are all met."));
+    host.appendChild(e);
+    return;
+  }
+  items.slice(0, 400).forEach((z) => host.appendChild(card(z, price[z.symbol])));
+}
+
+function card(z, price) {
+  const meta = KINDS[z.kind] || { label: z.kind, color: "#63a8ff", short: "?" };
+  const node = el("div", "zone" + (z.status !== "active" ? " resolved" : "") + (state.selected === z.key ? " sel" : ""));
+  node.style.setProperty("--accent", meta.color);
+
+  const r1 = el("div", "row1");
+  r1.appendChild(el("span", "sym", z.symbol.replace("USDT", "") + (z.symbol.endsWith("USDT") ? "/USDT" : "")));
+  r1.appendChild(el("span", "tf", z.timeframe));
+  const tag = el("span", "kindtag", meta.label);
+  tag.style.color = meta.color;
+  tag.style.borderColor = meta.color + "66";
+  tag.style.background = meta.color + "14";
+  r1.appendChild(tag);
+  r1.appendChild(el("span", "status " + z.status, z.status === "active" ? "active" : z.status));
+  node.appendChild(r1);
+
+  const lvl = el("div", "lvl");
+  lvl.appendChild(el("span", "px", fmtPx(z.level)));
+  if (price != null) {
+    const diff = ((z.level - price) / price) * 100;
+    lvl.appendChild(el("span", "dist", `${fmtPct(diff)} from ${fmtPx(price)}`));
+  }
+  node.appendChild(lvl);
+
+  const when = el("div", "when");
+  when.appendChild(el("span", null, `formed ${fmtTime(z.time)}`));
+  when.appendChild(el("span", null, ago(z.time)));
+  if (z.bottom !== z.top) when.appendChild(el("span", null, `block ${fmtPx(z.bottom)} – ${fmtPx(z.top)}`));
+  if (z.session) when.appendChild(el("span", null, z.session));
+  node.appendChild(when);
+
+  const ev = el("ul", "evid");
+  (z.evidence || []).slice(0, 5).forEach((text) => ev.appendChild(el("li", null, text)));
+  node.appendChild(ev);
+
+  const bar = el("div", "bar");
+  const fill = el("i");
+  fill.style.width = Math.min(100, (z.strength / 6) * 100) + "%";
+  bar.appendChild(fill);
+  node.appendChild(bar);
+
+  const foot = el("div", "foot");
+  foot.appendChild(el("span", null, `${z.strength} condition${z.strength === 1 ? "" : "s"} met`));
+  foot.appendChild(el("span", null, statusLine(z)));
+  if (z.swept_level != null) foot.appendChild(el("span", null, `swept ${fmtPx(z.swept_level)}`));
+  node.appendChild(foot);
+
+  node.onclick = () => selectZone(z);
+  return node;
+}
+
+function selectZone(z) {
+  state.selected = z.key;
+  state.selectedZone = z;
+  document.querySelectorAll(".zone.sel").forEach((n) => n.classList.remove("sel"));
+  drawCards();
+  drawChart(z);
+}
+
+async function drawChart(z) {
+  const svg = $("chart");
+  const W = 560, H = 360, padR = 64, padL = 6, padB = 18, padT = 8;
+  $("chartTitle").textContent = `${z.symbol} · ${z.timeframe} · ${(KINDS[z.kind] || {}).label || z.kind}`;
+  svg.innerHTML = "";
+  let data;
+  try {
+    data = await (await fetch(`/api/candles?symbol=${encodeURIComponent(z.symbol)}&timeframe=${encodeURIComponent(z.timeframe)}&limit=400`)).json();
+  } catch (err) {
+    $("chartMeta").textContent = "could not load candles";
+    return;
+  }
+  const bars = data.bars || [];
+  if (bars.length < 5) { $("chartMeta").textContent = "not enough candles yet for this timeframe"; return; }
+
+  let startIdx = bars.findIndex((b) => (b.close_time || b.open_time) >= z.time);
+  if (startIdx < 0) startIdx = 0;
+  const visibleStart = Math.max(0, Math.min(startIdx - Math.max(10, Math.floor(bars.length * 0.35)), bars.length - 20));
+  const shown = bars.slice(visibleStart);
+  const zoneStartLocal = Math.max(0, startIdx - visibleStart);
+
+  let lo = Infinity, hi = -Infinity;
+  shown.forEach((b) => { lo = Math.min(lo, b.low); hi = Math.max(hi, b.high); });
+  lo = Math.min(lo, z.bottom); hi = Math.max(hi, z.top);
+  const span = (hi - lo) || 1;
+  lo -= span * 0.06; hi += span * 0.06;
+  const y = (p) => padT + (1 - (p - lo) / (hi - lo)) * (H - padT - padB);
+  const step = (W - padL - padR) / Math.max(1, shown.length);
+  const x = (i) => padL + i * step + step / 2;
+  const bw = Math.max(1.2, step * 0.62);
+
+  // grid + price axis
+  for (let i = 0; i <= 4; i++) {
+    const p = lo + ((hi - lo) * i) / 4;
+    const gy = y(p);
+    svg.insertAdjacentHTML("beforeend", `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="#1b2434" stroke-width="1"/>`);
+    svg.insertAdjacentHTML("beforeend", `<text x="${W - padR + 6}" y="${gy + 3.5}" fill="#6d7b93" font-size="9.5" font-family="ui-monospace,monospace">${fmtPx(p)}</text>`);
+  }
+
+  // zone block, from the forming candle to the right edge
+  const zx = x(zoneStartLocal) - bw / 2;
+  const zTop = y(z.top), zBot = y(z.bottom);
+  const up = z.side === "low";
+  const fill = up ? "rgba(46,230,168,.16)" : "rgba(255,92,122,.16)";
+  const stroke = up ? "rgba(46,230,168,.65)" : "rgba(255,92,122,.65)";
+  svg.insertAdjacentHTML("beforeend", `<rect x="${zx}" y="${Math.min(zTop, zBot) - 1}" width="${Math.max(3, W - padR - zx)}" height="${Math.max(2, Math.abs(zBot - zTop) + 2)}" fill="${fill}" stroke="${stroke}"/>`);
+  // level line
+  svg.insertAdjacentHTML("beforeend", `<line x1="${zx}" y1="${y(z.level)}" x2="${W - padR}" y2="${y(z.level)}" stroke="${stroke}" stroke-width="1.4" stroke-dasharray="4 3"/>`);
+  svg.insertAdjacentHTML("beforeend", `<text x="${zx + 4}" y="${y(z.level) - 4}" fill="${stroke}" font-size="9.5" font-family="ui-monospace,monospace">${(KINDS[z.kind] || {}).short || ""} ${fmtPx(z.level)}</text>`);
+
+  // candles
+  shown.forEach((b, i) => {
+    const bull = b.close >= b.open;
+    const col = bull ? "#2ee6a8" : "#ff5c7a";
+    const cx = x(i);
+    svg.insertAdjacentHTML("beforeend", `<line x1="${cx}" y1="${y(b.high)}" x2="${cx}" y2="${y(b.low)}" stroke="${col}" stroke-width="1" opacity=".8"/>`);
+    const yo = y(b.open), yc = y(b.close);
+    svg.insertAdjacentHTML("beforeend", `<rect x="${cx - bw / 2}" y="${Math.min(yo, yc)}" width="${bw}" height="${Math.max(1, Math.abs(yc - yo))}" fill="${col}" opacity=".9"/>`);
+  });
+
+  // mitigation / invalidation marker
+  const markAt = z.mitigated_at || z.invalidated_at;
+  if (markAt) {
+    const mi = shown.findIndex((b) => (b.close_time || b.open_time) >= markAt);
+    if (mi >= 0) {
+      const mc = z.mitigated_at ? "#2ee6a8" : "#8592ab";
+      svg.insertAdjacentHTML("beforeend", `<line x1="${x(mi)}" y1="${padT}" x2="${x(mi)}" y2="${H - padB}" stroke="${mc}" stroke-width="1" stroke-dasharray="2 3" opacity=".8"/>`);
+      svg.insertAdjacentHTML("beforeend", `<text x="${x(mi) + 4}" y="${padT + 11}" fill="${mc}" font-size="9" font-family="ui-monospace,monospace">${z.mitigated_at ? "mitigated" : "invalidated"}</text>`);
+    }
+  }
+
+  // last price
+  const last = shown[shown.length - 1];
+  svg.insertAdjacentHTML("beforeend", `<line x1="${padL}" y1="${y(last.close)}" x2="${W - padR}" y2="${y(last.close)}" stroke="#63a8ff" stroke-width="1" opacity=".55"/>`);
+  svg.insertAdjacentHTML("beforeend", `<text x="${padL + 3}" y="${y(last.close) - 4}" fill="#63a8ff" font-size="9.5" font-family="ui-monospace,monospace">${fmtPx(last.close)}</text>`);
+
+  // swept / break reference levels
+  if (z.swept_level != null) svg.insertAdjacentHTML("beforeend", `<line x1="${padL}" y1="${y(z.swept_level)}" x2="${zx}" y2="${y(z.swept_level)}" stroke="#ffb347" stroke-width="1" stroke-dasharray="1 3" opacity=".8"/>`);
+  if (z.break_level != null) svg.insertAdjacentHTML("beforeend", `<line x1="${padL}" y1="${y(z.break_level)}" x2="${zx}" y2="${y(z.break_level)}" stroke="#b487ff" stroke-width="1" stroke-dasharray="1 3" opacity=".8"/>`);
+
+  drawChartMeta(z, last);
+}
+
+function drawChartMeta(z, last) {
+  const host = $("chartMeta");
+  if (!z) { host.textContent = "select a zone"; return; }
+  const price = last ? last.close : (state.data.price || {})[z.symbol];
+  const parts = [];
+  parts.push(`<span>status <b>${z.status}</b></span>`);
+  parts.push(`<span>formed <b>${fmtTime(z.time)}</b></span>`);
+  parts.push(`<span>level <b>${fmtPx(z.level)}</b></span>`);
+  if (price) {
+    const inZone = price <= z.top && price >= z.bottom;
+    parts.push(`<span>price <b>${fmtPx(price)}</b>${inZone ? " (inside the block)" : ""}</span>`);
+    const diff = ((z.level - price) / price) * 100;
+    parts.push(`<span>distance <b>${fmtPct(diff)}</b></span>`);
+  }
+  if (z.session) parts.push(`<span>session <b>${z.session}</b></span>`);
+  if (z.mitigated_at) parts.push(`<span>mitigated <b>${fmtTime(z.mitigated_at)}</b> @ ${fmtPx(z.mitigated_price)}</span>`);
+  if (z.invalidated_at) parts.push(`<span>invalidated <b>${fmtTime(z.invalidated_at)}</b> @ ${fmtPx(z.invalidated_price)}</span>`);
+  host.innerHTML = parts.join("");
+}
+
+function drawTape() {
+  const host = $("tape");
+  const events = (state.data && state.data.events) || [];
+  host.innerHTML = "";
+  $("tapeCount").textContent = events.length ? `${events.length} recent` : "";
+  if (!events.length) { host.appendChild(el("div", null, "Nothing detected yet — the tape fills as candles close.")); return; }
+  events.slice(0, 40).forEach((ev) => {
+    const z = ev.zone || {};
+    const row = el("div");
+    const time = ev.type === "formed" ? z.time : (z.mitigated_at || z.invalidated_at);
+    row.appendChild(el("span", "t", fmtTime(time).replace(" UTC", "")));
+    const kind = KINDS[z.kind] || {};
+    const verb = ev.type === "formed" ? "formed" : ev.type;
+    const tag = el("span", null, `${verb} · ${z.symbol || "?"} ${z.timeframe || ""} ${kind.label || z.kind || ""} @ ${fmtPx(z.level)}`);
+    if (kind.color) tag.style.color = kind.color;
+    row.appendChild(tag);
+    if (ev.type === "formed" && z.key === state.selected) row.style.fontWeight = "700";
+    host.appendChild(row);
+  });
+}
+
+/* --------------------------------------------------------------- controls */
+$("search").oninput = (e) => { state.search = e.target.value.trim().toUpperCase(); drawCards(); };
+$("onlyActive").onchange = (e) => { state.onlyActive = e.target.checked; drawCards(); };
+$("showWeak").onchange = (e) => { state.showWeak = e.target.checked; drawCards(); };
+$("sort").onchange = (e) => { state.sort = e.target.value; drawCards(); };
+$("btnSettings").onclick = () => openSettings();
+$("btnSymbols").onclick = () => { openDrawer("drawerSymbols"); drawUniverse(); loadUniverse(false); };
+$("btnHelp").onclick = () => openDrawer("drawerHelp");
+document.querySelectorAll("[data-close]").forEach((b) => (b.onclick = closeDrawers));
+$("scrim").onclick = closeDrawers;
+function closeDrawers() {
+  document.querySelectorAll(".drawer").forEach((d) => d.classList.remove("on"));
+  $("scrim").classList.remove("on");
+}
+function openDrawer(id) {
+  document.querySelectorAll(".drawer").forEach((d) => d.classList.remove("on"));
+  $(id).classList.add("on");
+  $("scrim").classList.add("on");
+}
+
+/* settings drawer */
+const SETTING_FIELDS = ["pivot_len", "major_len", "disp_bars", "min_fvg_atr", "induce_tol", "induce_count", "atr_period", "max_zone_age", "mitigation_mode", "lookback"];
+function openSettings() {
+  const s = (state.data && state.data.settings) || {};
+  SETTING_FIELDS.forEach((k) => { const node = $("s_" + k); if (node && s[k] != null) node.value = s[k]; });
+  const sessions = s.sessions || [];
+  const byName = {};
+  sessions.forEach((x) => { byName[x.name.toLowerCase()] = x; });
+  const set = (id, v) => { if (v != null && $(id)) $(id).value = v; };
+  set("s_asia_start", (byName.asia || {}).start); set("s_asia_end", (byName.asia || {}).end);
+  set("s_london_start", (byName.london || {}).start); set("s_london_end", (byName.london || {}).end);
+  set("s_ny_start", (byName["new york"] || {}).start); set("s_ny_end", (byName["new york"] || {}).end);
+  openDrawer("drawerSettings");
+}
+$("btnSaveSettings").onclick = async () => {
+  const payload = {};
+  SETTING_FIELDS.forEach((k) => {
+    const node = $("s_" + k);
+    if (!node) return;
+    payload[k] = k === "mitigation_mode" ? node.value : Number(node.value);
+  });
+  payload.sessions = [
+    { name: "Asia", start: Number($("s_asia_start").value), end: Number($("s_asia_end").value) },
+    { name: "London", start: Number($("s_london_start").value), end: Number($("s_london_end").value) },
+    { name: "New York", start: Number($("s_ny_start").value), end: Number($("s_ny_end").value) },
+  ];
+  const btn = $("btnSaveSettings"); btn.disabled = true; $("settingsHint").textContent = "re-reading the map…";
+  try {
+    const res = await (await fetch("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) })).json();
+    $("settingsHint").textContent = res.warning || "saved";
+    toast(res.warning || "settings applied");
+    closeDrawers();
+  } catch (err) {
+    $("settingsHint").textContent = "could not save: " + err;
+  } finally { btn.disabled = false; }
+};
+
+/* symbols drawer */
+async function loadUniverse(force) {
+  const note = $("symNote");
+  try {
+    const res = await (await fetch("/api/universe" + (force ? "?force=1" : ""))).json();
+    state.universe = res.items || [];
+    state.uniError = res.error;
+    note.textContent = res.error
+      ? `the exchange list is not reachable: ${res.error}`
+      : `${res.count} pairs listed on ${res.exchange}, biggest turnover first. Changes are saved to config.json.`;
+  } catch (err) {
+    state.uniError = String(err);
+    note.textContent = "could not load the exchange list: " + err;
+  }
+  drawUniverse();
+}
+function drawUniverse() {
+  const host = $("uniList");
+  const q = ($("uniSearch").value || "").trim().toUpperCase();
+  const known = new Set((state.data && state.data.symbols) || []);
+  host.innerHTML = "";
+  const items = state.universe.filter((it) => !q || it.symbol.includes(q)).slice(0, 120);
+  if (!items.length) host.appendChild(el("div", "note", state.uniError ? "no exchange list available" : "no match"));
+  items.forEach((it) => {
+    const row = el("div", "symrow");
+    row.appendChild(el("span", null, it.symbol));
+    row.appendChild(el("span", "n", `${(it.change || 0).toFixed(1)}%`));
+    const b = el("button", "btn " + (known.has(it.symbol) ? "ghost" : "primary"), known.has(it.symbol) ? "added" : "add");
+    b.disabled = known.has(it.symbol);
+    b.onclick = () => addSymbols([it.symbol]);
+    row.appendChild(b);
+    host.appendChild(row);
+  });
+  const active = $("activeList");
+  active.innerHTML = "";
+  (state.data && state.data.symbols || []).forEach((sym) => {
+    const row = el("div", "symrow");
+    row.appendChild(el("span", null, sym));
+    const b = el("button", "btn danger", "remove");
+    b.onclick = () => removeSymbol(sym);
+    row.appendChild(b);
+    active.appendChild(row);
+  });
+}
+async function addSymbols(list) {
+  const res = await (await fetch("/api/symbols", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ add: list }) })).json();
+  (res.warnings || []).forEach(toast);
+  if (res.added && res.added.length) toast(`added ${res.added.length} instrument(s) - they warm up in the background`);
+  drawUniverse();
+}
+async function removeSymbol(sym) {
+  const res = await (await fetch("/api/symbols", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ remove: [sym] }) })).json();
+  (res.warnings || []).forEach(toast);
+  drawUniverse();
+}
+$("uniSearch").oninput = drawUniverse;
+$("btnRefreshUniverse").onclick = () => loadUniverse(true);
+$("btnAdd50").onclick = async () => {
+  const res = await (await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset: "top50" }) })).json();
+  if (res.error) return toast(res.error);
+  (res.warnings || []).forEach(toast);
+  toast(`added ${(res.added || []).length} instrument(s)`);
+  drawUniverse();
+};
+$("btnAddAll").onclick = async () => {
+  const res = await (await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset: "all" }) })).json();
+  if (res.error) return toast(res.error);
+  (res.warnings || []).forEach(toast);
+  toast(`added ${(res.added || []).length} instrument(s)`);
+  drawUniverse();
+};
+
+$("helpBody").innerHTML = `
+  <p><b style="color:#ff5c7a">Strong high</b> — a high that caused manipulation (price traded above a swing high) and then structure broke the other way (a candle closed below the opposing swing). Every strong high leaves a weak low behind it.</p>
+  <p><b style="color:#ff8fb0">Very strong high</b> — the same, when the level that was grabbed was itself a major (strong) level and there is an inducement (equal highs/lows) sitting there.</p>
+  <p><b style="color:#b487ff">Algo candle (AC)</b> — the candle that absorbed the orders: it prints a fair value gap within a few bars of the swing. The book: "AC is what makes the high or low strong."</p>
+  <p><b style="color:#d6b3ff">Very strong algo candle</b> — grab of liquidity + momentum shift + FVG + inducement on one candle.</p>
+  <p><b style="color:#ffb347">Rejection block</b> — an algo candle that sits on the high/low of a session (Asia / London / New York) with an inducement behind it.</p>
+  <p><b>Mitigation</b> — price coming back into the block fills the orders there; the zone is then marked <b>mitigated</b> with the exact time and price. If a candle closes beyond the extreme the high became weak, so the zone is <b>invalidated</b>.</p>
+  <p>Nothing is deleted: a zone keeps its formation time on this map until the price mitigates it, and the tape keeps the record afterwards.</p>
+`;
+
+/* ------------------------------------------------------------------- boot */
+function tickClock() { if (state.data) { /* ages refresh */ } }
+setInterval(() => { if (state.data && document.visibilityState === "visible") drawCards(); }, 30000);
+connect();
+</script>
+</body>
+</html>
