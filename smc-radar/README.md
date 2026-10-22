@@ -89,6 +89,13 @@ its resolution time and price; the tape keeps the record; only a zone older than
   through history, **drag the right edge** to rescale price, **double-click**
   (or `reset`) to follow the newest candle again. Touch: one finger pans, two
   fingers pinch. A crosshair shows OHLC for the candle under the cursor.
+  The last candle keeps **the same right-hand margin TradingView uses** (14% of
+  the view, at least four candles) instead of being glued to the price axis, and
+  you can drag or scroll further into that empty space; `follow` snaps back.
+  In live mode the chart draws a **countdown to the candle close** (`⏱ 02:41`)
+  that runs every second and turns amber in the last ten seconds, next to a
+  `● live` marker while the candle is still forming. A replay has no wall clock
+  behind it, so it says `▶ replay` rather than faking a timer.
 * **Live tape** — every formation and every resolution as it happens.
 * **Symbols drawer** — search the exchange's list, add pairs, add the top 50 or
   every pair, remove pairs. The list is written to `config.json`.
@@ -97,6 +104,50 @@ its resolution time and price; the tape keeps the record; only a zone older than
   what the new setting would have found) and written to `config.json`.
 
 ## 2b. Live, continuous data — how it keeps coming
+
+### If `candles_seen` / `ticks_seen` stay at 0
+
+That was a real report: `connected: true`, `feed: "live - 12 symbols on 1
+socket(s)"`, and yet nothing arriving. Three things changed so it cannot happen
+again, and so the reason is never a mystery:
+
+1. **The REST poller is now the safety net** (`bot/poller.py`, on by default in
+   live mode). Every 6 seconds it asks the exchange's own kline endpoint for the
+   last 3 one-minute candles of every symbol. The newest, still-open candle is
+   pushed as a **tick**; the first time a candle is seen **closed** it is pushed
+   as a closed candle (so 5m/15m/1h are still built from real 1m candles). When
+   the websocket is healthy the poller steps back to a 30-second top-up; when
+   the websocket is silent for 45 seconds it becomes the primary feed.
+   Duplicates are impossible: the engine ignores any candle it already has.
+2. **The websocket host is verified, not assumed.** MEXC has moved hosts; both
+   `wbs.mexc.com` and `wbs-api.mexc.com` are tried, and a socket that connects
+   but sends no kline within 20 seconds is abandoned (`bot/feed.py`). So
+   "connected" now means "a candle actually came through".
+3. **`/api/health` says why.** New fields:
+
+```json
+"stream":    {"messages": 41, "parsed": 41, "ignored": 0, "subscribed": 12,
+              "seconds_since_message": 0.4, "samples": ["…raw frame…"]},
+"rest_poll": {"enabled": true, "primary": false, "requests": 120, "errors": 0,
+              "closed_pushed": 118, "ticks_pushed": 0, "age": 1.2},
+"warming":   {"active": false, "done": 60, "total": 60, "errors": 0},
+"delivering": true
+```
+
+Read it like this: `stream.messages = 0` after a minute → the socket is giving
+you nothing (the poller is then carrying the app, `rest_poll.primary = true`);
+`messages > 0` but `parsed = 0` → the exchange changed its message format and
+`stream.samples` contains the raw frame to send me; `rest_poll.errors > 0` →
+REST is failing too, so it is a network problem; `delivering: false` with both
+counters at 0 → nothing is reaching the machine.
+
+### Starting up
+
+Start-up used to warm every instrument × timeframe over REST *before* serving
+anything, which is why the browser waited. Now the page and `/api/health` answer
+in **~0.5 s** (measured: `tools/smoke.sh` prints the number) and the warm-up runs
+in the background, four instruments at a time, reporting itself as
+`warming.done / warming.total` on the page header ("warming 23/60").
 
 The first version needed a restart to show anything new. That is fixed in five
 places, each one measurable:
@@ -129,13 +180,22 @@ refresh returns only new bars, and both SSE and the websocket push.
 | `mitigation_mode` | `zone` | `zone` = price enters the block, `level` = the exact high/low |
 | `sessions` | Asia 0–8, London 7–16, NY 12–21 (UTC) | session edges for rejection blocks |
 
+Live-only keys (top level of `config.json`):
+
+| key | default | meaning |
+|---|---|---|
+| `rest_poll_seconds` | 6 | how often the REST poller refreshes candles when the socket is silent |
+| `rest_poll_quiet_after` | 45 | seconds of socket silence before the poller becomes the primary feed |
+| `rest_poll_always` | false | force the poller to poll ticks even when the socket is healthy |
+
 ## 4. What was verified, and how to reproduce it
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 26 passed
+../.venv/bin/python -m pytest tests -q                 # 30 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
-PORT=8891 bash tools/smoke.sh                          # end-to-end HTTP/WS/SSE checks
+PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
+cd tools/ui && npm i && node chart.mjs && node transports.mjs   # headless browser checks
 ```
 
 The scan above runs on **real Binance 1-minute candles** for BTCUSDT,
@@ -160,6 +220,17 @@ Tests (`tests/test_map.py`, `tests/test_engine.py`) pin the definitions:
 * the engine turns real candles into every timeframe, keeps 240 bars, pushes a
   JSON state, and a settings change from the UI lands in `config.json`.
 
+New in this round, all covered by `tests/` and `tools/`:
+
+* a **dead socket** (`connected: true`, nothing ever delivered) still produces
+  closed candles **and** ticks, without duplicating candles in the chart
+  (`test_server_feeds_itself_from_rest_when_the_socket_never_delivers`);
+* a **healthy socket** keeps the poller quiet (no unnecessary tick polling);
+* warm-up reports progress and never blocks the server;
+* the chart's right margin, the countdown (formula **and** the ticking clock),
+  the per-timeframe refresh rate and the live tick counter are asserted in
+  `tools/ui/chart.mjs`.
+
 The page was smoke-tested headlessly against the running replay server, three
 times over, once per transport:
 
@@ -180,8 +251,10 @@ candle path by a test that feeds an unfinished 1m bar and reads it back through
 
 * **The exchange is not reachable from the machine this was built on.** MEXC's
   REST and websocket are blocked in the build sandbox, so the *connectivity*
-  path was verified only up to "the server starts, serves the page, and reports
-  the feed as reconnecting". Everything else — deep history, the forming candle,
+  path was verified only up to "the server starts in half a second, serves the
+  page, and reports the feed as reconnecting". The behaviour after a socket
+  connects but stays silent is covered by an integration test that reproduces
+  exactly that state and then checks that candles and ticks still arrive. Everything else — deep history, the forming candle,
   the push, the three transports, the reconnect logic — is covered by the tests
   and the smoke script above, and every number on the page comes from real
   recorded candles rather than from a live feed. `python run.py check` tells you

@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import config_store
 from .engine import Engine
+from .poller import RestPoller
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -71,6 +72,14 @@ def create_app(
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "mexc")
     max_symbols = int(config.get("max_symbols", 400))
+    poller = RestPoller(
+        feed,
+        engine,
+        interval=float(config.get("rest_poll_seconds", 6)),
+        quiet_after=float(config.get("rest_poll_quiet_after", 45)),
+        force=bool(config.get("rest_poll_always", False)),
+    )
+    app_state: dict[str, Any] = {"warmed": False, "warm_task": None, "poller": poller, "started_at": time.time()}
     universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None}
     tasks: list[asyncio.Task] = []
     warm_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -132,12 +141,22 @@ def create_app(
             except Exception:
                 pass
 
+    async def warm_background() -> None:
+        try:
+            await engine.warmup(feed)
+        finally:
+            app_state["warmed"] = True
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        await engine.warmup(feed)
+        # The page must open at once. Warming a dozen instruments over REST takes
+        # a while, so it runs next to the server, never in front of it.
+        tasks.append(asyncio.create_task(warm_background()))
         tasks.append(asyncio.create_task(pump()))
         tasks.append(asyncio.create_task(warmer()))
         tasks.append(asyncio.create_task(heartbeat()))
+        if engine.source != "replay" or bool(config.get("rest_poll_in_replay", False)):
+            tasks.append(asyncio.create_task(poller.run()))
         try:
             yield
         finally:
@@ -156,6 +175,7 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
+        last_message = getattr(feed, "last_message", 0) or 0
         return {
             "ok": True,
             "source": engine.source,
@@ -170,6 +190,25 @@ def create_app(
             "zones": len(engine.zones),
             "symbols": len(engine.symbols),
             "timeframes": engine.timeframes,
+            "uptime": round(time.time() - app_state["started_at"], 1),
+            "warming": {
+                "active": engine.warming,
+                "done": engine.warm_done,
+                "total": max(1, engine.warm_total),
+                "errors": engine.warm_errors,
+            },
+            # why is data (not) arriving? These fields answer it.
+            "stream": {
+                "messages": getattr(feed, "messages", 0),
+                "parsed": getattr(feed, "parsed", 0),
+                "ignored": getattr(feed, "ignored", 0),
+                "frames": getattr(feed, "frames", 0),
+                "subscribed": len(getattr(feed, "subscribed", []) or []),
+                "seconds_since_message": round(time.time() - last_message, 1) if last_message else None,
+                "samples": list(getattr(feed, "samples", []) or [])[-2:],
+            },
+            "rest_poll": poller.stats(),
+            "delivering": engine.candles_seen > 0 or engine.ticks_seen > 0,
         }
 
     @app.get("/api/stream")

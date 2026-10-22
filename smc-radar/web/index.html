@@ -369,6 +369,7 @@ const KINDS = {
   weak_high:          { label: "Weak high",            short: "wH",   side: "high", color: "#5f6c84" },
   weak_low:           { label: "Weak low",             short: "wL",   side: "low",  color: "#5f6c84" },
 };
+const TF_MS = { "1m": 60e3, "3m": 180e3, "5m": 300e3, "15m": 900e3, "30m": 1800e3, "1h": 3600e3 };
 const TABS = [
   { id: "all", label: "All", kinds: Object.keys(KINDS) },
   { id: "strong_high", label: "Strong high", kinds: ["strong_high"], cls: "hi" },
@@ -492,7 +493,7 @@ function transportWatchdog() {
       link.kind = "none";
       startWS(); startSSE();
     }
-    const label = link.kind === "ws" ? "live" : link.kind === "sse" ? "live · sse" : link.kind === "poll" ? "polling" : "reconnecting";
+      const label = link.kind === "ws" ? "live" : link.kind === "sse" ? "live · sse" : link.kind === "poll" ? "polling" : "reconnecting";
     setBadge(age <= 6000 ? "live" : age <= 20000 ? "replay" : "down", age <= 6000 ? label : `${label} ${Math.round(age / 1000)}s`);
   }, 1000);
 }
@@ -600,9 +601,19 @@ function onState() {
   }
   const feedNode = $("chartFeed");
   if (feedNode) {
-    feedNode.textContent = state.data.source === "replay"
-      ? `replay · ${state.data.candles_seen || 0} candles`
-      : `live · ${(state.data.ticks_seen || 0).toLocaleString()} ticks`;
+    const d = state.data;
+    const warming = d.warming && d.warming.active;
+    const ticks = d.ticks_seen || 0;
+    const candles = d.candles_seen || 0;
+    const age = d.last_tick_age;
+    if (warming && !candles) {
+      feedNode.textContent = `warming ${d.warming.done}/${d.warming.total}`;
+    } else if (!ticks && !candles) {
+      feedNode.textContent = d.source === "replay" ? "replay starting…" : "waiting for the first candle…";
+    } else {
+      feedNode.textContent = `${d.source === "replay" ? "replay" : "live"} · ${ticks.toLocaleString()} ticks · ${candles.toLocaleString()} candles`
+        + (age != null ? ` · ${age.toFixed(0)}s ago` : "");
+    }
   }
 }
 
@@ -722,11 +733,21 @@ function card(z, price) {
    The last candle is the one still forming, so it grows in front of you. */
 const chart = {
   zone: null, bars: [], live: false, right: 0, span: 160, zoomY: 1, panY: 0,
+  futureBars: 400,          // how far you may scroll past the last candle
+  skew: 0,                  // server clock minus this browser's clock, in ms
+  lastTickAt: 0,
+  marginFraction: 0.14,     // breathing space on the right, as a share of the view
   auto: true, hover: null, drag: null, timer: null, loading: false, error: null,
   debug: { rects: 0, lines: 0, candles: 0 }, fetchedAt: 0, count: 0,
 };
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// empty candles kept after the live one, so the last candle is not glued to the
+// axis (this is the TradingView "right margin" behaviour)
+chart.marginBars = function (span) {
+  return Math.max(4, Math.round(span * this.marginFraction));
+};
 
 function selectZone(z) {
   state.selected = z.key;
@@ -747,7 +768,15 @@ function openChart(z) {
   }
   $("chartTitle").firstChild.textContent = `${z.symbol} · ${z.timeframe} · ${(KINDS[z.kind] || {}).label || z.kind} `;
   refreshChart(true);
-  if (!chart.timer) chart.timer = setInterval(() => refreshChart(false), 1800);
+  if (chart.timer) clearInterval(chart.timer);
+  const tfMs = TF_MS[z.timeframe] || 300000;
+  const every = tfMs <= 60e3 ? 900 : tfMs <= 300e3 ? 1200 : 1800;
+  chart.timer = setInterval(() => refreshChart(false), every);
+  if (chart.clockTimer) clearInterval(chart.clockTimer);
+  // the countdown ticks every second, the candles only when new data arrives
+  chart.clockTimer = setInterval(() => {
+    if (chart.zone && document.visibilityState === "visible" && !chart.loading) renderChart();
+  }, 1000);
 }
 
 async function refreshChart(reset) {
@@ -764,6 +793,7 @@ async function refreshChart(reset) {
     const res = await fetch(url, { cache: "no-store" });
     const data = await res.json();
     chart.key = z.key;
+    if (data.server_time) chart.skew = data.server_time - Date.now();
     if (data.incremental && chart.bars.length) {
       const merged = new Map(chart.bars.map((b) => [b.open_time, b]));
       (data.bars || []).forEach((b) => merged.set(b.open_time, b));
@@ -828,9 +858,15 @@ function renderChart() {
   const len = bars.length;
   chart.span = clamp(chart.span, 20, Math.max(25, len));
   const span = Math.min(chart.span, Math.max(20, len));
-  const maxRight = len - 1;
-  if (chart.auto) chart.right = maxRight;
+  // TradingView leaves a gap after the last candle instead of gluing it to the
+  // price axis: the newest candle is drawn a little left of the right edge, and
+  // you can drag/scroll into that empty space to see where price might go.
+  const margin = chart.marginBars(span);
+  const maxRight = len - 1 + chart.futureBars;
+  if (chart.auto) chart.right = len - 1 + margin;
   chart.right = clamp(chart.right, Math.min(span - 1, maxRight), maxRight);
+  chart.lastIndex = len - 1;
+  chart.leftEdge = chart.right - span + 1;
   const left = chart.right - span + 1;
   const plotW = W - padL - padR;
   const cw = plotW / span;
@@ -838,7 +874,7 @@ function renderChart() {
   const bw = Math.max(1, Math.min(14, cw * 0.66));
 
   const i0 = Math.max(0, Math.floor(left));
-  const i1 = Math.min(len - 1, Math.ceil(chart.right));
+  const i1 = Math.min(len - 1, Math.ceil(chart.right));   // drawing stops at the newest candle
   const zIdx = zoneIndex(bars, z);
   let lo = Infinity, hi = -Infinity;
   for (let i = i0; i <= i1; i++) {
@@ -875,12 +911,13 @@ function renderChart() {
   const ticks = Math.max(3, Math.min(8, Math.round(plotW / 110)));
   for (let t = 0; t <= ticks; t++) {
     const i = Math.round(left + ((span - 1) * t) / ticks);
-    if (i < 0 || i >= len) continue;
-    const b = bars[i];
+    if (i < 0) continue;
+    const stepMs = TF_MS[(chart.zone && chart.zone.timeframe) || "5m"] || 300000;
+    const base = i < len ? bars[i].open_time : bars[len - 1].open_time + (i - len + 1) * stepMs;
     const gx = xAt(i);
     ctx.strokeStyle = "#151d2b";
     ctx.beginPath(); ctx.moveTo(gx, padT); ctx.lineTo(gx, H - padB); ctx.stroke();
-    const d = new Date(b.open_time);
+    const d = new Date(base);
     const label = `${String(d.getUTCDate()).padStart(2, "0")} ${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
     ctx.fillStyle = "#6d7b93";
     ctx.fillText(label, gx, H - padB + 6);
@@ -980,6 +1017,33 @@ function renderChart() {
       ctx.fillStyle = "#07101c"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
       ctx.fillText(fmtPx(priceToDraw), W - padR + 5, y);
       debug.lines++;
+    }
+  }
+
+  // ---- candle countdown, like the clock in the corner of a TradingView chart
+  if (z && (chart.auto || chart.live)) {
+    const isReplay = !!(state.data && state.data.source === "replay");
+    ctx.textAlign = "right"; ctx.textBaseline = "top";
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    if (isReplay) {
+      // a replay has no wall clock behind it: say so instead of faking a timer
+      ctx.fillStyle = "#8592ab";
+      ctx.fillText("▶ replay", W - padR - 8, padT + 2);
+    } else {
+      const step = TF_MS[z.timeframe || "5m"] || 300000;
+      const nowServer = Date.now() + (chart.skew || 0);
+      const lastBar = bars[len - 1];
+      const closeAt = lastBar ? lastBar.open_time + step : Math.ceil(nowServer / step) * step;
+      const left = Math.max(0, closeAt - nowServer);
+      const mm = String(Math.floor(left / 60000)).padStart(2, "0");
+      const ss = String(Math.floor((left % 60000) / 1000)).padStart(2, "0");
+      const near = left < 10000;
+      ctx.fillStyle = near ? "#ffb347" : "#8592ab";
+      ctx.fillText(`⏱ ${mm}:${ss}`, W - padR - 8, padT + (chart.live ? 18 : 2));
+      if (chart.live) {
+        ctx.fillStyle = "#2ee6a8";
+        ctx.fillText("● live", W - padR - 8, padT + 2);
+      }
     }
   }
 

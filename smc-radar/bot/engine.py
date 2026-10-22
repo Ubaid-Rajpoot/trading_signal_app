@@ -64,6 +64,11 @@ class Engine:
         self.seq = 0
         self.last_tick_at = time.time()
         self.started_at = time.time()
+        # warm-up progress, so the page can say what it is waiting for
+        self.warm_total = len(self.symbols) * len(self.timeframes)
+        self.warm_done = 0
+        self.warming = True
+        self.warm_errors = 0
         self.last_event_at = time.time()
         self._last_state_at = 0.0
         self._warm_failures = 0
@@ -102,6 +107,7 @@ class Engine:
             added.append(symbol)
         if added:
             self.state_interval = self._interval_for(len(self.symbols))
+            self.warm_total += len(added) * len(self.timeframes)
         return added
 
     def remove_symbols(self, symbols: list[str]) -> list[str]:
@@ -113,6 +119,7 @@ class Engine:
             self.rollups = {k: v for k, v in self.rollups.items() if k[0] not in drop}
             self.history = {k: v for k, v in self.history.items() if k[0] not in drop}
             self.last_open = {k: v for k, v in self.last_open.items() if k not in drop}
+            self._recount_warm()
             self.partial = {k: v for k, v in self.partial.items() if k[0] not in drop}
             self.zones = {k: v for k, v in self.zones.items() if v.get("symbol") not in drop}
             self.state_interval = self._interval_for(len(self.symbols))
@@ -129,7 +136,15 @@ class Engine:
             self.remove_symbols([symbol])
         added = self.add_symbols(wanted)
         self.state_interval = self._interval_for(len(self.symbols))
+        self._recount_warm()
         return added
+
+    def _recount_warm(self) -> None:
+        """Progress must describe the instruments that are actually watched."""
+        total = len(self.symbols) * len(self.timeframes)
+        if total != self.warm_total:
+            self.warm_total = total
+            self.warm_done = min(self.warm_done, total)
 
     def restrict_symbols(self, available: list[str]) -> None:
         keep = {str(s).upper() for s in available}
@@ -178,22 +193,29 @@ class Engine:
         for tf in self.timeframes:
             key = (symbol, tf)
             map_ = self.maps.get(key)
-            if map_ is None or len(self.history.get(key, ())) >= 150:
+            if map_ is None:
+                continue
+            if len(self.history.get(key, ())) >= 150:
+                self.warm_done += 1   # already warm (a replay pre-roll, say)
                 continue
             interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
             if interval is None:
                 await self._warm_from_minutes(feed, symbol, tf)
+                self.warm_done += 1
                 continue
             try:
                 candles = await asyncio.wait_for(feed.history(symbol, interval, WARM_BARS), timeout=20)
                 self._warm_failures = 0
             except Exception as exc:  # a broken symbol must not kill the scanner
                 self._warm_failures += 1
+                self.warm_errors += 1
+                self.warm_done += 1
                 if self._warm_failures <= 3:
                     await self._log(f"warm-up {symbol} {tf}: {type(exc).__name__}: {exc}", "warn")
                 continue
             for bar in candles:
                 self._append(key, {**bar, "closed": True})
+            self.warm_done += 1
 
     async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> None:
         key = (symbol, tf)
@@ -208,14 +230,33 @@ class Engine:
         # keep the roll-up in step with the live stream
         self.rollups[key] = rollup
 
-    async def warmup(self, feed) -> None:
-        for symbol in list(self.symbols):
-            if self._warm_failures >= 6:
-                # the exchange is not answering: serving the page now is more
-                # useful than waiting out a timeout for every instrument
+    async def warmup(self, feed, concurrency: int = 4) -> None:
+        """Warm every instrument, a few at a time.
+
+        Start-up used to wait for every symbol before the page was served, which
+        on a dozen instruments meant a minute of staring at nothing. Now the map
+        warms in the background while the page is already open and reporting
+        progress (``warming`` / ``warm_done`` / ``warm_total``).
+        """
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def one(symbol: str) -> None:
+            async with sem:
+                if self._warm_failures >= 8:
+                    return
+                try:
+                    await self.warm_symbol(feed, symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.warm_errors += 1
+
+        try:
+            await asyncio.gather(*(one(symbol) for symbol in list(self.symbols)))
+        finally:
+            self.warming = False
+            if self._warm_failures >= 8:
                 await self._log("warm-up stopped: the exchange is not answering - live candles will fill the map", "error")
-                break
-            await self.warm_symbol(feed, symbol)
         await self._emit_state(force=True)
 
     async def backfill(self, feed, symbol: str) -> None:
@@ -303,14 +344,47 @@ class Engine:
                     "closed": False,
                 }
             else:
-                rollup = self.rollups.get(key)
-                if rollup is None:
+                preview = self._preview(key, candle)
+                if preview is None:
                     continue
-                preview = rollup.preview(candle)
                 history = self.history.get(key)
                 if history and preview["open_time"] <= history[-1]["open_time"]:
                     continue
                 self.partial[key] = preview
+
+    def _preview(self, key: tuple[str, str], candle: dict) -> dict | None:
+        """The higher-timeframe candle that is forming right now.
+
+        It is assembled from the 1m candles already stored in this bucket plus
+        the live tick - so a 15m candle shows the true open, the true high/low
+        and the current close from the first minute, not just the last tick.
+        """
+        tf = key[1]
+        step = TIMEFRAMES.get(tf)
+        if step is None:
+            return None
+        start = (int(candle["open_time"]) // step) * step
+        merged = {
+            "open_time": start,
+            "close_time": start + step - 1,
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+            "volume": float(candle.get("volume") or 0.0),
+            "timeframe": tf,
+            "closed": False,
+        }
+        history = self.history.get(key)
+        if history:
+            for bar in reversed(history):
+                if int(bar["open_time"]) < start:
+                    break
+                merged["high"] = max(merged["high"], float(bar["high"]))
+                merged["low"] = min(merged["low"], float(bar["low"]))
+                merged["open"] = float(bar["open"])
+                merged["volume"] += float(bar.get("volume") or 0.0)
+        return merged
 
     def ingest(self, candle: dict) -> None:
         """Take one CLOSED 1m candle and update every timeframe.
@@ -464,6 +538,12 @@ class Engine:
                 for event in self.events[:30]
             ],
             "seq": self.seq,
+            "warming": {
+                "active": self.warming,
+                "done": self.warm_done,
+                "total": max(1, self.warm_total),
+                "errors": self.warm_errors,
+            },
             "server_time": int(time.time() * 1000),
             "candles_seen": self.candles_seen,
             "ticks_seen": self.ticks_seen,
