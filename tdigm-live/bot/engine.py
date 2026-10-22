@@ -26,6 +26,17 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from .buckets import TIMEFRAMES, Rollup, merge
+from .confluence import (
+    Confluence,
+    dealing_range,
+    equal_extremes,
+    failing_swings,
+    liquidity_pools,
+    pools_ahead,
+    fair_value_gaps,
+    position_in_range,
+    zone_of,
+)
 from .filters import Filters
 from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
 from .regime import RegimePoint, RegimeTracker
@@ -443,8 +454,11 @@ class Engine:
         }
 
         if setup is not None:
+            book = self._confluence(cell, setup, bar)
             candidate = {
                 **base,
+                "book": book.as_dict(),
+                "break_kind": book.break_kind,
                 "tdi_tail": self._tdi_tail(cell, point),
                 "kind": "signal",
                 "side": setup.side,
@@ -455,6 +469,7 @@ class Engine:
                 "break": brk,
                 "structure": True,
                 "rr": setup.rr,
+                "external_trend": book.external_trend,
                 "bars_since_sweep": setup.index - setup.sweep.index,
                 "setup": setup.as_dict(),
             }
@@ -577,6 +592,59 @@ class Engine:
                 "price": preview["close"],
                 "time": int(preview["open_time"]),
             }
+
+    def _confluence(self, cell: Cell, setup, bar: dict) -> Confluence:
+        """p.42 / p.53 / p.87 applied to THIS setup (only runs when one appears)."""
+        candles = list(cell.candles)
+        index = len(candles) - 1
+        # structure indices are absolute (they count every bar ever seen) while
+        # the candle list is a rolling window - map one onto the other
+        offset = cell.structure.count - len(candles)
+
+        def local(absolute: int) -> int:
+            return max(0, min(index, absolute - offset))
+        side = setup.side
+        sweep = setup.sweep
+        atr = cell.regime_point.atr
+        point = Confluence(side=side)
+
+        point.break_kind = setup.break_kind
+        point.external_trend = cell.structure.external_trend
+        point.swept_label = "strong high" if sweep.side == "high" else "strong low"
+        point.broke_label = "weak low" if setup.broke.side == "low" else "weak high"
+
+        bounds = cell.structure.range()
+        if bounds:
+            point.range_high, point.range_low = bounds["high"], bounds["low"]
+            point.range_high_time, point.range_low_time = bounds["high_time"], bounds["low_time"]
+            bounds_pair = dealing_range(bounds["high"], bounds["low"])
+            point.position = position_in_range(float(bar["close"]), bounds_pair)
+            point.zone = zone_of(point.position)
+            point.sweep_position = position_in_range(float(sweep.level), bounds_pair)
+            point.sweep_zone = zone_of(point.sweep_position)
+
+        # p.87: the displacement that broke structure should leave an imbalance
+        wanted = "bearish" if side == "SHORT" else "bullish"
+        gaps = [
+            gap
+            for gap in fair_value_gaps(candles, max(2, local(sweep.index)), index)
+            if gap.side == wanted
+        ]
+        point.fvgs_in_leg = len(gaps)
+        if gaps:
+            point.fvg_filled = max(gap.filled_fraction(candles, index) for gap in gaps)
+
+        pools = liquidity_pools(candles, lookback=30, tolerance=0.25, atr=atr)
+        point.equal_highs = max((count for _, count in pools["highs"]), default=0)
+        point.equal_lows = max((count for _, count in pools["lows"]), default=0)
+        point.pools_ahead = pools_ahead(pools, side, float(bar["close"]))
+
+        if atr and atr > 0:
+            point.structure_atr = abs(sweep.level - setup.broke.price) / atr
+
+        swing = failing_swings(candles, cell.structure.pivot_len)
+        point.failure_swing = swing["kind"] if swing else None
+        return point
 
     @staticmethod
     def _regime_dict(cell: Cell) -> dict[str, Any]:

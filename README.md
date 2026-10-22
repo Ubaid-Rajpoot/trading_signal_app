@@ -124,7 +124,11 @@ doing it **with speed**, and a setup is only published when the market is
 entry, stop beyond the sweep and the liquidity target, streams MEXC (or Binance)
 klines, builds every timeframe from 1m, ships filters that are saved to
 `config.json`, and lets you add any of the exchange's symbols from the page. No
-orders, no backtest. See [`tdigm-live/README.md`](tdigm-live/README.md).
+orders, no backtest. Every alert is labelled the way the reference book labels a
+setup (SHIFT/MS, strong-weak highs and lows, premium/discount, FVG, liquidity
+pools), and [`tdigm-live/docs/book-coverage.md`](tdigm-live/docs/book-coverage.md)
+audits each book concept: implemented or not, which test proves it, and what it
+measured on real BTC data. See [`tdigm-live/README.md`](tdigm-live/README.md).
 
 ## Scan the market
 

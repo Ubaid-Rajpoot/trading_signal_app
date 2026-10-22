@@ -186,6 +186,12 @@
   .cell.armed .s { color: var(--amber); }
   .cell.cold { opacity: .45; }
   .cell.flat { border-color: #2b3242; background: rgba(255,255,255,.02); }
+  .book-line { display: block; font-size: 10.5px; color: #9fb0c9; letter-spacing: .01em; }
+  .book-tag {
+    display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 9px; font-weight: 700;
+    letter-spacing: .07em; text-transform: uppercase; background: rgba(180,135,255,.14); color: #c9a9ff;
+    border: 1px solid rgba(180,135,255,.3);
+  }
   .cell.flat .s { color: var(--muted); }
   .dot-live { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--muted-2); margin-right: 4px; vertical-align: middle; }
   .dot-live.on { background: var(--green); }
@@ -415,6 +421,46 @@
             <option value="with">only with EMA20/EMA50</option>
           </select>
         </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h4>The book's confluences</h4>
+      <p class="mini" style="margin:0 0 8px">Each one is a rule from the PDF. The measured effect of every switch is in <b>docs/book-coverage.md</b>, so nothing here is on by faith.</p>
+      <div class="row">
+        <label>Trade with the external structure
+          <span class="hint">p.53 — the last MAJOR break (MS) must agree with the trade</span></label>
+        <div class="switch"><input type="checkbox" id="f-sdir" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Refuse trades aimed into a liquidity pool
+          <span class="hint">p.42 — 3+ equal highs/lows in front of the entry</span></label>
+        <div class="switch"><input type="checkbox" id="f-pool" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Require the displacement to leave an FVG
+          <span class="hint">p.87 — no imbalance, no trade</span></label>
+        <div class="switch"><input type="checkbox" id="f-fvg" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Only a major break (MS) confirms
+          <span class="hint">p.53 — off: the reversal break is a SHIFT</span></label>
+        <div class="switch"><input type="checkbox" id="f-ms" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Premium / discount
+          <span class="hint">p.42 — sweep must be in premium (short) / discount (long)</span></label>
+        <div class="switch"><input type="checkbox" id="f-prem" /><span></span></div>
+      </div>
+      <div class="fields">
+        <div class="field"><span>premium threshold</span><input type="number" step="0.05" min="0.5" max="1" id="f-premlevel" /></div>
+        <div class="field"><span>measure</span>
+          <select id="f-premon">
+            <option value="sweep">at the sweep</option>
+            <option value="entry">at the entry</option>
+          </select>
+        </div>
+        <div class="field"><span>pool size (equal levels)</span><input type="number" step="1" min="2" id="f-poolcount" /></div>
       </div>
     </div>
 
@@ -712,6 +758,17 @@
         detail.append(html(`base <b>${fmt(a.mbl)}</b>`));
       }
       if (a.armed) detail.append(html(`watching <b>${price(a.armed.watching)}</b>`));
+      if (a.book) {
+        const b = a.book;
+        const kind = b.break_kind === "MS" ? "MS (major break)" : "SHIFT (minor break)";
+        let line = `<span class="book-tag">${kind}</span> ${b.swept_label || ""} → ${b.broke_label || ""}`;
+        if (b.zone) line += ` · entry ${b.zone} ${Math.round((b.position || 0) * 100)}%`;
+        if (b.sweep_zone) line += ` · sweep ${b.sweep_zone}`;
+        if (b.fvgs_in_leg) line += ` · ${b.fvgs_in_leg} FVG`;
+        if (b.pools_ahead) line += ` · ${b.pools_ahead} equal ${a.side === "LONG" ? "highs" : "lows"} ahead`;
+        if (b.structure_atr) line += ` · structure ${b.structure_atr} ATR`;
+        detail.append(html(`<span class="book-line">${line}</span>`));
+      }
       if (a.regime) {
         const r = a.regime;
         detail.append(html(`market <b>${r.state === "trend" ? "trending" : r.state === "range" ? "ranging" : "?"}</b>`
@@ -870,6 +927,11 @@
     if (f.config.structure) parts.push("structure");
     if (f.config.hvb) parts.push(`HVB ${f.config.hvb_min_points ? "≥ " + f.config.hvb_min_points + " pts" : "(any touch)"} · ${state.centre_reference === "fifty" ? "50 midline" : "middle of bands"}`);
     if (f.config.regime !== false) parts.push(`trending only · ADX ≥ ${f.config.regime_adx_min} · ER ≥ ${f.config.regime_er_min}${f.config.regime_direction === "with" ? " · with EMA" : ""}`);
+    if (f.config.structure_direction) parts.push("with external structure");
+    if (f.config.block_liquidity_pool) parts.push(`no ${f.config.pool_count || 3}x pools`);
+    if (f.config.require_fvg) parts.push("FVG required");
+    if (f.config.require_ms) parts.push("MS only");
+    if (f.config.premium_discount) parts.push(`premium/discount ${f.config.premium_on_entry ? "entry" : "sweep"}`);
     if (f.config.break) parts.push("20-bar break");
     if (f.config.min_rr) parts.push(`R:R ≥ ${f.config.min_rr}`);
     if (f.config.max_bars_since_sweep) parts.push(`≤ ${f.config.max_bars_since_sweep} bars`);
@@ -903,6 +965,14 @@
     $("f-break").checked = !!f.break;
     $("f-hvbpts").value = f.hvb_min_points || 0;
     $("f-hvbspeed").value = f.hvb_min_speed || 0;
+    $("f-sdir").checked = f.structure_direction !== false;
+    $("f-pool").checked = f.block_liquidity_pool !== false;
+    $("f-fvg").checked = !!f.require_fvg;
+    $("f-ms").checked = !!f.require_ms;
+    $("f-prem").checked = !!f.premium_discount;
+    $("f-premlevel").value = f.premium_level ?? 0.5;
+    $("f-premon").value = f.premium_on_entry ? "entry" : "sweep";
+    $("f-poolcount").value = f.pool_count ?? 3;
     $("f-regime").checked = f.regime !== false;
     $("f-adx").value = f.regime_adx_min ?? 20;
     $("f-er").value = f.regime_er_min ?? 0.1;
@@ -933,6 +1003,14 @@
       regime_adx_min: Number($("f-adx").value) || 0,
       regime_er_min: Number($("f-er").value) || 0,
       regime_direction: $("f-regime-dir").value,
+      structure_direction: $("f-sdir").checked,
+      block_liquidity_pool: $("f-pool").checked,
+      pool_count: Number($("f-poolcount").value) || 3,
+      require_fvg: $("f-fvg").checked,
+      require_ms: $("f-ms").checked,
+      premium_discount: $("f-prem").checked,
+      premium_level: Number($("f-premlevel").value) || 0.5,
+      premium_on_entry: $("f-premon").value === "entry",
       min_rr: Number($("f-minrr").value) || 0,
       max_bars_since_sweep: Number($("f-maxbars").value) || 0,
       cooldown_minutes: Number($("f-cooldown").value) || 0,

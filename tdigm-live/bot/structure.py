@@ -21,7 +21,12 @@ bar that pokes through has closed.
 
 Definitions used by the alerts (all exact, no hidden magic):
 
-    pivot_len           bars on each side of a swing point (default 5)
+    pivot_len           bars on each side of a MINOR swing point (default 5)
+    major_len           bars on each side of a MAJOR swing point (default 20);
+                        a break of a minor swing is a SHIFT, of a major one the
+                        book's MS (p.53), and the last major break gives the
+                        external trend / the dealing range of p.42
+    break_kind          "SHIFT" or "MS", recorded on every setup
     sweep               bar.high > level (high level) / bar.low < level (low level)
     sweep invalidation  a later CLOSE beyond the sweep extreme - price accepted
                         the new level, so there is nothing to reverse
@@ -43,6 +48,7 @@ from typing import Any
 
 DEFAULTS: dict[str, Any] = {
     "pivot_len": 5,
+    "major_len": 20,
     "sweep_max_wait": 60,
     "level_max_age": 180,
     "max_levels": 40,
@@ -61,9 +67,16 @@ class Level:
     index: int
     time: int
     swept: bool = False
+    kind: str = "minor"  # "minor" (SHIFT territory) or "major" (MS territory)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"side": self.side, "price": self.price, "time": self.time, "swept": self.swept}
+        return {
+            "side": self.side,
+            "price": self.price,
+            "time": self.time,
+            "swept": self.swept,
+            "kind": self.kind,
+        }
 
 
 @dataclass
@@ -100,6 +113,7 @@ class Setup:
     index: int
     time: int
     broke: Level
+    break_kind: str = "SHIFT"  # "SHIFT" (minor) or "MS" (major, p.53)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +128,7 @@ class Setup:
             "sweep_extreme": self.sweep.extreme,
             "broke_level": self.broke.price,
             "broke_time": self.broke.time,
+            "break_kind": self.break_kind,
             "bars_since_sweep": self.index - self.sweep.index,
         }
 
@@ -128,6 +143,7 @@ class Structure:
     def __init__(self, settings: dict[str, Any] | None = None) -> None:
         cfg = {**DEFAULTS, **(settings or {})}
         self.pivot_len = max(1, int(cfg["pivot_len"]))
+        self.major_len = max(self.pivot_len, int(cfg.get("major_len") or 20))
         self.sweep_max_wait = max(1, int(cfg["sweep_max_wait"]))
         self.level_max_age = max(self.pivot_len * 2, int(cfg["level_max_age"]))
         self.max_levels = max(4, int(cfg["max_levels"]))
@@ -140,6 +156,10 @@ class Structure:
         self.closes: deque[float] = deque(maxlen=keep)
         self.count = 0  # absolute index of the next bar
         self.levels: deque[Level] = deque(maxlen=self.max_levels)
+        self.major_levels: deque[Level] = deque(maxlen=12)
+        self.external_trend: int | None = None
+        self.last_major_break: dict[str, Any] | None = None
+        self._major_count = 0
         self.sweeps: dict[str, Sweep | None] = {"high": None, "low": None}
         self.last_setup: Setup | None = None
         self.setups = 0
@@ -147,9 +167,9 @@ class Structure:
         self.events: dict[str, Any] = {}
 
     # ---------------------------------------------------------------- pivots
-    def _pivot_at(self, position: int) -> tuple[str, float] | None:
+    def _pivot_at(self, position: int, width: int | None = None) -> tuple[str, float] | None:
         """Is the bar at ``position`` a confirmed swing point?"""
-        n = self.pivot_len
+        n = self.pivot_len if width is None else max(1, int(width))
         highs = list(self.highs)
         lows = list(self.lows)
         start = max(0, position - n)
@@ -175,6 +195,8 @@ class Structure:
 
         events: dict[str, Any] = {
             "pivot": None,
+            "major_pivot": None,
+            "major_break": None,
             "sweep": None,
             "sweeps": [],
             "setup": None,
@@ -200,6 +222,40 @@ class Structure:
                         Level(side=side, price=level_price, index=index - self.pivot_len, time=pivot_time)
                     )
                     events["pivot"] = {"side": side, "price": level_price, "time": pivot_time}
+
+        # 1b. major swings (p.53 MS): the same fractal, but a much wider window.
+        #     A major pivot can only be confirmed `major_len` bars later.
+        major_pos = len(self.highs) - 1 - self.major_len
+        if major_pos >= self.major_len and self.major_len > self.pivot_len:
+            found_major = self._pivot_at(major_pos, self.major_len)
+            if found_major is not None:
+                side, level_price = found_major
+                duplicate = any(
+                    abs(level.price - level_price) < 1e-12 and level.side == side
+                    for level in self.major_levels
+                )
+                if not duplicate:
+                    self.major_levels.append(
+                        Level(side=side, price=level_price, index=index - self.major_len,
+                              time=int(self.times[major_pos]), kind="major")
+                    )
+                    events["major_pivot"] = {"side": side, "price": level_price}
+
+        # 1c. the latest major break is the external trend; it also defines the
+        #     dealing range of p.42 (last major low .. last major high).
+        for level in self.major_levels:
+            if level.swept:
+                continue
+            if level.side == "high" and price > level.price:
+                level.swept = True
+                self.external_trend = 1
+                self.last_major_break = {"side": "high", "price": level.price, "index": index}
+                events["major_break"] = self.last_major_break
+            elif level.side == "low" and price < level.price:
+                level.swept = True
+                self.external_trend = -1
+                self.last_major_break = {"side": "low", "price": level.price, "index": index}
+                events["major_break"] = self.last_major_break
 
         # 2. sweeps: each side is tracked separately, so taking buy-side
         #    liquidity does not stop the bot watching the sell side.
@@ -327,6 +383,7 @@ class Structure:
             index=index,
             time=int(self.times[-1]),
             broke=sweep.opposite,  # type: ignore[arg-type]
+            break_kind="MS" if getattr(sweep.opposite, "kind", "minor") == "major" else "SHIFT",
         )
         self.last_setup = setup
         self.setups += 1
@@ -363,12 +420,33 @@ class Structure:
             "direction": "SHORT" if sweep.side == "high" else "LONG",
         }
 
+    def range(self) -> dict[str, float] | None:
+        """p.42 dealing range: the last major low .. the last major high."""
+        highs = [l for l in self.major_levels if l.side == "high"]
+        lows = [l for l in self.major_levels if l.side == "low"]
+        if not highs or not lows:
+            return None
+        high = max(highs, key=lambda l: l.index)
+        low = max(lows, key=lambda l: l.index)
+        if high.price <= low.price:
+            return None
+        return {
+            "high": high.price,
+            "low": low.price,
+            "high_time": high.time,
+            "low_time": low.time,
+        }
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "levels": len(self.levels),
+            "major_levels": len(self.major_levels),
+            "external_trend": self.external_trend,
+            "break_kind": self.last_setup.break_kind if self.last_setup else None,
             "setups": self.setups,
             "invalidated": self.invalidated,
             "sweeps": {side: (s.as_dict() if s else None) for side, s in self.sweeps.items()},
+            "range": self.range(),
         }
 
 

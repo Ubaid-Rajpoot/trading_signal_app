@@ -712,3 +712,141 @@ async def test_engine_publishes_regime_with_every_signal():
         assert regime["state"] in {"trend", "range"}
         assert regime["adx"] is not None and regime["er"] is not None
         assert regime["adx_min"] == pytest.approx(20.0)
+
+
+# ------------------------------------------------- the book's confluences
+def _candle(i: int, high: float, low: float, close: float | None = None) -> dict:
+    return {
+        "symbol": "BTCUSDT",
+        "open_time": 1_700_000_000_000 + i * 300_000,
+        "close_time": 1_700_000_000_000 + i * 300_000 + 299_999,
+        "open": close if close is not None else (high + low) / 2,
+        "high": high,
+        "low": low,
+        "close": close if close is not None else (high + low) / 2,
+        "volume": 1.0,
+        "trades": 1,
+        "closed": True,
+    }
+
+
+def test_fvg_is_a_three_candle_gap_and_nothing_else():
+    from bot.confluence import fair_value_gaps
+
+    # bar 3's low is above bar 1's high -> bullish imbalance between them
+    candles = [
+        _candle(0, high=100, low=98),
+        _candle(1, high=105, low=99),
+        _candle(2, high=110, low=104),
+        _candle(3, high=111, low=106),  # overlapping, no gap
+    ]
+    gaps = fair_value_gaps(candles, 0, len(candles) - 1)
+    # two bullish gaps: 100-104 (bar 0 high .. bar 2 low) and 105-106
+    assert [(g.side, g.bottom, g.top) for g in gaps] == [
+        ("bullish", 100.0, 104.0),
+        ("bullish", 105.0, 106.0),
+    ]
+    # price then trades back down into the gap -> it is being filled
+    candles.append(_candle(4, high=107, low=102))
+    assert gaps[0].filled_fraction(candles, 4) == pytest.approx(0.5)
+    candles.append(_candle(5, high=103, low=97))
+    assert gaps[0].filled_fraction(candles, 5) == 1.0
+
+
+def test_liquidity_pool_counts_equal_extremes_not_every_candle():
+    from bot.confluence import liquidity_pools, pools_ahead
+
+    candles = [_candle(i, high=100.0, low=90.0) for i in range(3)]      # 3 equal lows
+    candles += [_candle(i, high=130.0, low=120.0) for i in range(3, 6)]  # 3 equal highs
+    candles += [_candle(i, high=240 + i, low=220 + i) for i in range(6, 10)]
+    pools = liquidity_pools(candles, lookback=10, tolerance=0.25, atr=4.0)
+    assert max(count for _, count in pools["lows"]) == 3
+    assert max(count for _, count in pools["highs"]) == 3
+    # a short aims down: the equal LOWS below 125 are in the way
+    assert pools_ahead(pools, "SHORT", 125.0) == 3   # equal lows below the entry
+    assert pools_ahead(pools, "SHORT", 80.0) == 0    # nothing left below
+    assert pools_ahead(pools, "LONG", 125.0) == 3    # equal highs above it
+
+
+def test_dealing_range_separates_premium_and_discount():
+    from bot.confluence import dealing_range, position_in_range, zone_of
+
+    bounds = dealing_range(120.0, 80.0)
+    assert bounds == {"high": 120.0, "low": 80.0, "equilibrium": 100.0}
+    assert zone_of(position_in_range(118.0, bounds)) == "premium"
+    assert zone_of(position_in_range(82.0, bounds)) == "discount"
+    assert zone_of(position_in_range(100.0, bounds)) == "equilibrium"
+    assert position_in_range(130.0, bounds) == 1.0  # clamped
+
+
+def test_failure_swing_is_a_swing_that_fails_to_extend():
+    from bot.confluence import failing_swings
+
+    prices = [100, 96, 104, 99, 108, 103, 106, 101, 109]
+    candles = []
+    for i, price in enumerate(prices):
+        candles.append(_candle(i, high=price + 0.5, low=price - 0.5))
+    swings = failing_swings(candles, pivot_len=1)
+    assert swings is not None
+    assert swings["kind"] in {"bullish", "bearish"}
+
+
+def test_structure_labels_strong_and_weak_levels_and_the_break_kind():
+    from bot.structure import Structure, DEFAULTS
+
+    assert DEFAULTS["major_len"] == 20
+    st, _pivots, _sweeps, setups, _events = run_structure(SHORT_PATTERN)
+    assert setups, "the fixture has to produce a setup"
+    _index, setup = setups[0]
+    # p.42: the swept level caused the manipulation and the break -> STRONG;
+    # the level that the reversal broke -> WEAK.
+    assert setup.sweep.side == "high"  # buy-side liquidity taken = strong high
+    assert setup.broke.side == "low"   # the low that failed = weak low
+    # p.53: this break is a MINOR swing break, i.e. a SHIFT, not an MS
+    assert setup.break_kind == "SHIFT"
+
+
+def test_book_gates_reject_and_explain():
+    book = {
+        "break_kind": "SHIFT", "external_trend": -1, "swept_label": "strong high",
+        "broke_label": "weak low", "position": 0.3, "sweep_position": 0.9,
+        "zone": "discount", "sweep_zone": "premium", "fvgs_in_leg": 0, "fvg_filled": 0.0,
+        "equal_highs": 2, "equal_lows": 5, "pools_ahead": 5, "structure_atr": 1.2,
+        "failure_swing": None,
+    }
+    cand = candidate(book=book)
+
+    assert not Filters({"structure_direction": True}).apply(cand)[0]          # against structure
+    assert Filters({"structure_direction": True}).apply(candidate(book={**book, "external_trend": 1}))[0] is False
+    open_filters = {"structure_direction": False, "premium_discount": False,
+                    "block_liquidity_pool": False, "require_fvg": False, "require_ms": False}
+    assert Filters(open_filters).apply(candidate(book={**book, "external_trend": -1}))[0] is True
+
+    ok, reasons = Filters({"require_ms": True}).apply(cand)
+    assert not ok and any("SHIFT, not an MS" in r for r in reasons)
+    ok, reasons = Filters({"require_fvg": True}).apply(cand)
+    assert not ok and any("no FVG" in r for r in reasons)
+    ok, reasons = Filters({"block_liquidity_pool": True, "pool_count": 3}).apply(cand)
+    assert not ok and any("liquidity pool" in r for r in reasons)
+    ok, reasons = Filters({"structure_atr_min": 2.0}).apply(cand)
+    assert not ok and any("ATR tall" in r for r in reasons)
+    # premium/discount reads the SWEEP by default and the entry when asked
+    short = candidate(side="SHORT", book={**book, "sweep_position": 0.2, "sweep_zone": "discount"})
+    ok, reasons = Filters({"premium_discount": True}).apply(short)
+    assert not ok and any("not in premium" in r for r in reasons)
+    ok, _ = Filters({"premium_discount": True, "premium_on_entry": True}).apply(short)
+    assert not ok
+
+
+@pytest.mark.asyncio
+async def test_every_signal_carries_the_book_labels():
+    engine = make_engine(hvb=False, filters={"structure_direction": False, "block_liquidity_pool": False})
+    await push_5m(engine, market_rows())
+    signals = [a for a in engine.alerts if a["kind"] == "signal"]
+    assert signals
+    book = signals[-1]["book"]
+    for key in ("break_kind", "swept_label", "broke_label", "zone", "sweep_zone", "pools_ahead", "structure_atr"):
+        assert key in book
+    assert book["swept_label"] in {"strong high", "strong low"}
+    assert book["broke_label"] in {"weak low", "weak high"}
+    assert book["break_kind"] in {"SHIFT", "MS"}
