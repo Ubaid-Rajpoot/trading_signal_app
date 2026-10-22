@@ -137,9 +137,13 @@ it. It maps the order-block book's own structures — **strong high/low, very
 strong high/low, algo candle, very strong algo candle, rejection block** — on
 every instrument and every timeframe, and keeps each one on the page with the
 time it formed until price **mitigates** it. Nine tabs (each pattern and its
-low-side mirror), live filters, a chart per zone with the block, the level and
-the mitigation marker, a live tape of formations and resolutions, and settings
-that are written back to `config.json`. Every zone lists the book conditions it
+low-side mirror), live filters, a TradingView-style chart per zone (1000
+candles, scroll to zoom, drag to pan, crosshair, the forming candle growing
+live) with the block, the level and the mitigation marker, a live tape of
+formations and resolutions, and settings that are written back to
+`config.json`. Data streams continuously over a websocket, falling back to
+server-sent events and then polling, with a heartbeat so a page never goes
+stale and a silent exchange socket rebuilt automatically. Every zone lists the book conditions it
 met, with the page they come from; see
 [`smc-radar/README.md`](smc-radar/README.md).
 
