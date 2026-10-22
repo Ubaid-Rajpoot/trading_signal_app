@@ -80,6 +80,19 @@ async def main() -> int:
     ap.add_argument("--regime-dir", default="any", choices=["any", "with"], help="also demand the EMA direction")
     ap.add_argument("--horizon", type=int, default=300, help="bars to look ahead when scoring a signal")
     ap.add_argument("--no-score", action="store_true", help="skip the win/loss walk-forward")
+    ap.add_argument("--major-len", type=int, default=20, help="bars each side of a MAJOR swing (MS)")
+    ap.add_argument("--premium", action="store_true",
+                    help="require the sweep to happen in premium/discount (p.42) - off by default, measured harmful")
+    ap.add_argument("--premium-level", type=float, default=0.5, help="how deep into premium/discount")
+    ap.add_argument("--premium-on-entry", action="store_true", help="measure the ENTRY instead of the sweep")
+    ap.add_argument("--no-structure-direction", dest="structure_direction", action="store_false",
+                    help="do NOT require the last major break to agree (it is required by default, like the app)")
+    ap.add_argument("--require-ms", action="store_true", help="the confirming break must be an MS")
+    ap.add_argument("--require-fvg", action="store_true", help="the displacement must leave an FVG (p.87)")
+    ap.add_argument("--no-pool", action="store_true", help="do not block trades aimed into equal highs/lows")
+    ap.add_argument("--pool-count", type=int, default=3, help="equal highs/lows that count as a pool")
+    ap.add_argument("--structure-atr-min", type=float, default=0.0)
+    ap.add_argument("--structure-atr-max", type=float, default=0.0)
     ap.add_argument("--json", default="", help="write the signals as JSON (for offline analysis)")
     ap.add_argument("--no-structure", action="store_true")
     ap.add_argument("--require-break", dest="require_break", action="store_true",
@@ -119,8 +132,19 @@ async def main() -> int:
             "regime_adx_min": args.adx_min,
             "regime_er_min": args.er_min,
             "regime_direction": args.regime_dir,
+            "premium_discount": bool(args.premium),
+            "premium_level": args.premium_level,
+            "premium_on_entry": args.premium_on_entry,
+            "structure_direction": args.structure_direction,
+            "require_ms": args.require_ms,
+            "require_fvg": args.require_fvg,
+            "block_liquidity_pool": not args.no_pool,
+            "pool_count": args.pool_count,
+            "structure_atr_min": args.structure_atr_min,
+            "structure_atr_max": args.structure_atr_max,
         },
-        structure={"pivot_len": args.pivot_len, "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target},
+        structure={"pivot_len": args.pivot_len, "major_len": args.major_len,
+                   "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target},
     )
 
     signals: dict[str, list[dict]] = defaultdict(list)
@@ -143,6 +167,9 @@ async def main() -> int:
         sides = Counter(a["side"] for a in got)
         rrs = [a["setup"]["rr"] for a in got if a.get("setup") and a["setup"].get("rr")]
         hvb = sum(1 for a in got if a.get("hvb"))
+        kinds = Counter((a.get("break_kind") or "?") for a in got)
+        zones = Counter(((a.get("book") or {}).get("zone") or "?") for a in got)
+        print(f"       break kinds {dict(kinds)} · zones {dict(zones)}")
         print(f"{tf:>4}: {len(got):>4} signals  ({len(got) / max(days, 1):.2f}/day)  "
               f"long {sides.get('LONG', 0)} short {sides.get('SHORT', 0)}  "
               f"hvb {hvb}  median RR {sorted(rrs)[len(rrs) // 2] if rrs else '-'}")

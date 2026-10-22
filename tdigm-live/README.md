@@ -126,6 +126,24 @@ next to them, so you can see *why* it is quiet instead of guessing.
 Both thresholds are sliders in ⚙ and are saved to `config.json`. Set them low
 to see more, high to see only the strongest trends.
 
+### The book's confluences (p.42, p.53, p.87)
+
+Every alert says where it sits in the book, and each of these is a switch:
+
+| reading on the card | book | default |
+|---|---|---|
+| `SHIFT (minor break)` / `MS (major break)` | p.53 | label only |
+| `strong high → weak low` | p.42 — the swept level caused the manipulation and the break; the level that failed is weak | shown |
+| `entry premium 78% · sweep premium` | p.42 — where the trade and the manipulation sit in the dealing range | shown, gate **off** (measured harmful) |
+| `2 FVG` | p.87 — imbalances the displacement printed | shown, gate off |
+| `5 equal lows ahead` | p.42/p.53 — a liquidity pool in front of the trade | **gate on**: 3+ equal extremes refuse the trade |
+| `with external structure` | p.53 — the last major break must agree | **gate on** |
+| `structure 1.2 ATR` | how tall the swept→broken structure is | shown, gate off |
+
+The measured effect of **every** switch, page by page, is in
+[`docs/book-coverage.md`](docs/book-coverage.md) — including the two that
+measured *worse* and are therefore off by default. Nothing is on by faith.
+
 ---
 
 ## Run it
@@ -197,6 +215,11 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **trending markets only** | on | ADX(14) and the efficiency ratio must both clear their lines |
 | **ADX at least / ER at least** | 20 / 0.10 | how much trend is enough |
 | **regime direction** | any | `any`, or `with` the EMA20/EMA50 direction |
+| **external structure** | on | the last MAJOR break (MS) must agree with the trade (p.53) |
+| **liquidity pool** | on, 3 levels | refuse a trade aimed into 3+ equal highs/lows (p.42) |
+| **FVG required** | off | the displacement must leave an imbalance (p.87) |
+| **MS required** | off | the confirming break must be major (it never is — see the doc) |
+| **premium / discount** | off, 0.5 | the sweep (or the entry) must sit in premium for shorts / discount for longs |
 | **centre band** | middle of bands | `mbl` (yellow line, middle of upper/lower) or `fifty` (the 50 axis) |
 | **20-bar break** | off | the older rule (close beyond the last 20 highs/lows) as an extra condition |
 | **min R:R** | 0 | skip setups whose target pays less than this |

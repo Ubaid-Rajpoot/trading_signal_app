@@ -10,6 +10,14 @@ condition on/off or narrows the same condition:
     hvb_min_speed    and how fast: this candle's step vs the line's average step
     regime           only trade a trending market (ADX + efficiency ratio)
     regime_direction "any" or "with" (the EMA20/EMA50 direction)
+    premium_discount  p.42 - the manipulation (sweep) must happen in premium
+                      for a short / in discount for a long, unless
+                      premium_on_entry is set (then the entry is measured)
+    structure_direction  the last MAJOR break has to agree with the trade (p.53)
+    require_ms       the confirming break must be a major swing (MS, not SHIFT)
+    require_fvg      the displacement must have left an FVG (p.87)
+    block_liquidity_pool  no trade aimed straight into a cluster of equal highs/lows
+    structure_atr_min / _max  the swept->broken structure has to be this tall (ATR)
     break            the classic 20-bar high/low close break, same bar
     sides            long only / short only / both
     min_rr           skip setups whose next-liquidity target pays less than this
@@ -37,6 +45,17 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "regime_adx_min": 20.0,
     "regime_er_min": 0.10,
     "regime_direction": "any",
+    "premium_discount": False,
+    "premium_level": 0.5,
+    "premium_on_entry": False,
+    "structure_direction": True,
+    "require_ms": False,
+    "require_fvg": False,
+    "block_liquidity_pool": True,
+    "pool_tolerance": 0.25,
+    "pool_count": 3,
+    "structure_atr_min": 0.0,
+    "structure_atr_max": 0.0,
     "break": False,
     "sides": ["long", "short"],
     "min_rr": 0.0,
@@ -136,6 +155,10 @@ class Filters:
                 if regime.get("direction") is not None and regime["direction"] * want < 0:
                     reasons.append("against the EMA trend (regime_direction = with)")
 
+        book = candidate.get("book") or {}
+        if book:
+            reasons.extend(self._book_checks(side, cfg, book, candidate))
+
         if cfg.get("break"):
             if not candidate.get("break"):
                 reasons.append("no 20-bar high/low break on this candle")
@@ -181,6 +204,58 @@ class Filters:
 
         self.passed += 1
         return True, []
+
+    @staticmethod
+    def _book_checks(side: str, cfg: dict, book: dict, candidate: dict) -> list[str]:
+        """The book's confluences, each one switchable on its own."""
+        out: list[str] = []
+
+        # p.42 premium / discount
+        if cfg.get("premium_discount") and side:
+            threshold = float(cfg.get("premium_level") or 0.5)
+            on_entry = bool(cfg.get("premium_on_entry"))
+            zone = book.get("zone") if on_entry else book.get("sweep_zone")
+            position = book.get("position") if on_entry else book.get("sweep_position")
+            if zone is None:
+                pass  # nothing to judge against yet - do not invent a rejection
+            elif side == "short" and position is not None and position < threshold:
+                out.append(f"short not in premium ({position * 100:.0f}% of the dealing range)")
+            elif side == "long" and position is not None and (1 - position) < threshold:
+                out.append(f"long not in discount ({(1 - position) * 100:.0f}% below the top)")
+
+        # p.53 external structure direction
+        if cfg.get("structure_direction") and side:
+            trend = book.get("external_trend")
+            want = 1 if side == "long" else -1
+            if trend is None:
+                pass  # not enough major structure yet: do not invent a rejection
+            elif trend * want < 0:
+                out.append("against the external structure (last major break)")
+
+        if cfg.get("require_ms") and book.get("break_kind") != "MS":
+            out.append(f"only a SHIFT, not an MS (break kind: {book.get('break_kind') or 'none'})")
+
+        if cfg.get("require_fvg") and not book.get("fvgs_in_leg"):
+            out.append("the displacement left no FVG to trade from")
+
+        if cfg.get("block_liquidity_pool") and side:
+            need = int(cfg.get("pool_count") or 3)
+            pools = int(book.get("pools_ahead") or 0)
+            if pools >= need:
+                where = "highs" if side == "long" else "lows"
+                out.append(f"{pools} equal {where} in front of the trade (a liquidity pool)")
+
+        low = float(cfg.get("structure_atr_min") or 0)
+        high = float(cfg.get("structure_atr_max") or 0)
+        height = book.get("structure_atr")
+        if low > 0 or high > 0:
+            if height is None:
+                out.append("structure height unknown (ATR not ready)")
+            elif low > 0 and height < low:
+                out.append(f"structure only {height:.2f} ATR tall (needs {low:g})")
+            elif high > 0 and height > high:
+                out.append(f"structure {height:.2f} ATR tall (wider than {high:g})")
+        return out
 
     # ------------------------------------------------------------ reporting
     def summary(self) -> dict[str, Any]:

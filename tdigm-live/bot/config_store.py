@@ -22,6 +22,17 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "regime_adx_min": 20.0,
     "regime_er_min": 0.10,
     "regime_direction": "any",
+    "premium_discount": False,
+    "premium_level": 0.5,
+    "premium_on_entry": False,
+    "structure_direction": True,
+    "require_ms": False,
+    "require_fvg": False,
+    "block_liquidity_pool": True,
+    "pool_tolerance": 0.25,
+    "pool_count": 3,
+    "structure_atr_min": 0.0,
+    "structure_atr_max": 0.0,
     "break": False,
     "sides": ["long", "short"],
     "min_rr": 0.0,
@@ -102,9 +113,11 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
         if key not in payload:
             continue
         value = payload[key]
-        if key in {"structure", "hvb", "break", "regime"}:
+        if key in {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
+                   "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry"}:
             merged[key] = bool(value)
-        elif key in {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr"}:
+        elif key in {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
+                     "premium_level", "pool_tolerance", "pool_count", "structure_atr_min", "structure_atr_max"}:
             try:
                 merged[key] = max(0.0, float(value))
             except (TypeError, ValueError):
