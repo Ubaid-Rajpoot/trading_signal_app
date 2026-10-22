@@ -12,6 +12,17 @@ Nothing in this app makes prices up. There are exactly two sources.
   offers 1m klines, so 3m/5m/15m/30m/1h are built from the 1m candles by
   `bot/buckets.py`, clock-aligned, closed candles only.
 
+The websocket is tried on **both known MEXC hosts** (`wbs.mexc.com` and
+`wbs-api.mexc.com`), and a socket that connects but sends no kline for 20 seconds
+is dropped for the next one - "connected" is only reported when a candle has
+actually arrived.
+
+Independently of the socket, `bot/poller.py` re-reads the same REST kline
+endpoint every few seconds and feeds the engine: the still-open candle as a
+**tick**, each candle once as **closed**. That is why `candles_seen` and
+`ticks_seen` keep climbing even if a proxy silently swallows the websocket; it
+is the same real exchange data, just fetched instead of pushed.
+
 `python run.py check` prints whether this machine can reach both. If it cannot,
 the server still starts and says so on the page.
 

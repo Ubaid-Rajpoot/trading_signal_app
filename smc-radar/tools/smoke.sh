@@ -33,10 +33,23 @@ json() { "$PY" -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 
-for _ in $(seq 1 40); do
-  curl -sf "$URL/api/health" >/dev/null 2>&1 && break
-  sleep 0.5
+START=$(date +%s%N)
+READY=""
+for _ in $(seq 1 80); do
+  if curl -sf "$URL/api/health" >/dev/null 2>&1; then READY=1; break; fi
+  sleep 0.1
 done
+MS=$(( ($(date +%s%N) - START) / 1000000 ))
+if [ -n "$READY" ] && [ "$MS" -lt 3000 ]; then
+  pass "the page is served quickly (${MS}ms after start)"
+else
+  fail "the page is served quickly (${MS}ms after start)"
+fi
+
+HEALTH=$(curl -sf "$URL/api/health")
+echo "$HEALTH" | grep -q '"stream"' && pass "health explains the stream (messages/parsed/ignored/samples)" || fail "health explains the stream"
+echo "$HEALTH" | grep -q '"rest_poll"' && pass "health explains the REST poller" || fail "health explains the REST poller"
+echo "$HEALTH" | grep -q '"warming"' && pass "health reports warm-up progress" || fail "health reports warm-up progress"
 
 curl -sf "$URL/" | grep -q "SMC radar" && pass "page served" || fail "page served"
 

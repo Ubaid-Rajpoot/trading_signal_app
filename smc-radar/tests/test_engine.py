@@ -331,3 +331,130 @@ def test_the_heartbeat_rebuilds_a_silent_exchange_stream():
             return feed.reconnects
 
     assert asyncio.run(go()) >= 1, "the heartbeat must notice the silence and reconnect"
+
+
+# ------------------------------------------------------------ REST poller
+class PollFeed(FakeFeed):
+    """Serves a rolling window of the recorded candles, like an exchange would."""
+
+    def __init__(self, rows, start: int = 0):
+        super().__init__(rows)
+        self.cursor = start
+
+    async def history(self, symbol, interval, limit=500, include_open=False):
+        window = self.rows[self.cursor : self.cursor + limit]
+        return [dict(r, symbol=symbol, closed=not include_open or i < len(window) - 1) for i, r in enumerate(window)]
+
+
+def test_rest_poller_delivers_candles_and_ticks_when_the_socket_is_silent():
+    from bot.poller import RestPoller
+
+    rows = load(400)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m", "5m"], settings=dict(DEFAULTS))
+    feed = PollFeed(rows)
+    feed.connected = True          # connected, but nothing has ever arrived
+    feed.parsed = 0
+    feed.last_message = time.time() - 600
+    poller = RestPoller(feed, engine, interval=2, force=True)
+
+    async def go():
+        await poller.once()
+        first = (engine.candles_seen, engine.ticks_seen, engine.snapshot()["price"]["BTCUSDT"])
+        await poller.once()        # the same candles again must not duplicate
+        closed_bars = len(engine.history[("BTCUSDT", "1m")])
+        chart_bars = len(engine.bars("BTCUSDT", "1m", 900))
+        second = (engine.candles_seen, engine.ticks_seen, closed_bars, chart_bars)
+        return first, second
+
+    (c1, t1, price1), (c2, t2, closed_bars, chart_bars) = asyncio.run(go())
+    assert c1 > 0, "closed candles must reach the engine even with a dead socket"
+    assert t1 > 0, "the forming candle must reach the engine as a tick"
+    assert price1 == pytest.approx(rows[2]["close"])
+    assert poller.closed_pushed == c1
+    assert t2 > t1, "ticks keep coming"
+    assert closed_bars == 2, "closed candles are not duplicated into the chart"
+    assert chart_bars == 3, "the chart shows the closed candles plus the one still forming"
+    assert poller.last_error is None
+
+
+def test_rest_poller_is_quiet_when_the_socket_is_healthy():
+    from bot.poller import RestPoller
+
+    rows = load(300)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    feed = PollFeed(rows)
+    feed.connected = True
+    feed.parsed = 50
+    feed.last_message = time.time() - 2   # the socket is delivering
+    poller = RestPoller(feed, engine, interval=2, idle_interval=30)
+    asyncio.run(poller.once())
+    assert poller.primary is False
+    assert engine.ticks_seen == 0, "no need to poll ticks when the socket provides them"
+    assert engine.candles_seen >= 1, "but closed candles are still topped up"
+
+
+def test_warmup_reports_progress_and_does_not_block_forever():
+    rows = load(1500)
+
+    class SlowFeed(FakeFeed):
+        async def history(self, symbol, interval, limit=500, include_open=False):
+            await asyncio.sleep(0.01)
+            return await super().history(symbol, interval, limit)
+
+    engine = Engine(symbols=["BTCUSDT", "ETHUSDT"], timeframes=["5m", "15m"], settings=dict(DEFAULTS))
+    assert engine.warming is True
+    asyncio.run(engine.warmup(SlowFeed(rows), concurrency=4))
+    assert engine.warming is False
+    assert engine.warm_done == 4, f"every cell must report progress, got {engine.warm_done}"
+    assert engine.warm_total >= 4
+    state = engine.snapshot()
+    assert state["warming"]["active"] is False
+
+
+def test_server_feeds_itself_from_rest_when_the_socket_never_delivers():
+    """The exact bug reported live: connected:true, candles_seen:0, ticks 0.
+
+    With the socket dead, the app must still fill the map and move the chart.
+    """
+    rows = load(600)
+
+    class DeadSocketFeed(PollFeed):
+        source = "live"
+
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.connected = True
+            self.parsed = 0
+            self.last_message = 0.0
+
+        async def candles(self):
+            while True:            # a socket that accepts and then says nothing
+                await asyncio.sleep(60)
+                yield {}
+
+    feed = DeadSocketFeed(rows)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m", "5m"], settings=dict(DEFAULTS))
+    config = {
+        "symbols": ["BTCUSDT"],
+        "timeframes": ["1m", "5m"],
+        "max_symbols": 5,
+        "rest_poll_seconds": 1.5,
+        "rest_poll_quiet_after": 1,
+    }
+    app = create_app(config, feed, engine, None)
+
+    async def go():
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(5.5)
+            return (
+                engine.candles_seen,
+                engine.ticks_seen,
+                engine.snapshot()["price"].get("BTCUSDT"),
+                len(engine.bars("BTCUSDT", "1m", 50)),
+            )
+
+    candles, ticks, price, chart_bars = asyncio.run(go())
+    assert candles > 0, "closed candles must arrive from the REST poller"
+    assert ticks > 0, "the forming candle must arrive as a tick"
+    assert price and price > 0
+    assert chart_bars >= 2

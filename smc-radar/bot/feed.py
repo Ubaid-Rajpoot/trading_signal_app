@@ -47,7 +47,10 @@ BINANCE_TFS = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "
 
 MEXC_REST = "https://api.mexc.com"
 MEXC_HOSTS = [MEXC_REST]
-MEXC_WS = "wss://wbs.mexc.com/ws"
+# MEXC has moved its websocket host around; both are tried, and a host that
+# accepts the connection but never sends a kline is abandoned for the next one.
+MEXC_WS_HOSTS = ["wss://wbs.mexc.com/ws", "wss://wbs-api.mexc.com/ws"]
+MEXC_WS = MEXC_WS_HOSTS[0]
 MEXC_TFS = {"1m": "1m", "3m": None, "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m"}
 MEXC_WS_INTERVAL = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60"}
 
@@ -82,6 +85,12 @@ class BaseFeed:
         self.status = "starting"
         self.last_message = 0.0
         self.frames = 0
+        self.messages = 0        # raw frames off the socket
+        self.parsed = 0          # frames that turned into a candle
+        self.ignored = 0         # acks / errors / channels we do not use
+        self.bytes_seen = 0
+        self.samples: list[str] = []   # the last few raw frames, for diagnostics
+        self.subscribed: list[str] = []
         self._generation = 0  # bumped when the symbol list changes
 
     # ------------------------------------------------------------- symbols
@@ -115,7 +124,10 @@ class BaseFeed:
         return self.tf_map.get(timeframe, timeframe)
 
     # ------------------------------------------------------------- history
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(
+        self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
+    ) -> list[dict]:
+        """Closed candles, or also the one still forming when ``include_open``."""
         raise NotImplementedError
 
     async def _get_json(self, url: str, params: dict | None = None) -> object:
@@ -180,6 +192,15 @@ class BaseFeed:
                 self.status = f"reconnecting ({attempt}) {type(exc).__name__}: {str(exc)[:90]}"
                 await asyncio.sleep(min(30.0, 2 ** min(attempt, 5)) + random.uniform(0, 1))
 
+    def sample(self, raw) -> None:
+        """Remember what the exchange actually sent, so a silent feed is provable."""
+        self.messages += 1
+        text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        self.bytes_seen += len(text)
+        if len(self.samples) >= 6:
+            self.samples.pop(0)
+        self.samples.append(text[:300])
+
     async def _push(self, candle: dict) -> None:
         self.frames += 1
         self.last_message = time.time()
@@ -201,7 +222,7 @@ class BinanceFeed(BaseFeed):
     tf_map = BINANCE_TFS
     chunk_size = 400
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(self, symbol: str, interval: str, limit: int = 500, include_open: bool = False) -> list[dict]:
         params = {"symbol": symbol.upper(), "interval": interval, "limit": min(limit, 1000)}
         last: Exception | None = None
         for host in BINANCE_HOSTS:
@@ -219,10 +240,10 @@ class BinanceFeed(BaseFeed):
                         "close": float(r[4]),
                         "volume": float(r[5]),
                         "trades": int(r[8]) if len(r) > 8 else 0,
-                        "closed": True,
+                        "closed": int(r[6]) < now_ms or not include_open,
                     }
                     for r in rows  # type: ignore[union-attr]
-                    if int(r[6]) < now_ms
+                    if include_open or int(r[6]) < now_ms
                 ]
                 if candles:
                     return candles
@@ -297,7 +318,9 @@ class MexcFeed(BaseFeed):
         super().__init__(symbols, **kwargs)
         self._last_candle: dict[str, dict] = {}
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(
+        self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
+    ) -> list[dict]:
         mapped = MEXC_TFS.get(interval, interval)
         if not mapped:
             raise FeedError(f"MEXC has no {interval} interval - aggregate 1m instead")
@@ -307,7 +330,7 @@ class MexcFeed(BaseFeed):
         candles = []
         for r in rows:  # type: ignore[union-attr]
             close_time = int(r[6])
-            if close_time >= now_ms:
+            if close_time >= now_ms and not include_open:
                 continue
             candles.append(
                 {
@@ -320,7 +343,7 @@ class MexcFeed(BaseFeed):
                     "close": _num(r[4]),
                     "volume": _num(r[5]),
                     "trades": 0,
-                    "closed": True,
+                    "closed": close_time < now_ms,
                 }
             )
         if not candles:
@@ -330,22 +353,62 @@ class MexcFeed(BaseFeed):
     async def stream(self, symbols: list[str]) -> None:
         if websockets is None:
             raise FeedError("the 'websockets' package is not installed")
-        async with websockets.connect(MEXC_WS, ping_interval=None, close_timeout=5, max_queue=4096) as ws:
+        last_error: Exception | None = None
+        for host in MEXC_WS_HOSTS:
+            try:
+                await self._stream_host(host, symbols)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self.connected = False
+                self.status = f"{host} failed: {type(exc).__name__}: {str(exc)[:70]}"
+                await asyncio.sleep(0.5)
+        raise FeedError(f"no MEXC websocket host delivered: {last_error}")
+
+    async def _stream_host(self, host: str, symbols: list[str]) -> None:
+        async with websockets.connect(host, ping_interval=None, close_timeout=5, max_queue=4096) as ws:
             self.connected = True
-            self.status = f"live - {len(self._symbols)} symbols on {len(self._chunks())} socket(s)"
             # MEXC spot kline channel: spot@public.kline.v3.api@<SYMBOL>@<INTERVAL>
             params = [f"spot@public.kline.v3.api@{s}@Min1" for s in symbols]
+            self.subscribed = list(params)
             for i in range(0, len(params), 20):  # MEXC caps subscriptions per frame
                 await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": params[i : i + 20]}))
+            self.status = f"live - {len(symbols)} symbols on {host.split('//')[1].split('/')[0]}"
             ping = asyncio.create_task(self._ping(ws))
+            first = asyncio.create_task(self._first_candle(ws))
+            try:
+                # a socket that connects but stays silent is not "live": if the
+                # first kline does not arrive in 20s, try the next host
+                await asyncio.wait_for(asyncio.shield(first), timeout=20)
+            except asyncio.TimeoutError:
+                first.cancel()
+                ping.cancel()
+                self.connected = False
+                self.status = f"{host} connected but sent no kline in 20s"
+                raise FeedError(self.status)
+            except Exception:
+                pass
+            finally:
+                if not first.done():
+                    first.cancel()
             try:
                 async for raw in ws:
-                    if isinstance(raw, (bytes, bytearray)):
-                        continue  # protobuf channels are not subscribed here
-                    message = json.loads(raw)
+                    self.sample(raw)
+                    if isinstance(raw, (bytes, bytearray)) and not raw.lstrip().startswith(b"{"):
+                        self.ignored += 1
+                        continue  # a protobuf channel we did not subscribe to
+                    try:
+                        message = json.loads(raw)
+                    except Exception:
+                        self.ignored += 1
+                        continue
                     kline = self._parse(message)
                     if kline is None:
+                        self.ignored += 1
                         continue
+                    self.parsed += 1
                     symbol = kline["symbol"]
                     open_time = kline["open_time"]
                     previous = self._last_candle.get(symbol)
@@ -356,6 +419,22 @@ class MexcFeed(BaseFeed):
                     await self._push(dict(kline))
             finally:
                 ping.cancel()
+
+    async def _first_candle(self, ws) -> None:
+        """Wait for the first parseable kline (used as a liveness gate)."""
+        while True:
+            raw = await ws.recv()
+            self.sample(raw)
+            try:
+                message = json.loads(raw)
+            except Exception:
+                continue
+            kline = self._parse(message)
+            if kline is not None:
+                self.parsed += 1
+                self._last_candle[kline["symbol"]] = {**kline, "closed": False}
+                await self._push(dict(kline))
+                return
 
     @staticmethod
     def _parse(message: dict) -> dict | None:
@@ -476,7 +555,9 @@ class ReplayFeed(BaseFeed):
             found.append((symbol, path))
         return found
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(
+        self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
+    ) -> list[dict]:
         return []  # the replay warms up by playing
 
     def file_for(self, symbol: str) -> Path | None:

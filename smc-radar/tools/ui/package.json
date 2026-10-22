@@ -1,0 +1,11 @@
+{
+  "name": "smc-radar-ui-checks",
+  "private": true,
+  "type": "module",
+  "description": "Headless browser checks for the SMC radar page",
+  "scripts": {
+    "chart": "node chart.mjs",
+    "transports": "node transports.mjs"
+  },
+  "dependencies": { "jsdom": "^30.0.0", "ws": "^8.18.0", "eventsource": "^2.0.2" }
+}
