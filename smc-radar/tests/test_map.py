@@ -201,3 +201,103 @@ def test_snapshot_is_json_ready():
     assert payload["symbol"] == "TESTUSDT"
     assert payload["timeframe"] == "5m"
     assert payload["bars"] == len(strong_high_path())
+
+
+# ------------------------------------------- round 5: order block + quality
+def real_path(closes: list[float]) -> list[dict]:
+    """Candles with a real open (the previous close), so bodies and colours exist."""
+    bars, prev = [], closes[0]
+    for i, close in enumerate(closes):
+        bars.append(bar(i, close, open_=prev))
+        prev = close
+    return bars
+
+
+def orders(zone, bars, lookback=8):
+    """The opposite-colour candle with the biggest body, latest wins on a tie."""
+    k = next(i for i, b in enumerate(bars) if b["close_time"] >= zone.time)
+    window = list(enumerate(bars[max(0, k - lookback): k + 1]))
+    pool = [
+        (i, b)
+        for i, b in window
+        if (float(b["close"]) >= float(b["open"])) == (zone.side == HIGH)
+        and ((float(b["low"]) < zone.level) if zone.side == HIGH else (float(b["high"]) > zone.level))
+    ]
+    if not pool:
+        return None
+    best = max(pool, key=lambda pair: (abs(float(pair[1]["close"]) - float(pair[1]["open"])), pair[0]))
+    return best[1]
+
+
+def test_high_block_starts_at_the_exact_high_and_marks_the_order_block_candle():
+    bars = real_path(strong_high_path())
+    map_ = run(bars)
+    zone = next(z for z in map_.zones if z.kind == "strong_high")
+    assert zone.top == pytest.approx(zone.level), "the rectangle starts at the exact high"
+    assert zone.bottom < zone.top, "the rectangle has real height"
+    assert zone.block_src == "order block candle"
+    candle = orders(zone, bars)
+    assert candle is not None
+    assert zone.ob["time"] == candle["close_time"], "the marked candle is the biggest opposite-colour body"
+    assert float(candle["close"]) >= float(candle["open"]), "at a HIGH the marked candle is a green/up candle"
+    assert zone.bottom == pytest.approx(float(candle["low"])), "the block reaches that candle's low"
+
+
+def test_low_block_mirrors_it_with_a_red_candle():
+    bars = real_path([20 - c for c in strong_high_path()])
+    map_ = run(bars)
+    zone = next(z for z in map_.zones if z.kind == "strong_low")
+    assert zone.bottom == pytest.approx(zone.level)
+    candle = orders(zone, bars)
+    assert zone.ob["time"] == candle["close_time"]
+    assert float(candle["close"]) < float(candle["open"]), "at a LOW the marked candle is a red/down candle"
+    assert zone.top == pytest.approx(float(candle["high"]))
+
+
+def test_block_never_collapses_to_a_line():
+    bars = path([10.0] * 20)
+    map_ = run(bars)
+    for zone in map_.zones:
+        assert zone.top > zone.bottom
+
+
+def test_regime_separates_a_trend_from_a_range():
+    map_trend = run(path([100 + i * 0.8 for i in range(60)]))
+    assert map_trend.regime()["state"] == "trend_up"
+    assert map_trend.regime()["er"] > 0.5
+
+    map_chop = run(path([100 + (2 if i % 2 else -2) for i in range(60)]))
+    assert map_chop.regime()["state"] == "range", "an alternating tape is not a trend"
+
+
+def test_every_zone_carries_a_grade_and_its_reason():
+    map_ = run(real_path(strong_high_path() * 2))
+    assert map_.zones, "the path produces zones"
+    for zone in map_.zones:
+        payload = zone.as_dict()
+        assert payload["grade"] in {"A+", "A", "B", "C"}
+        assert 0 <= payload["score"] <= 100
+        assert payload["trend"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
+        assert payload["block_atr"] is None or payload["block_atr"] > 0
+
+
+def test_a_thin_block_scores_below_a_thick_one():
+    """The study says block thickness is the feature that matters, so it must
+    move the score. Same zone, same trend, only the block size changes."""
+    # warm the ATR up first: the map needs a few candles before it has one
+    bars = real_path([10.0] * 20 + strong_high_path())
+    map_ = run(bars)
+    zone = next(z for z in map_.zones if z.kind == "strong_high")
+    assert zone.block_atr is not None, "after a warm-up every zone is measurable"
+    zone.block_atr = 0.1
+    map_.score_zone(zone)
+    thin_score = zone.score
+    zone.block_atr = 1.4
+    map_.score_zone(zone)
+    assert zone.score > thin_score, "a thicker block must score higher"
+    assert zone.score > 0
+
+    # and the calibrated weights put a real 1m kind in a sensible place
+    zone.kind = "rejection_block_bear" if zone.side == "high" else "rejection_block_bull"
+    map_.score_zone(zone)
+    assert zone.grade in {"A+", "A"}

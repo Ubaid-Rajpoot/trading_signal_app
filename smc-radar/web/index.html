@@ -197,6 +197,30 @@
   .symrow .n { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
   .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: #16203300; border: 1px solid var(--line-2); background-color: #131b28; color: var(--text); padding: 10px 16px; border-radius: 11px; font-size: 12.5px; opacity: 0; transition: .2s; z-index: 60; max-width: 90vw; }
   .toast.on { opacity: 1; transform: translateX(-50%); }
+
+  /* grade + regime chips (round 5) */
+  .grade { font-size: 10.5px; font-weight: 900; letter-spacing: .04em; padding: 2px 6px; border-radius: 6px; border: 1px solid; }
+  .grade.ap { color: #ffd479; background: rgba(255,212,121,.1); border-color: #7a5f22; }
+  .grade.a  { color: #9fe8c8; background: rgba(46,230,168,.08); border-color: #1d5c47; }
+  .grade.b  { color: #9db4d6; background: rgba(99,168,255,.07); border-color: #24466e; }
+  .grade.c  { color: #ff9fb2; background: rgba(255,92,122,.08); border-color: #6b2233; }
+  .ctx { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+  .ctx span { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .ctx .up { color: #2ee6a8; border-color: #1d5c47; background: rgba(46,230,168,.07); }
+  .ctx .down { color: #ff5c7a; border-color: #6b2233; background: rgba(255,92,122,.07); }
+  .ctx .range { color: #ffb347; border-color: #6b4c1c; background: rgba(255,179,71,.07); }
+  .ctx .ready { color: #08111f; background: linear-gradient(180deg,#8ff3cf,#2ee6a8); border-color: #8ff3cf; }
+  .zone.ready { box-shadow: 0 0 0 1px rgba(46,230,168,.45); }
+  .conf { font-size: 11px; color: #ffd479; margin-top: 6px; display: grid; gap: 2px; }
+  .conf span::before { content: "✦ "; }
+  /* fullscreen chart */
+  #chartPanel.fs { position: fixed; inset: 10px; z-index: 70; display: flex; flex-direction: column; }
+  #chartPanel.fs .chartwrap { flex: 1; min-height: 0; }
+  #chartPanel.fs #chart { height: 100% !important; }
+  #chartPanel:fullscreen { background: #080c14; display: flex; flex-direction: column; }
+  #chartPanel:fullscreen .chartwrap { flex: 1; min-height: 0; }
+  #chartPanel:fullscreen #chart { height: 100% !important; }
+  body.fs-lock { overflow: hidden; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -237,7 +261,31 @@
   <div class="toolbar">
     <div class="field"><label>find</label><input type="search" id="search" placeholder="symbol…" /></div>
     <div class="chips" id="tfChips"></div>
-    <label class="toggle"><input type="checkbox" id="onlyActive" checked /> only active</label>
+    <div class="field"><label>show</label>
+      <select id="showMode">
+        <option value="active">active only</option>
+        <option value="recent" selected>active + recently mitigated</option>
+        <option value="all">everything</option>
+      </select>
+    </div>
+    <div class="field" id="recentField"><label>window</label>
+      <select id="recentWindow">
+        <option value="15">15 min</option>
+        <option value="60">1 hour</option>
+        <option value="120" selected>2 hours</option>
+        <option value="480">8 hours</option>
+        <option value="1440">24 hours</option>
+      </select>
+    </div>
+    <div class="field"><label>quality</label>
+      <select id="quality">
+        <option value="prime" selected>A+ and A (measured)</option>
+        <option value="ap">A+ only</option>
+        <option value="ready">tradeable now (in trend)</option>
+        <option value="conf">on a strong / very strong level</option>
+        <option value="all">everything, incl. thin / range</option>
+      </select>
+    </div>
     <label class="toggle"><input type="checkbox" id="showWeak" /> weak pairs</label>
     <div class="spacer"></div>
     <div class="field"><label>sort</label>
@@ -266,11 +314,13 @@
           <button class="btn ghost mini" id="btnFollow" title="keep the newest candle on the right edge">follow</button>
           <button class="btn ghost mini" id="btnZoomIn" title="zoom in (scroll up)">+</button>
           <button class="btn ghost mini" id="btnZoomOut" title="zoom out (scroll down)">−</button>
+          <button class="btn ghost mini on" id="btnZones" title="draw every zone of this instrument and timeframe on the chart">zones</button>
           <button class="btn ghost mini" id="btnReset" title="reset the view (double-click the chart)">reset</button>
+          <button class="btn ghost mini" id="btnFull" title="full screen (F)">⛶</button>
         </span></h2>
         <div class="chartwrap">
           <canvas id="chart"></canvas>
-          <div class="ohlc" id="ohlc">scroll = zoom · drag = pan · drag the right edge = price scale</div>
+          <div class="ohlc" id="ohlc">drag = move the chart both ways · scroll = zoom · F = full screen</div>
         </div>
         <div class="legend">
           <span><i style="background:#ff5c7a"></i>supply (high)</span>
@@ -369,6 +419,8 @@ const KINDS = {
   weak_high:          { label: "Weak high",            short: "wH",   side: "high", color: "#5f6c84" },
   weak_low:           { label: "Weak low",             short: "wL",   side: "low",  color: "#5f6c84" },
 };
+const GRADE_RANK = { "A+": 3, "A": 2, "B": 1, "C": 0 };
+const REGIME_LABEL = { trend_up: "trend ↑", trend_down: "trend ↓", range: "range", unknown: "–" };
 const TF_MS = { "1m": 60e3, "3m": 180e3, "5m": 300e3, "15m": 900e3, "30m": 1800e3, "1h": 3600e3 };
 const TABS = [
   { id: "all", label: "All", kinds: Object.keys(KINDS) },
@@ -383,7 +435,9 @@ const TABS = [
 ];
 const state = {
   data: null, tab: "all", search: "", tfs: new Set(), sort: "new",
-  onlyActive: true, showWeak: false, selected: null, universe: [], uniError: null,
+  showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
+  quality: "prime", hiddenByQuality: 0,
+  historyItems: [], historyAt: 0,
   chartKey: "", lastRender: 0,
 };
 const $ = (id) => document.getElementById(id);
@@ -403,9 +457,22 @@ function fmtTime(ms) {
   const mm = String(d.getUTCMinutes()).padStart(2, "0");
   return `${d.getUTCDate()} ${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${hh}:${mm} UTC`;
 }
+function nowAnchor() {
+  const d = state.data || {};
+  if ((d.source || "live") === "replay") {
+    const times = [(d.active || []).map((z) => z.time), (state.historyItems || []).map((z) => z.time)]
+      .reduce((a, b) => a.concat(b), [])
+      .filter(Boolean);
+    const newest = times.length ? Math.max.apply(null, times) : 0;
+    // a replay's candles are older than the wall clock: use its own newest zone
+    return newest || d.server_time || Date.now();
+  }
+  return d.server_time || Date.now();
+}
+
 function ago(ms) {
   if (!ms) return "";
-  const s = Math.max(0, (Date.now() - ms) / 1000);
+  const s = Math.max(0, (nowAnchor() - ms) / 1000);
   if (s < 90) return Math.round(s) + "s ago";
   if (s < 5400) return Math.round(s / 60) + "m ago";
   if (s < 172800) return Math.round(s / 3600) + "h ago";
@@ -515,21 +582,41 @@ function allZones() {
   const d = state.data;
   if (!d) return [];
   const active = d.active || [];
-  // resolved zones are not pushed with every frame; they are fetched once when
-  // the "only active" filter is switched off (see loadHistory)
-  const hist = state.onlyActive ? [] : (state.historyItems || d.history || []);
+  if (state.showMode === "active") return active;
+  // Resolved zones are fetched on demand. They stay on the list exactly as they
+  // were - dimmed, with the time they formed AND the time/price that mitigated
+  // them - because a 1m zone is often resolved within minutes of forming.
+  let hist = state.historyItems || d.history || [];
+  if (state.showMode === "recent") {
+    // measured against the feed's own clock: for a live feed that is "now", for
+    // a replay it is the newest candle it is playing (nobody wants "650 days ago")
+    const cutoff = nowAnchor() - state.recentMinutes * 60000;
+    hist = hist.filter((z) => {
+      const at = z.mitigated_at || z.invalidated_at || z.time;
+      return at && at >= cutoff;
+    });
+  }
   return active.concat(hist);
 }
 
 async function loadHistory() {
+  if (state.showMode === "active") { drawCards(); return; }
   try {
     const res = await fetch("/api/zones?status=resolved", { cache: "no-store" });
     const body = await res.json();
     state.historyItems = body.items || [];
+    state.historyAt = Date.now();
   } catch (err) {
-    state.historyItems = [];
+    state.historyItems = state.historyItems || [];
   }
   drawCards();
+}
+
+function scheduleHistory() {
+  // keep the resolved list fresh while it is on screen
+  if (state.showMode === "active") return;
+  if (Date.now() - (state.historyAt || 0) < 20000) return;
+  loadHistory();
 }
 function kindsForTab(tabId) {
   const tab = TABS.find((t) => t.id === tabId) || TABS[0];
@@ -547,14 +634,26 @@ function visibleZones() {
     const q = state.search.toUpperCase();
     items = items.filter((z) => z.symbol.includes(q));
   }
+  const gradeRank = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
+  const readyOf = (z) => !!(z.now_trend && z.now_trend.ready);
+  const before = items.length;
+  if (state.quality === "prime") items = items.filter((z) => gradeRank(z) >= 2);   // A+ and A
+  else if (state.quality === "ap") items = items.filter((z) => gradeRank(z) >= 3);  // A+ only
+  else if (state.quality === "ready") items = items.filter(readyOf);
+  else if (state.quality === "conf") items = items.filter((z) => (z.confluence || []).length || (z.htf || []).length);
+  state.hiddenByQuality = before - items.length;
+
   const dist = (z) => {
     const p = price[z.symbol];
     return p == null ? Infinity : Math.abs(z.level - p) / p;
   };
-  if (state.sort === "near") items.sort((a, b) => dist(a) - dist(b));
-  else if (state.sort === "strength") items.sort((a, b) => (b.strength - a.strength) || (b.time - a.time));
-  else if (state.sort === "symbol") items.sort((a, b) => a.symbol.localeCompare(b.symbol) || (b.time - a.time));
-  else items.sort((a, b) => (b.time - a.time));
+  const rank = (z) => (z.status === "active" ? 0 : 1);
+  items.sort((a, b) => rank(a) - rank(b));   // active zones always lead the list
+  const lead = (a, b) => (rank(a) - rank(b)) || (readyOf(b) ? 1 : 0) - (readyOf(a) ? 1 : 0) || gradeRank(b) - gradeRank(a);
+  if (state.sort === "near") items.sort((a, b) => lead(a, b) || dist(a) - dist(b));
+  else if (state.sort === "strength") items.sort((a, b) => lead(a, b) || (b.strength - a.strength) || (b.time - a.time));
+  else if (state.sort === "symbol") items.sort((a, b) => lead(a, b) || a.symbol.localeCompare(b.symbol) || (b.time - a.time));
+  else items.sort((a, b) => lead(a, b) || (b.time - a.time));
   return items;
 }
 
@@ -578,11 +677,13 @@ function onState() {
   $("kVSAC").textContent = (byKind.very_strong_algo_bear || 0) + (byKind.very_strong_algo_bull || 0);
   $("kRB").textContent = (byKind.rejection_block_bear || 0) + (byKind.rejection_block_bull || 0);
   $("kMit").textContent = (d.resolved && d.resolved.mitigated) || 0;
-  $("kActiveSub").textContent = `${byKind.strong_low || 0} strong low · ${byKind.very_strong_low || 0} very strong low`;
+  const ready = active.filter((z) => z.now_trend && z.now_trend.ready).length;
+  $("kActiveSub").textContent = `${ready} tradeable now · ${byKind.strong_low || 0} strong low`;
 
   drawTabs(active);
   drawTfChips();
   scheduleCards();
+  scheduleHistory();
   drawTape();
   // keep the selected zone in step: it may have been mitigated since we drew it
   if (state.selected) {
@@ -662,14 +763,22 @@ function drawCards() {
   const d = state.data || {};
   const price = d.price || {};
   host.innerHTML = "";
-  $("shown").textContent = `${items.length} shown`;
+  const activeCount = items.filter((z) => z.status === "active").length;
+  const resolvedCount = items.length - activeCount;
+  const hidden = state.hiddenByQuality || 0;
+  const base = resolvedCount
+    ? `${items.length} shown · ${activeCount} active · ${resolvedCount} recently mitigated`
+    : `${items.length} shown`;
+  $("shown").textContent = hidden ? `${base} · ${hidden} hidden by the quality filter` : base;
   $("listMeta").textContent = items.length ? `${items.length} zones` : "";
   if (!items.length) {
     const e = el("div", "empty");
     e.appendChild(el("b", null, d.symbols && d.symbols.length ? "No zone of this kind is active right now" : "Waiting for the first candles"));
-    e.appendChild(el("span", null, d.source === "replay"
-      ? "The replay is still warming up its timeframes — zones appear as candles close."
-      : "The scanner is streaming. A pattern only appears when the book's conditions are all met."));
+    e.appendChild(el("span", null, state.hiddenByQuality
+      ? `${state.hiddenByQuality} zone(s) are hidden by the quality filter — choose "everything" to see them.`
+      : d.source === "replay"
+        ? "The replay is still warming up its timeframes — zones appear as candles close."
+        : "The scanner is streaming. A pattern only appears when the book's conditions are all met."));
     host.appendChild(e);
     return;
   }
@@ -689,6 +798,11 @@ function card(z, price) {
   tag.style.borderColor = meta.color + "66";
   tag.style.background = meta.color + "14";
   r1.appendChild(tag);
+  if (z.grade) {
+    const g = el("span", "grade " + String(z.grade).toLowerCase().replace("+", "p"), z.grade);
+    g.title = `quality score ${z.score || 0}/100 — measured on real candles, see the README`;
+    r1.appendChild(g);
+  }
   r1.appendChild(el("span", "status " + z.status, z.status === "active" ? "active" : z.status));
   node.appendChild(r1);
 
@@ -707,9 +821,34 @@ function card(z, price) {
   if (z.session) when.appendChild(el("span", null, z.session));
   node.appendChild(when);
 
+  // the market right now, not when the zone formed
+  const nt = z.now_trend || z.trend || {};
+  const ctx = el("div", "ctx");
+  const stateCls = nt.state === "trend_up" ? "up" : nt.state === "trend_down" ? "down" : "range";
+  const regimeChip = el("span", stateCls, REGIME_LABEL[nt.state] || "–");
+  regimeChip.title = `efficiency ratio ${nt.er == null ? "–" : nt.er} · ADX ${nt.adx == null ? "–" : nt.adx}`;
+  ctx.appendChild(regimeChip);
+  if (z.now_trend && z.now_trend.ready) {
+    const ready = el("span", "ready", "TRADEABLE NOW");
+    ready.title = "the live trend is on this zone's side";
+    ctx.appendChild(ready);
+    node.classList.add("ready");
+  } else if (nt.state === "range") {
+    ctx.appendChild(el("span", "range", "range — the book says wait"));
+  }
+  if (z.block_atr != null) ctx.appendChild(el("span", null, `block ${z.block_atr}×ATR`));
+  if (z.disp_atr != null) ctx.appendChild(el("span", null, `leg ${z.disp_atr}×ATR`));
+  node.appendChild(ctx);
+
   const ev = el("ul", "evid");
   (z.evidence || []).slice(0, 5).forEach((text) => ev.appendChild(el("li", null, text)));
   node.appendChild(ev);
+  const extra = [].concat(z.confluence || [], z.htf || []);
+  if (extra.length) {
+    const conf = el("div", "conf");
+    extra.slice(0, 4).forEach((text) => conf.appendChild(el("span", null, text)));
+    node.appendChild(conf);
+  }
 
   const bar = el("div", "bar");
   const fill = el("i");
@@ -719,6 +858,9 @@ function card(z, price) {
 
   const foot = el("div", "foot");
   foot.appendChild(el("span", null, `${z.strength} condition${z.strength === 1 ? "" : "s"} met`));
+  if (z.ob && z.ob.color) {
+    foot.appendChild(el("span", null, `OB candle ${z.ob.color} ${fmtPx(z.ob.low)}–${fmtPx(z.ob.high)} @ ${fmtTime(z.ob.time)}`));
+  }
   foot.appendChild(el("span", null, statusLine(z)));
   if (z.swept_level != null) foot.appendChild(el("span", null, `swept ${fmtPx(z.swept_level)}`));
   node.appendChild(foot);
@@ -738,6 +880,7 @@ const chart = {
   lastTickAt: 0,
   marginFraction: 0.14,     // breathing space on the right, as a share of the view
   auto: true, hover: null, drag: null, timer: null, loading: false, error: null,
+  drawZones: true,
   debug: { rects: 0, lines: 0, candles: 0 }, fetchedAt: 0, count: 0,
 };
 
@@ -829,6 +972,29 @@ function chartSize() {
   return { ctx, W, H, padL: 8, padR: 68, padT: 12, padB: 24 };
 }
 
+function chartChartZones(z) {
+  if (!chart.drawZones || !z) return [];
+  const spot = (state.data && state.data.price && state.data.price[z.symbol]) || (chart.bars.length ? chart.bars[chart.bars.length - 1].close : null);
+  const pool = allZones().filter((o) => o.key !== z.key && o.symbol === z.symbol && o.timeframe === z.timeframe
+    && o.kind !== "weak_high" && o.kind !== "weak_low");
+  // keep the chart readable: the nearest 24 blocks around the selected one
+  return pool
+    .sort((a, b) => Math.abs((a.level || 0) - (z.level || 0)) - Math.abs((b.level || 0) - (z.level || 0)))
+    .slice(0, 24)
+    .sort((a, b) => a.time - b.time);
+}
+
+function barIndexAt(bars, time) {
+  let lo = 0, hi = bars.length - 1, found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const at = bars[mid].close_time || bars[mid].open_time;
+    if (at >= time) { found = mid; hi = mid - 1; }
+    else lo = mid + 1;
+  }
+  return found;
+}
+
 function zoneIndex(bars, z) {
   // first candle that ends at or after the moment the zone formed
   let lo = 0, hi = bars.length - 1, found = -1;
@@ -883,6 +1049,7 @@ function renderChart() {
     if (b.high > hi) hi = b.high;
   }
   if (zIdx >= 0 && zIdx <= i1 + 1) { lo = Math.min(lo, z.bottom); hi = Math.max(hi, z.top); }
+  for (const other of chartChartZones(z)) { lo = Math.min(lo, other.bottom); hi = Math.max(hi, other.top); }
   if (!isFinite(lo) || !isFinite(hi)) return;
   if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
   const mid = (lo + hi) / 2;
@@ -923,26 +1090,82 @@ function renderChart() {
     ctx.fillText(label, gx, H - padB + 6);
   }
 
-  // ---- the zone block, from the candle that made it to the right edge
-  if (zIdx >= 0) {
-    const zx = Math.max(padL, xAt(zIdx) - bw / 2);
-    const yTop = yAt(z.top), yBot = yAt(z.bottom);
+  // ---- every zone of this instrument + timeframe, drawn where it really sits
+  // (behind the selected one), then the selected block on top of them.
+  const paintZone = (zone, strong) => {
+    const zIdx2 = zoneIndex(bars, zone);
+    if (zIdx2 < 0 || zIdx2 > i1) return;
+    const isUp = zone.side === "low";
+    const rgb = isUp ? "46,230,168" : "255,92,122";
+    const x0 = xAt(zIdx2) - bw / 2;
+    let x1 = W - padR;
+    if (zone.status !== "active") {
+      const endAt = zone.mitigated_at || zone.invalidated_at;
+      if (endAt) {
+        const mi = zoneIndex(bars, { time: endAt });
+        if (mi >= 0) x1 = Math.max(x0 + 2, xAt(mi));
+      }
+    }
+    const yTop = yAt(zone.top), yBot = yAt(zone.bottom);
     const boxTop = Math.min(yTop, yBot);
-    const boxH = Math.max(2, Math.abs(yBot - yTop));
-    ctx.fillStyle = `rgba(${accent},.14)`;
-    ctx.fillRect(zx, boxTop, Math.max(2, W - padR - zx), boxH);
+    const boxH = Math.max(1.5, Math.abs(yBot - yTop));
+    const alpha = strong ? 0.16 : 0.07;
+    ctx.fillStyle = `rgba(${rgb},${alpha})`;
+    ctx.fillRect(x0, boxTop, Math.max(2, x1 - x0), boxH);
+    ctx.strokeStyle = `rgba(${rgb},${strong ? 0.6 : 0.28})`;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0, boxTop, Math.max(2, x1 - x0), boxH);
+    // a zone that was already mitigated keeps its block but loses the fill
+    if (zone.status !== "active") {
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = `rgba(${rgb},${strong ? 0.5 : 0.2})`;
+      ctx.beginPath(); ctx.moveTo(x0, yBot); ctx.lineTo(x1, yBot); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (strong) {
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = `rgba(${rgb},.95)`;
+      ctx.beginPath(); ctx.moveTo(x0, yAt(zone.level)); ctx.lineTo(x1, yAt(zone.level)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = `rgba(${rgb},1)`;
+      ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+      const meta = KINDS[zone.kind] || {};
+      ctx.fillText(`${meta.short || ""} ${zone.grade || ""} ${fmtPx(zone.level)}`, x0 + 4, Math.min(yTop, yBot) - 2);
+      // the order-block candle itself: the opposite-colour candle the block is
+      // drawn on. Located by TIME, because the zone's own index belongs to the
+      // engine's candle list, not to the slice the chart is holding.
+      if (zone.ob && zone.ob.time) {
+        const oi = barIndexAt(bars, zone.ob.time);
+        if (oi >= 0 && (oi < i0 || oi > i1)) {
+          // the candle is outside the visible window: point at it instead of hiding it
+          const atLeft = oi < i0;
+          ctx.fillStyle = "rgba(255,212,121,.95)";
+          ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.textAlign = atLeft ? "left" : "right";
+          ctx.textBaseline = "middle";
+          ctx.fillText(atLeft ? "◀ OB" : "OB ▶", atLeft ? padL + 4 : W - padR - 4, yAt(zone.level) + 12);
+          debug.lines++;
+        }
+        if (oi >= i0 && oi <= i1) {
+          const ox = xAt(oi);
+          ctx.strokeStyle = "rgba(255,212,121,.95)";
+          ctx.lineWidth = 1.4;
+          ctx.strokeRect(ox - bw * 0.8, yAt(zone.ob.high), bw * 1.6, Math.max(2, yAt(zone.ob.low) - yAt(zone.ob.high)));
+          ctx.fillStyle = "rgba(255,212,121,.95)";
+          ctx.textAlign = "center"; ctx.textBaseline = "top";
+          ctx.fillText("OB", ox, yAt(zone.ob.low) + 2);
+        }
+      }
+    }
     debug.rects++;
-    ctx.strokeStyle = `rgba(${accent},.55)`; ctx.lineWidth = 1;
-    ctx.strokeRect(zx, boxTop, Math.max(2, W - padR - zx), boxH);
-    // exact level
-    ctx.setLineDash([4, 3]);
-    ctx.strokeStyle = `rgba(${accent},.9)`;
-    ctx.beginPath(); ctx.moveTo(zx, yAt(z.level)); ctx.lineTo(W - padR, yAt(z.level)); ctx.stroke();
-    ctx.setLineDash([]);
-    debug.lines++;
-    ctx.fillStyle = `rgba(${accent},1)`;
-    ctx.textAlign = "left"; ctx.textBaseline = "bottom";
-    ctx.fillText(`${(KINDS[z.kind] || {}).short || ""} ${fmtPx(z.level)}`, zx + 4, yAt(z.level) - 2);
+  };
+
+  const context = chartChartZones(z);
+  context.forEach((other) => paintZone(other, false));
+  if (zIdx >= 0) paintZone(z, true);
+  else if (z) {
+    // the zone formed before the visible window: still anchor it at the left edge
+    paintZone({ ...z, time: bars[i0] ? bars[i0].open_time : z.time }, true);
   }
 
   // ---- swept / break reference lines
@@ -1059,6 +1282,18 @@ function renderChart() {
     ctx.strokeStyle = "#2c3850"; ctx.strokeRect(W - padR + 2, y - 7, padR - 4, 14);
     ctx.fillStyle = "#c8d7f0"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
     ctx.fillText(fmtPx(pAt), W - padR + 5, y);
+    // the time of the candle under the cursor, on the time axis
+    if (bars[i]) {
+      const d = new Date(bars[i].open_time);
+      const label = `${String(d.getUTCDate()).padStart(2, "0")} ${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+      ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      const tw = ctx.measureText(label).width + 10;
+      const bx = clamp(x - tw / 2, padL, W - padR - tw);
+      ctx.fillStyle = "#162033"; ctx.fillRect(bx, H - padB + 2, tw, 15);
+      ctx.strokeStyle = "#2c3850"; ctx.strokeRect(bx, H - padB + 2, tw, 15);
+      ctx.fillStyle = "#c8d7f0"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillText(label, bx + 5, H - padB + 10);
+    }
     if (bars[i]) drawOhlc(bars[i], pAt);
   } else {
     drawOhlc(last, priceToDraw);
@@ -1096,6 +1331,10 @@ function drawChartMeta(z, last) {
     parts.push(`<span>distance <b>${fmtPct(diff)}</b></span>`);
   }
   if (z.session) parts.push(`<span>session <b>${z.session}</b></span>`);
+  if (z.grade) parts.push(`<span>grade <b>${z.grade}</b> (${z.score || 0}/100)</span>`);
+  const nt = z.now_trend || z.trend || {};
+  if (nt.state) parts.push(`<span>market <b>${REGIME_LABEL[nt.state] || nt.state}</b>${nt.er != null ? ` ER ${nt.er}` : ""}${nt.adx != null ? ` ADX ${nt.adx}` : ""}</span>`);
+  if (z.ob) parts.push(`<span>order block candle <b>${z.ob.color === "up" ? "up" : "down"}</b> ${fmtPx(z.ob.low)}–${fmtPx(z.ob.high)}</span>`);
   parts.push(`<span>candles <b>${chart.count || chart.bars.length}</b></span>`);
   if (z.mitigated_at) parts.push(`<span>mitigated <b>${fmtTime(z.mitigated_at)}</b> @ ${fmtPx(z.mitigated_price)}</span>`);
   if (z.invalidated_at) parts.push(`<span>invalidated <b>${fmtTime(z.invalidated_at)}</b> @ ${fmtPx(z.invalidated_price)}</span>`);
@@ -1125,9 +1364,19 @@ function drawTape() {
 
 /* --------------------------------------------------------------- controls */
 $("search").oninput = (e) => { state.search = e.target.value.trim().toUpperCase(); drawCards(); };
-$("onlyActive").onchange = (e) => {
-  state.onlyActive = e.target.checked;
-  if (!state.onlyActive) loadHistory(); else drawCards();
+$("showMode").onchange = (e) => {
+  state.showMode = e.target.value;
+  $("recentField").style.display = state.showMode === "recent" ? "" : "none";
+  if (state.showMode === "active") drawCards(); else loadHistory();
+};
+$("recentWindow").onchange = (e) => {
+  state.recentMinutes = Number(e.target.value) || 120;
+  loadHistory();
+};
+$("quality").onchange = (e) => {
+  state.quality = e.target.value;
+  drawCards();
+  if (chart.zone) renderChart();
 };
 $("showWeak").onchange = (e) => { state.showWeak = e.target.checked; drawCards(); };
 $("sort").onchange = (e) => { state.sort = e.target.value; drawCards(); };
@@ -1263,6 +1512,11 @@ $("helpBody").innerHTML = `
   <p><b style="color:#ffb347">Rejection block</b> — an algo candle that sits on the high/low of a session (Asia / London / New York) with an inducement behind it.</p>
   <p><b>Mitigation</b> — price coming back into the block fills the orders there; the zone is then marked <b>mitigated</b> with the exact time and price. If a candle closes beyond the extreme the high became weak, so the zone is <b>invalidated</b>.</p>
   <p>Nothing is deleted: a zone keeps its formation time on this map until the price mitigates it, and the tape keeps the record afterwards.</p>
+  <hr style="border:0;border-top:1px solid #222c3f;margin:14px 0" />
+  <p><b style="color:#ffd479">The rectangle</b> is the order block, not the pivot body: it starts at the <b>exact high/low</b> the pattern is about and runs to the far side of the <b>last opposite-colour candle with the biggest body</b> — green at a high, red at a low. That candle is outlined in amber and labelled <b>OB</b> on the chart (with <b>◀ OB</b> / <b>OB ▶</b> if it is outside the visible window). A block is never thinner than <b>0.12 × ATR</b>.</p>
+  <p><b>Grade (A+ … C)</b> — a ranking built from features that were measured on 90 days of real 1m BTC: block thickness, displacement size, FVG size and the pattern kind score the most; same-level strong confluence and the trend score a little. Measured on that data: A+ / A zones travel <b>2 × ATR</b> in your favour before the level is closed through in <b>83%</b> of cases, B in 68%, C in 54%. Full table and method: <code>docs/quality-btcusdt-1m.md</code>. The default filter shows A+ and A; "everything" brings the rest back.</p>
+  <p><b>Market regime</b> — Kaufman efficiency ratio (net travel ÷ total travel over 40 bars) plus Wilder's ADX(14). Both must agree before the market is called a trend, which is what stops a wide, choppy range from looking like one. <b>TRADEABLE NOW</b> means the live trend is on this zone's side (the book's HTF-direction rule). It is not a signal to enter.</p>
+  <p><b>Chart</b> — drag to move it in both directions, scroll to zoom, drag the right edge for the price scale, <b>F</b> or ⛶ for full screen, <b>+ / −</b> to zoom, arrows to pan, <b>R</b> to reset.</p>
 `;
 
 /* ------------------------------------------------------- chart interaction
@@ -1307,7 +1561,7 @@ function chartCoords(ev) {
     if (x > w - padR) {
       state_.drag = { mode: "scale", y, zoom: state_.zoomY };
     } else {
-      state_.drag = { mode: "pan", x, right: state_.right, auto: state_.auto };
+      state_.drag = { mode: "pan", x, y, right: state_.right, panY: state_.panY, auto: state_.auto };
       canvas.classList.add("panning");
     }
     ev.preventDefault();
@@ -1320,9 +1574,14 @@ function chartCoords(ev) {
     if (state_.drag) {
       if (state_.drag.mode === "pan") {
         const dx = x - state_.drag.x;
+        const dy = y - state_.drag.y;
         const plotW = Math.max(1, w - padR - 8);
         const shift = Math.round((dx / plotW) * state_.span);
         state_.right = state_.drag.right - shift;
+        // vertical pan: grab the candles and move them up or down, exactly like
+        // dragging the price scale in TradingView
+        const plotH = Math.max(1, h - 36);
+        state_.panY = state_.drag.panY + (dy / plotH) / Math.max(0.2, state_.zoomY);
         state_.auto = false;
       } else {
         const dy = y - state_.drag.y;
@@ -1355,7 +1614,7 @@ function chartCoords(ev) {
   canvas.addEventListener("touchstart", (ev) => {
     if (ev.touches.length === 1) {
       const t = ev.touches[0];
-      state_.drag = { mode: "pan", x: t.clientX, right: state_.right, auto: state_.auto };
+      state_.drag = { mode: "pan", x: t.clientX, y: t.clientY, right: state_.right, panY: state_.panY, auto: state_.auto };
     } else if (ev.touches.length === 2) {
       pinch = { dist: Math.hypot(ev.touches[0].clientX - ev.touches[1].clientX, ev.touches[0].clientY - ev.touches[1].clientY), span: state_.span };
       state_.drag = null;
@@ -1373,6 +1632,7 @@ function chartCoords(ev) {
       const rect = canvas.getBoundingClientRect();
       const plotW = Math.max(1, rect.width - 76);
       state_.right = state_.drag.right - Math.round(((t.clientX - state_.drag.x) / plotW) * state_.span);
+      state_.panY = state_.drag.panY + ((t.clientY - state_.drag.y) / Math.max(1, rect.height - 36)) / Math.max(0.2, state_.zoomY);
       state_.auto = false;
       renderChart();
       ev.preventDefault();
@@ -1383,6 +1643,12 @@ function chartCoords(ev) {
   $("btnZoomIn").onclick = () => { state_.span = clamp(Math.round(state_.span * 0.8), 20, Math.max(25, state_.bars.length)); renderChart(); };
   $("btnZoomOut").onclick = () => { state_.span = clamp(Math.round(state_.span * 1.25), 20, Math.max(25, state_.bars.length)); renderChart(); };
   $("btnReset").onclick = () => resetChartView();
+  $("btnZones").onclick = () => {
+    state_.drawZones = !state_.drawZones;
+    $("btnZones").classList.toggle("on", state_.drawZones);
+    renderChart();
+  };
+  $("btnFull").onclick = () => toggleFullscreen();
   $("btnFollow").onclick = () => {
     state_.auto = !state_.auto;
     if (state_.auto) state_.right = Math.max(0, state_.bars.length - 1);
@@ -1391,7 +1657,54 @@ function chartCoords(ev) {
   };
   paintFollow();
   window.addEventListener("resize", () => { if (state_.zone) renderChart(); });
+  window.addEventListener("keydown", (ev) => {
+    if (!state_.zone) return;
+    const tag = (ev.target && ev.target.tagName) || "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    const maxSpan = Math.max(25, state_.bars.length);
+    if (ev.key === "+" || ev.key === "=") { state_.span = clamp(Math.round(state_.span * 0.8), 20, maxSpan); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "-" || ev.key === "_") { state_.span = clamp(Math.round(state_.span * 1.25), 20, maxSpan); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "ArrowLeft") { state_.auto = false; state_.right -= Math.max(1, Math.round(state_.span / 12)); paintFollow(); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "ArrowRight") { state_.auto = false; state_.right += Math.max(1, Math.round(state_.span / 12)); paintFollow(); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "ArrowUp") { state_.panY -= 0.05 / Math.max(0.2, state_.zoomY); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "ArrowDown") { state_.panY += 0.05 / Math.max(0.2, state_.zoomY); renderChart(); ev.preventDefault(); }
+    else if (ev.key === "f" || ev.key === "F") { toggleFullscreen(); ev.preventDefault(); }
+    else if (ev.key === "r" || ev.key === "R") { resetChartView(); }
+    else if (ev.key === "Escape") { exitFullscreen(); }
+  });
 })();
+
+function toggleFullscreen() {
+  const panel = $("chartPanel");
+  const on = panel.classList.contains("fs") || document.fullscreenElement;
+  if (on) { exitFullscreen(); return; }
+  if (panel.requestFullscreen) {
+    panel.requestFullscreen().then(() => setTimeout(chartResized, 60)).catch(() => {});
+  }
+  panel.classList.add("fs");
+  document.body.classList.add("fs-lock");
+  $("btnFull").classList.add("on");
+  setTimeout(chartResized, 80);
+}
+
+function exitFullscreen() {
+  const panel = $("chartPanel");
+  panel.classList.remove("fs");
+  document.body.classList.remove("fs-lock");
+  $("btnFull").classList.remove("on");
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  setTimeout(chartResized, 60);
+}
+
+function chartResized() {
+  // the canvas is sized from its CSS box, so a resize only needs a repaint
+  if (chart.zone) renderChart();
+}
+document.addEventListener("fullscreenchange", () => {
+  const panel = $("chartPanel");
+  if (!document.fullscreenElement && panel.classList.contains("fs")) return;
+  setTimeout(chartResized, 60);
+});
 
 function paintFollow() {
   const b = $("btnFollow");

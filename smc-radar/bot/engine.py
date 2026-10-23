@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 from collections import deque
 
 from .buckets import TIMEFRAMES, Rollup
-from .map import DEFAULTS, KINDS, MarketMap
+from .map import DEFAULTS, KINDS, TREND_KINDS, MarketMap
 
 MAX_ZONES = 1200
 MAX_HISTORY = 1500      # candles kept per instrument/timeframe for the chart
@@ -494,6 +494,67 @@ class Engine:
     async def _log(self, message: str, level: str = "info") -> None:
         await self._broadcast({"type": "log", "level": level, "message": message})
 
+    # ------------------------------------------------- live context / grading
+    def _strong_levels(self) -> dict[tuple[str, str, str], list[dict]]:
+        """Index of every strong / very strong level, per (symbol, side).
+
+        Built on demand from the zones that already exist, so a grade never
+        depends on data the map did not have when the zone formed.
+        """
+        index: dict[tuple[str, str, str], list[dict]] = {}
+        for zone in self.zones.values():
+            if zone.get("kind") not in TREND_KINDS:
+                continue
+            index.setdefault((zone["symbol"], zone["side"], zone["timeframe"]), []).append(zone)
+        return index
+
+    def _htf_confluence(self, zone: dict, index: dict[tuple[str, str, str], list[dict]]) -> list[str]:
+        """A strong level on another timeframe sitting at this zone's level.
+
+        The book says it plainly: "HTF REJECTION BLOCK IS A LTF ALGO CANDLE" -
+        so the same price tagged as a strong level on a higher timeframe is the
+        confluence that matters. Compared in percent, because every timeframe
+        has its own ATR.
+        """
+        out: list[str] = []
+        level = float(zone.get("level") or 0.0)
+        if not level:
+            return out
+        for other_tf in self.timeframes:
+            if other_tf == zone.get("timeframe"):
+                continue
+            for strong in index.get((zone["symbol"], zone["side"], other_tf), ()):
+                if abs(float(strong.get("level") or 0.0) - level) / level > 0.0015:
+                    continue
+                label = "very strong" if str(strong.get("kind", "")).startswith("very_strong") else "strong"
+                text = f"{other_tf} {label} {zone['side']} at the same price"
+                if text not in out:
+                    out.append(text)
+        return out
+
+    def enrich(self, zone: dict, index: dict | None = None) -> dict:
+        """Add what is true *now*: the live regime and the HTF confluence.
+
+        ``now_trend`` answers the only question that matters at the moment of a
+        trade - "is the market trending the way this zone needs?" - and it is
+        recomputed on every push because a range can turn into a trend while a
+        block waits for price.
+        """
+        index = index if index is not None else self._strong_levels()
+        map_ = self.maps.get((zone.get("symbol"), zone.get("timeframe")))
+        if map_ is not None:
+            regime = map_.regime()
+            aligned = (regime["state"] == "trend_down" and zone.get("side") == "high") or (
+                regime["state"] == "trend_up" and zone.get("side") == "low"
+            )
+            zone["now_trend"] = {
+                **regime,
+                "aligned": bool(aligned),
+                "ready": bool(aligned and regime["state"] in ("trend_up", "trend_down")),
+            }
+        zone["htf"] = self._htf_confluence(zone, index)
+        return zone
+
     # -------------------------------------------------------------- snapshot
     @staticmethod
     def slim(zone: dict) -> dict:
@@ -505,6 +566,10 @@ class Engine:
                 "time", "status", "strength", "evidence", "swept_level", "break_level",
                 "fvg", "inducement", "session", "mitigated_at", "mitigated_price",
                 "invalidated_at", "invalidated_price",
+                # round 5: the rectangle, the regime, the grade
+                "ob", "block_src", "trend", "trend_state", "aligned", "confluence", "htf",
+                "grade", "score", "entry_trend", "entry_state", "entry_aligned",
+                "fvg_atr", "disp_atr", "block_atr", "swept_major", "now_trend",
             )
         }
 
@@ -518,6 +583,10 @@ class Engine:
         }
 
     def snapshot(self, cells: bool = True, with_history: bool = True) -> dict[str, Any]:
+        index = self._strong_levels()
+        for zone in self.zones.values():
+            if zone.get("status") == "active":
+                self.enrich(zone, index)
         active = [z for z in self.zones.values() if z.get("status") == "active"]
         active.sort(key=lambda z: -int(z.get("time") or 0))
         history = [z for z in self.zones.values() if z.get("status") != "active"]
@@ -561,6 +630,7 @@ class Engine:
                     "atr": map_.atr_now(),
                     "active": len(map_.active()),
                     "trend": map_.trend_label,
+                    "regime": map_.regime(),
                 }
                 for map_ in self.maps.values()
             ],

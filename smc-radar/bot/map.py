@@ -64,6 +64,17 @@ DEFAULTS: dict[str, Any] = {
     "max_zone_age": 2000,    # bars a zone may stay on the map
     "mitigation_mode": "zone",  # "zone" (touch the block) or "level" (the exact extreme)
     "atr_period": 14,
+    # --- quality layer (round 5) -------------------------------------------
+    # These settings never decide *whether* a pattern exists - they decide which
+    # order-block candle the rectangle is drawn on, and how trustworthy the
+    # pattern is. Detection itself is unchanged.
+    "ob_lookback": 8,           # bars searched backwards for the order-block candle
+    "ob_min_height_atr": 0.12,  # a block is never thinner than this fraction of ATR
+    "trend_lookback": 40,       # bars behind the efficiency ratio
+    "trend_er_min": 0.25,       # Kaufman efficiency ratio: at/above this the market trends
+    "trend_adx_min": 18.0,      # and the ADX has to agree
+    "confluence_tol_atr": 0.5,  # "the same level" means within this fraction of ATR
+    "confluence_age": 400,      # bars a strong level stays relevant for confluence
     "sessions": [            # UTC, inclusive start, exclusive end
         {"name": "Asia", "start": 0, "end": 8},
         {"name": "London", "start": 7, "end": 16},
@@ -147,6 +158,22 @@ class Zone:
     invalidated_at: int | None = None
     invalidated_price: float | None = None
     created_index: int = 0
+    # --- round 5: what the rectangle is drawn on, and how good the pattern is
+    ob: dict[str, Any] | None = None      # the opposite-colour order-block candle
+    block_src: str = "pivot candle"       # "order block candle" or "pivot candle"
+    trend: dict[str, Any] | None = None   # market regime when the zone formed
+    confluence: list[str] = field(default_factory=list)
+    htf: list[str] = field(default_factory=list)
+    grade: str = "C"                      # A+ / A / B / C
+    score: int = 0
+    # the regime at the moment price came back into the block: this is the
+    # moment a trade is actually taken, so it gets its own snapshot
+    entry_trend: dict[str, Any] | None = None
+    # measurable features (the study in tools/zone_quality.py uses exactly these)
+    fvg_atr: float | None = None
+    disp_atr: float | None = None
+    block_atr: float | None = None
+    swept_major: bool = False
 
     @property
     def key(self) -> str:
@@ -185,6 +212,25 @@ class Zone:
             "mitigated_price": self.mitigated_price,
             "invalidated_at": self.invalidated_at,
             "invalidated_price": self.invalidated_price,
+            # round 5 - the rectangle, the regime and the grade
+            "ob": self.ob,
+            "block_src": self.block_src,
+            "trend": self.trend,
+            "trend_state": (self.trend or {}).get("state"),
+            "trend_er": (self.trend or {}).get("er"),
+            "trend_adx": (self.trend or {}).get("adx"),
+            "aligned": (self.trend or {}).get("aligned"),
+            "confluence": list(self.confluence),
+            "htf": list(self.htf),
+            "grade": self.grade,
+            "score": self.score,
+            "entry_trend": self.entry_trend,
+            "entry_state": (self.entry_trend or {}).get("state"),
+            "entry_aligned": (self.entry_trend or {}).get("aligned"),
+            "fvg_atr": self.fvg_atr,
+            "disp_atr": self.disp_atr,
+            "block_atr": self.block_atr,
+            "swept_major": self.swept_major,
         }
 
 
@@ -253,6 +299,206 @@ def fair_value_gap(bar0: dict, bar1: dict, bar2: dict, index: int) -> FairValueG
     return None
 
 
+# ------------------------------------------------------- trend / range gauge
+# the kinds that are themselves a strong level (used for confluence)
+TREND_KINDS = ("strong_high", "very_strong_high", "strong_low", "very_strong_low")
+class TrendGauge:
+    """Is this market trending, and in which direction - updated one bar at a time.
+
+    Two independent, well-known measurements, both computed from closed candles
+    only, so nothing here can look into the future:
+
+    * **Efficiency ratio** (Kaufman): net travel / total travel over N bars. In a
+      trend price goes somewhere; in a range it goes everywhere and ends up
+      roughly where it started, so the ratio collapses. This is the number that
+      separates "wide range that keeps breaking swings in both directions" from
+      a real trend.
+    * **ADX(14)** (Wilder): the strength of directional movement. Below ~18 the
+      market is not directional whatever the chart looks like.
+    """
+
+    def __init__(self, er_period: int = 40, adx_period: int = 14) -> None:
+        self.er_period = max(2, int(er_period))
+        self.adx_period = max(2, int(adx_period))
+        self.closes: deque[float] = deque(maxlen=self.er_period + 1)
+        self.er: float | None = None
+        self.adx: float | None = None
+        self.plus_di: float | None = None
+        self.minus_di: float | None = None
+        self._prev: tuple[float, float, float] | None = None
+        self._tr: float | None = None
+        self._plus_dm = 0.0
+        self._minus_dm = 0.0
+        self._seeded = 0
+        self._dx_sum = 0.0
+        self._dx_count = 0
+        self.bars = 0
+
+    def update(self, high: float, low: float, close: float) -> None:
+        self.bars += 1
+        self.closes.append(close)
+        n = self.er_period
+        if len(self.closes) == n + 1:
+            net = abs(self.closes[-1] - self.closes[0])
+            travel = sum(abs(self.closes[i] - self.closes[i - 1]) for i in range(1, len(self.closes)))
+            self.er = (net / travel) if travel > 0 else 0.0
+
+        prev = self._prev
+        self._prev = (high, low, close)
+        if prev is None:
+            return
+        prev_high, prev_low, prev_close = prev
+        up = high - prev_high
+        down = prev_low - low
+        plus_dm = up if (up > down and up > 0) else 0.0
+        minus_dm = down if (down > up and down > 0) else 0.0
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        period = self.adx_period
+        if self._seeded < period:
+            self._seeded += 1
+            self._tr = (self._tr or 0.0) + tr
+            self._plus_dm += plus_dm
+            self._minus_dm += minus_dm
+            if self._seeded == period:
+                self._calc(tr_sum=self._tr)
+            return
+        # Wilder's smoothing
+        self._tr = self._tr - (self._tr / period) + tr
+        self._plus_dm = self._plus_dm - (self._plus_dm / period) + plus_dm
+        self._minus_dm = self._minus_dm - (self._minus_dm / period) + minus_dm
+        self._calc(tr_sum=self._tr)
+
+    def _calc(self, tr_sum: float) -> None:
+        period = self.adx_period
+        if not tr_sum:
+            return
+        self.plus_di = 100.0 * self._plus_dm / tr_sum
+        self.minus_di = 100.0 * self._minus_dm / tr_sum
+        total = self.plus_di + self.minus_di
+        dx = 100.0 * abs(self.plus_di - self.minus_di) / total if total else 0.0
+        if self.adx is None:
+            self._dx_sum += dx
+            self._dx_count += 1
+            if self._dx_count >= period:
+                self.adx = self._dx_sum / self._dx_count
+        else:
+            self.adx = (self.adx * (period - 1) + dx) / period
+
+
+def order_block_candle(
+    bars: list[dict], k: int, side: str, lookback: int = 8, level: float | None = None
+) -> tuple[int, dict] | None:
+    """The candle the rectangle belongs on.
+
+    The order block is the **last opposite-colour candle with the biggest body**
+    before the extreme - the candle the institutions were filling while the
+    crowd was buying (at a high) or selling (at a low). For a high we look for a
+    green/up candle, for a low for a red/down one, walking back from the extreme
+    pivot. On a tie the one closest to the extreme wins, because that is the one
+    that actually supplied the liquidity.
+
+    A candidate that does not overlap the extreme's side is skipped: a candle
+    sitting *above* the high (or *below* the low) belongs to the previous swing,
+    not to this block. That is what keeps the rectangle on the right candles.
+    """
+    if not bars:
+        return None
+    k = max(0, min(len(bars) - 1, int(k)))
+    start = max(0, k - max(1, int(lookback)))
+    best: tuple[int, dict] | None = None
+    best_body = -1.0
+    for j in range(k, start - 1, -1):
+        bar = bars[j]
+        open_, close = float(bar["open"]), float(bar["close"])
+        up = close >= open_
+        wanted = up if side == HIGH else not up
+        if not wanted:
+            continue
+        if level is not None:
+            if side == HIGH and float(bar["low"]) >= level:
+                continue      # this candle sits above the high: not our block
+            if side == LOW and float(bar["high"]) <= level:
+                continue      # ... and this one sits below the low
+        body = abs(close - open_)
+        if body > best_body:
+            best, best_body = (j, bar), body
+    return best
+
+
+def block_geometry(
+    bars: list[dict], k: int, level: float, side: str, settings: dict[str, Any], atr: float | None
+) -> tuple[float, float, dict[str, Any] | None, str]:
+    """Where the rectangle goes: the exact high (low) down (up) to the order block.
+
+    Returns ``(top, bottom, ob, source)``. The extreme of the zone is always the
+    exact high/low the pattern is about - that is the level a stop goes behind -
+    and the block extends to the far side of the order-block candle, so the
+    rectangle covers the whole area price has to trade back through. That is why
+    a zone no longer looks "active" after price has already come back into it.
+    """
+    found = order_block_candle(bars, k, side, int(settings.get("ob_lookback", 8)), level)
+    atr = float(atr or 0.0)
+    minimum = float(settings.get("ob_min_height_atr", 0.12)) * atr
+    if minimum <= 0:
+        # no ATR yet (the first bars of a warm-up): keep a visible, non-zero box
+        minimum = max(abs(float(level)) * 1e-5, 1e-9)
+    if found is None:
+        pivot = bars[max(0, min(len(bars) - 1, k))]
+        ob = {
+            "index": None,
+            "time": int(pivot.get("close_time") or pivot.get("open_time") or 0),
+            "open": float(pivot["open"]),
+            "high": float(pivot["high"]),
+            "low": float(pivot["low"]),
+            "close": float(pivot["close"]),
+            "body": abs(float(pivot["close"]) - float(pivot["open"])),
+            "color": "up" if float(pivot["close"]) >= float(pivot["open"]) else "down",
+        }
+        source = "pivot candle"
+        if side == HIGH:
+            return level, min(float(pivot["low"]), level - minimum), ob, source
+        return max(float(pivot["high"]), level + minimum), level, ob, source
+
+    j, bar = found
+    open_, close = float(bar["open"]), float(bar["close"])
+    ob = {
+        "index": j,
+        "time": int(bar.get("close_time") or bar.get("open_time") or 0),
+        "open": open_,
+        "high": float(bar["high"]),
+        "low": float(bar["low"]),
+        "close": close,
+        "body": abs(close - open_),
+        "color": "up" if close >= open_ else "down",
+    }
+    if side == HIGH:
+        # the block always covers the order-block candle; the minimum height is
+        # only a floor for a degenerate (zero-range) candle, never a reason to
+        # push the rectangle away from the candle it marks
+        bottom = min(float(bar["low"]), level)
+        if level - bottom <= 1e-9:
+            bottom = level - minimum
+        return level, bottom, ob, "order block candle"
+    top = max(float(bar["high"]), level)
+    if top - level <= 1e-9:
+        top = level + minimum
+    return top, level, ob, "order block candle"
+
+
+def grade_for(score: int) -> str:
+    """A+ is the top of the measured range, C is the tail the study says fails."""
+    if score >= 62:
+        return "A+"
+    if score >= 48:
+        return "A"
+    if score >= 34:
+        return "B"
+    return "C"
+
+
+GRADE_ORDER = {"A+": 3, "A": 2, "B": 1, "C": 0}
+
+
 # ------------------------------------------------------------------- the map
 class MarketMap:
     """One instrument on one timeframe, updated bar by bar.
@@ -285,8 +531,16 @@ class MarketMap:
         # live sweep per side: {"pivot": Pivot, "extreme": float, "index": int}
         self.sweeps: dict[str, dict[str, Any] | None] = {HIGH: None, LOW: None}
         self.external_trend: int | None = None
+        self.gauge = TrendGauge(
+            er_period=int(self.cfg.get("trend_lookback", 40)),
+            adx_period=max(2, int(self.cfg.get("atr_period", 14))),
+        )
         self.last_events: dict[str, Any] = {}
         self.seen: set[str] = set()
+        # The candles around every confirmed pivot. A sweep can be confirmed long
+        # after its pivot has fallen out of the 240-bar window, and the block must
+        # still be drawn on the candle that really made the high - so keep it.
+        self.pivot_ctx: dict[int, list[dict]] = {}
 
     # ------------------------------------------------------------------ util
     @property
@@ -306,11 +560,163 @@ class MarketMap:
     def active(self) -> list[Zone]:
         return [z for z in self.zones if z.status == "active"]
 
+    # --------------------------------------------------------------- regime
+    def regime(self) -> dict[str, Any]:
+        """Trend or range, in numbers a trader can check.
+
+        ``er``  the Kaufman efficiency ratio over ``trend_lookback`` bars,
+        ``adx`` Wilder's ADX(14), ``dir`` +1/-1/0 the net direction over the same
+        window. A market is only called trending when BOTH the efficiency ratio
+        and the ADX agree, which is what keeps a wide, choppy range from being
+        mistaken for a trend.
+        """
+        er = self.gauge.er
+        adx = self.gauge.adx
+        closes = list(self.gauge.closes)
+        n = max(2, int(self.cfg.get("trend_lookback", 40)))
+        direction = 0
+        if len(closes) >= 2:
+            span = closes[-1] - closes[0]
+            direction = 1 if span > 0 else -1 if span < 0 else 0
+        er_min = float(self.cfg.get("trend_er_min", 0.25))
+        adx_min = float(self.cfg.get("trend_adx_min", 18.0))
+        enough = er is not None and adx is not None
+        trending = bool(enough and er >= er_min and adx >= adx_min and direction != 0)
+        if not enough:
+            state = "unknown"
+        elif trending:
+            state = "trend_up" if direction > 0 else "trend_down"
+        else:
+            state = "range"
+        return {
+            "state": state,
+            "er": round(er, 4) if er is not None else None,
+            "adx": round(adx, 2) if adx is not None else None,
+            "dir": direction,
+            "lookback": n,
+        }
+
+    def confluence_at(self, side: str, level: float) -> list[str]:
+        """Strong / very strong levels of this timeframe sitting at this level."""
+        atr = self.atr_now() or 0.0
+        tol = float(self.cfg.get("confluence_tol_atr", 0.5)) * atr if atr else 0.0
+        if not tol:
+            return []
+        max_age = int(self.cfg.get("confluence_age", 400))
+        out: list[str] = []
+        for other in self.zones:
+            if other.side != side or other.kind not in TREND_KINDS:
+                continue
+            if self.count - other.created_index > max_age:
+                continue
+            if abs(other.level - level) > tol:
+                continue
+            label = "very strong" if other.kind.startswith("very_strong") else "strong"
+            text = f"{label} {side} at the same level"
+            if text not in out:
+                out.append(text)
+        return out
+
+    def score_zone(self, zone: Zone, regime: dict[str, Any] | None = None) -> Zone:
+        """Turn the evidence into one number, and say why.
+
+        The weights are a ranking, not a new rule; they are printed with every
+        zone (``evidence`` keeps the book's reasons, ``trend``/``confluence``
+        keep the market context) so a grade can always be traced back.
+        """
+        regime = regime or self.regime()
+        kind = zone.kind
+        # Weights calibrated on 90 days of real 1m BTC candles by
+        # tools/zone_quality.py. Measured lift on "did price travel 2 ATR in
+        # your favour before a close beyond the high/low":
+        #   block >=1 ATR          79%   block <0.25 ATR        44%
+        #   displacement >=4 ATR   82%   displacement <2 ATR     66%
+        #   rejection block / VSA  83-88%  plain strong high/low 70%
+        #   FVG >=1.5 ATR          80%   FVG <0.4 ATR            72%
+        # Same-level strong confluence and the trend at the touch showed no lift
+        # on this sample, so they are shown but weighted lightly.
+        score = 0
+        if kind.startswith("rejection_block"):
+            score += 24
+        elif kind.startswith("very_strong"):
+            score += 22
+        elif kind.startswith("algo_"):
+            score += 16
+        elif kind.startswith("strong_"):
+            score += 8
+
+        block = zone.block_atr
+        if block is not None:
+            if block >= 1.0:
+                score += 20
+            elif block >= 0.5:
+                score += 8
+            elif block >= 0.25:
+                score += 3
+
+        disp = zone.disp_atr
+        if disp is not None:
+            if disp >= 4.0:
+                score += 12
+            elif disp >= 2.0:
+                score += 6
+            elif disp >= 1.0:
+                score += 2
+
+        fvg = zone.fvg_atr
+        if fvg is not None:
+            if fvg >= 1.5:
+                score += 6
+            elif fvg >= 0.8:
+                score += 4
+            elif fvg >= 0.4:
+                score += 2
+
+        if zone.inducement >= int(self.cfg["induce_count"]):
+            score += 4
+        if zone.session:
+            score += 3
+        if zone.confluence:
+            score += 3
+
+        state = regime.get("state")
+        trending = state in ("trend_up", "trend_down")
+        aligned = (state == "trend_down" and zone.side == HIGH) or (state == "trend_up" and zone.side == LOW)
+        if trending and aligned:
+            score += 4
+        zone.score = int(max(0, min(100, score)))
+        zone.grade = grade_for(zone.score)
+        zone.trend = {
+            **regime,
+            "aligned": bool(trending and aligned),
+            "label": (
+                "with the trend" if trending and aligned
+                else "against the trend" if trending
+                else "range" if state == "range"
+                else "unknown"
+            ),
+        }
+        return zone
+
     def _add_zone(self, zone: Zone) -> Zone | None:
         if zone.key in self.seen:
             return None
         self.seen.add(zone.key)
         zone.created_index = self.count
+        # grade it now: the market context and the strong levels already on the
+        # map are known at this instant, so a grade never depends on the future
+        atr = self.atr_now() or 0.0
+        if atr:
+            zone.block_atr = round(abs(zone.top - zone.bottom) / atr, 3)
+            if zone.fvg:
+                zone.fvg_atr = round(abs(zone.fvg["top"] - zone.fvg["bottom"]) / atr, 3)
+            if zone.swept_level is not None:
+                zone.swept_major = any(
+                    pivot.side == zone.side and abs(pivot.price - float(zone.swept_level)) < 1e-9
+                    for pivot in self.major
+                )
+        zone.confluence = self.confluence_at(zone.side, zone.level)
+        self.score_zone(zone)
         self.zones.append(zone)
         # keep the list bounded: drop the oldest resolved zone first
         if len(self.zones) > 400:
@@ -335,6 +741,11 @@ class MarketMap:
             }
         )
         self._push_atr(bar)
+        # the regime gauge only ever sees closed candles, like everything else
+        try:
+            self.gauge.update(float(bar["high"]), float(bar["low"]), float(bar["close"]))
+        except Exception:  # a malformed bar must never stop the map
+            pass
         index = self.count
         self.count += 1
 
@@ -397,6 +808,22 @@ class MarketMap:
                 continue
             pivot = Pivot(side=side, price=price, index=index - width, time=int(bars[position]["close_time"]), major=major)
             bucket.append(pivot)
+            depth = int(self.cfg.get("ob_lookback", 8))
+            self.pivot_ctx[pivot.time] = [
+                {
+                    "open_time": int(b["open_time"]),
+                    "close_time": int(b.get("close_time") or b["open_time"]),
+                    "open": float(b["open"]),
+                    "high": float(b["high"]),
+                    "low": float(b["low"]),
+                    "close": float(b["close"]),
+                    "volume": float(b.get("volume") or 0.0),
+                }
+                for b in bars[max(0, position - depth) : position + 1]
+            ]
+            if len(self.pivot_ctx) > 256:  # bounded, oldest first
+                for stale in list(self.pivot_ctx)[: len(self.pivot_ctx) - 256]:
+                    self.pivot_ctx.pop(stale, None)
             events["pivots"].append(pivot.as_dict())
             if major:
                 # the last major break gives the external trend (p.53 MS)
@@ -429,10 +856,22 @@ class MarketMap:
         atr = self.atr_now() or 0.0
         if atr and gap.size < float(self.cfg["min_fvg_atr"]) * atr:
             return  # a gap a fraction of the ATR is noise, not displacement
-        if pivot.side == HIGH:
-            top, bottom, level = float(bar["high"]), min(float(bar["open"]), float(bar["close"])), float(bar["high"])
+        # the rectangle: from the exact high/low down (up) to the far side of the
+        # last opposite-colour candle with the biggest body - the order block
+        level = float(bar["high"]) if pivot.side == HIGH else float(bar["low"])
+        top, bottom, ob, block_src = block_geometry(bars, k, level, pivot.side, self.cfg, atr)
+        # p.89: "when the momentum shift is aggressive, the breaker is very
+        # strong" - so measure the aggression of the leg out of the extreme
+        leg = bars[k + 1 :]
+        if leg and atr:
+            if pivot.side == HIGH:
+                furthest = min(float(b["low"]) for b in leg)
+                disp = (level - furthest) / atr
+            else:
+                furthest = max(float(b["high"]) for b in leg)
+                disp = (furthest - level) / atr
         else:
-            top, bottom, level = max(float(bar["open"]), float(bar["close"])), float(bar["low"]), float(bar["low"])
+            disp = None
 
         evidence = ["displacement left an FVG"] if gap else []
         strength = 1
@@ -501,7 +940,10 @@ class MarketMap:
             fvg={"side": gap.side, "top": gap.top, "bottom": gap.bottom, "time": gap.time},
             inducement=induce,
             session=session,
+            ob=ob,
+            block_src=block_src,
         )
+        zone.disp_atr = round(disp, 3) if disp is not None else None
         if self._add_zone(zone):
             events["zones"].append(zone.as_dict())
 
@@ -531,6 +973,8 @@ class MarketMap:
                 fvg={"side": gap.side, "top": gap.top, "bottom": gap.bottom, "time": gap.time},
                 inducement=induce,
                 session=session,
+                ob=ob,
+                block_src=block_src,
             )
             if self._add_zone(block):
                 events["zones"].append(block.as_dict())
@@ -626,12 +1070,19 @@ class MarketMap:
         offset = self.count - len(bars)
         k = pivot.index - offset
         k = max(0, min(len(bars) - 1, k))
-        candle = bars[k]
         side = pivot.side
-        if side == HIGH:
-            top, bottom, level = float(candle["high"]), min(float(candle["open"]), float(candle["close"])), float(candle["high"])
+        ctx = self.pivot_ctx.get(pivot.time)
+        if k < 0 or k >= len(bars) or float(bars[k].get("close_time") or 0) != float(pivot.time):
+            # the pivot is older than the window: use the candles kept with it
+            if not ctx:
+                return
+            candle = ctx[-1]
+            level = float(candle["high"]) if side == HIGH else float(candle["low"])
+            top, bottom, ob, block_src = block_geometry(ctx, len(ctx) - 1, level, side, self.cfg, self.atr_now())
         else:
-            top, bottom, level = max(float(candle["open"]), float(candle["close"])), float(candle["low"]), float(candle["low"])
+            candle = bars[k]
+            level = float(candle["high"]) if side == HIGH else float(candle["low"])
+            top, bottom, ob, block_src = block_geometry(bars, k, level, side, self.cfg, self.atr_now())
 
         evidence = [
             "liquidity grabbed above the swing" if side == HIGH else "liquidity grabbed below the swing",
@@ -695,6 +1146,8 @@ class MarketMap:
             fvg={"side": gap.side, "top": gap.top, "bottom": gap.bottom, "time": gap.time} if gap else None,
             inducement=induce,
             session=session,
+            ob=ob,
+            block_src=block_src,
         )
         # p.45: very strong = grabbed liquidity + broke a strong high/low + inducement
         if strong_level and induce >= int(self.cfg["induce_count"]):
@@ -723,6 +1176,14 @@ class MarketMap:
             events["zones"].append(weak.as_dict())
         events["breaks"].append({"side": side, "level": opposite.price, "time": int(bar["close_time"])})
 
+    def _entry_regime(self, zone: Zone) -> dict[str, Any]:
+        """Regime at the touch, plus whether it agrees with the zone's trade."""
+        regime = self.regime()
+        aligned = (regime["state"] == "trend_down" and zone.side == HIGH) or (
+            regime["state"] == "trend_up" and zone.side == LOW
+        )
+        return {**regime, "aligned": bool(aligned)}
+
     # ---------------------------------------------------------- mitigation
     def _resolve_zones(self, bar: dict, index: int, events: dict) -> None:
         """p.48: a zone lives until price mitigates it, or until it is broken."""
@@ -750,7 +1211,10 @@ class MarketMap:
                     zone.status = "mitigated"
                     zone.mitigated_at = int(bar["close_time"])
                     zone.mitigated_index = index
-                    zone.mitigated_price = high if self.mitigation_mode == "level" else max(low, zone.bottom)
+                    # the price a sell would actually have been filled at: the
+                    # highest point of the returning candle inside the block
+                    zone.mitigated_price = high if self.mitigation_mode == "level" else min(high, zone.top)
+                    zone.entry_trend = self._entry_regime(zone)
                     events["resolved"].append({"key": zone.key, "status": "mitigated"})
             else:
                 if close < zone.bottom:
@@ -764,7 +1228,8 @@ class MarketMap:
                     zone.status = "mitigated"
                     zone.mitigated_at = int(bar["close_time"])
                     zone.mitigated_index = index
-                    zone.mitigated_price = low if self.mitigation_mode == "level" else min(high, zone.top)
+                    zone.mitigated_price = low if self.mitigation_mode == "level" else max(low, zone.bottom)
+                    zone.entry_trend = self._entry_regime(zone)
                     events["resolved"].append({"key": zone.key, "status": "mitigated"})
 
     # ------------------------------------------------------------------ view
@@ -783,6 +1248,7 @@ class MarketMap:
             "price": self.last_price,
             "atr": self.atr_now(),
             "external_trend": self.external_trend,
+            "regime": self.regime(),
             "counts": self.counts(),
             "zones": [z.as_dict() for z in active[:limit]],
         }
