@@ -527,3 +527,67 @@ def test_active_1m_algo_high_appears_while_a_replay_streams():
     asyncio.run(go())
     assert seen_active, "a 1m algo candle high must go ACTIVE while the stream runs"
     assert any(z["side"] == "high" for z in seen_active)
+
+
+# --------------------------------------- round 5: the live context per zone
+def test_every_pushed_zone_carries_its_grade_and_live_regime():
+    """The page draws a grade and a "tradeable now" badge, so the payload the
+    browser receives must contain them - for active and resolved zones alike."""
+    rows = load(3000)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m", "5m"], settings=dict(DEFAULTS))
+    feed = FakeFeed(rows)
+
+    async def go():
+        await engine.warmup(feed)
+
+    asyncio.run(go())
+    state = engine.snapshot()
+    json.dumps(state)
+    assert state["active"], "real BTC candles produce zones"
+    for zone in state["active"]:
+        assert zone["grade"] in {"A+", "A", "B", "C"}
+        assert isinstance(zone["score"], int)
+        assert zone["now_trend"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
+        assert isinstance(zone["now_trend"]["ready"], bool)
+        assert zone["now_trend"]["ready"] in (True, False)
+        assert zone["ob"] is None or "color" in zone["ob"]
+        assert isinstance(zone["htf"], list)
+        assert isinstance(zone["confluence"], list)
+
+    # the live regime is per instrument AND timeframe, not one global number
+    for cell in state["cells"]:
+        assert cell["regime"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
+        assert "er" in cell["regime"] and "adx" in cell["regime"]
+
+
+def test_the_zone_api_serves_the_same_fields_and_never_hides_mitigation():
+    rows = load(3000)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    feed = FakeFeed(rows)
+
+    async def go():
+        await engine.warmup(feed)
+        app = create_app({"symbols": ["BTCUSDT"], "timeframes": ["5m"], "max_symbols": 5}, feed, engine, None)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            body = (await client.get("/api/zones?status=all&limit=4000")).json()
+            assert body["items"]
+            for zone in body["items"]:
+                assert "grade" in zone and "now_trend" in zone
+                if zone["status"] == "active":
+                    assert zone["mitigated_at"] is None and zone["invalidated_at"] is None
+                else:
+                    assert (zone["mitigated_at"] and zone["mitigated_price"] is not None) or (
+                        zone["invalidated_at"] and zone["invalidated_price"] is not None
+                    )
+            # the rectangle really does sit on the exact extreme
+            for zone in body["items"]:
+                if zone["kind"] in {"weak_high", "weak_low"}:
+                    continue  # a weak high/low is deliberately a line, not a block
+                if zone["side"] == "high":
+                    assert abs(zone["top"] - zone["level"]) < 1e-9
+                else:
+                    assert abs(zone["bottom"] - zone["level"]) < 1e-9
+                assert zone["bottom"] < zone["top"]
+
+    asyncio.run(go())

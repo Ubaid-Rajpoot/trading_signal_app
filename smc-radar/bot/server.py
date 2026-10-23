@@ -268,6 +268,9 @@ def create_app(
                 or int(z.get("mitigated_at") or 0) >= since
                 or int(z.get("invalidated_at") or 0) >= since
             ]
+        index = engine._strong_levels()
+        for zone in items:
+            engine.enrich(zone, index)
         items.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or z.get("time") or 0))
         limit = max(1, min(4000, int(limit)))
         return {"count": len(items), "items": items[:limit]}

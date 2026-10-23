@@ -78,22 +78,35 @@ its resolution time and price; the tape keeps the record; only a zone older than
   live count of *active* zones of that kind.
 * **Filters** — symbol search, timeframe chips, **view: active only / active +
   recently mitigated (default) / everything**, a window selector (15 min … 24 h),
-  weak pairs, sort by newest / closest to price / strongest evidence / symbol.
+  **quality: A+ and A (default) / A+ only / tradeable now / on a strong level /
+  everything**, weak
+  pairs, sort by newest / closest to price / strongest evidence / symbol.
   Active zones always lead the list; a resolved zone keeps its card, dimmed,
   with the time it formed **and** the time and price that mitigated it. That is
   what keeps a 1m pattern on screen: a 1m zone is usually mitigated within
   minutes, so an "active only" list can be empty for it by the time you look.
-* **Cards** — symbol, timeframe, pattern, status, level, distance from the live
-  price in %, formation time + age, block bounds, session, the evidence list,
-  condition count, and the mitigation/invalidation line once it happens.
+* **Cards** — symbol, timeframe, pattern, **grade (A+ … C)**, status, level,
+  distance from the live price in %, formation time + age, block bounds, session,
+  **the live market regime (trend ↑ / trend ↓ / range) with a `TRADEABLE NOW`
+  badge** when the trend is on the zone's side, **block and displacement size in
+  ATR**, the evidence list, **same-level and higher-timeframe confluence**, the
+  **order-block candle** the rectangle is drawn on, condition count, and the
+  mitigation/invalidation line once it happens.
 * **Chart** — a real chart, opened automatically on the newest active zone.
   It holds **1000 candles** (deep history, not just the detection window), draws
-  the zone block, the exact level, the swept and break levels, the
+  **every zone of that instrument and timeframe** behind the selected one (the
+  `zones` button turns them off; the nearest 24 are drawn so the chart stays
+  readable), outlines **the order-block candle itself** in amber (`OB`, with an
+  `◀ OB` / `OB ▶` arrow when it is outside the visible window), draws the zone block, the exact level, the swept and break levels, the
   mitigation/invalidation marker and the live price, and it grows the candle
   that is still forming in front of you. **Scroll** to zoom, **drag** to pan back
   through history, **drag the right edge** to rescale price, **double-click**
-  (or `reset`) to follow the newest candle again. Touch: one finger pans, two
-  fingers pinch. A crosshair shows OHLC for the candle under the cursor.
+  (or `reset`) to follow the newest candle again. Dragging moves the chart **in
+  both directions** — grab the candles and pull them up or down to see where the
+  order block really sits — and `⛶` (or `F`) puts the chart **full screen**
+  (`Esc` leaves). The keyboard also has `+` / `-` to zoom, arrows to pan and `R`
+  to reset. Touch: one finger pans, two fingers pinch. A crosshair shows OHLC for
+  the candle under the cursor and the time of that candle on the time axis.
   The last candle keeps **the same right-hand margin TradingView uses** (14% of
   the view, at least four candles) instead of being glued to the price axis, and
   you can drag or scroll further into that empty space; `follow` snaps back.
@@ -169,20 +182,34 @@ places, each one measurable:
 advances on its own, the candle endpoint serves a deep history, the incremental
 refresh returns only new bars, and both SSE and the websocket push.
 
-### Nothing about detection changed
+### What changed, and what did not
 
-`bot/map.py` - the file that holds the rules of strong high / very strong high /
-algo candle / rejection block / mitigation - is **byte-identical** to the first
-`smc-radar` commit (`git diff c86edfe HEAD -- smc-radar/bot/map.py` is empty),
-and `config.json` gained only the three `rest_poll_*` keys. Measured on the same
-recorded BTC replay, the first commit found 36 `algo_bear` zones on 1m in its
-first 888 candles; the current code found 84 in 2,820 candles - the same ratio,
-i.e. no rule was lost. What *did* change was how fast the page fills: a deep
-warm-up / replay pre-roll resolves most historical 1m zones before you look, so
-an active-only list could look empty. Hence the "recently mitigated" default
-above, and two regression tests that pin it:
-``test_btc_1m_algo_candle_high_is_reported_and_reachable_from_the_api`` and
-``test_active_1m_algo_high_appears_while_a_replay_streams``.
+* **Detection did not change.** The rules that decide *whether* a strong high /
+  very strong high / algo candle / rejection block exists are the ones from the
+  book, and `bot/map.py` still contains exactly one implementation of each. In
+  round 4 `map.py` was byte-identical to the first `smc-radar` commit and the
+  same recorded BTC replay produced the same 1m zones at the same rate.
+* **Round 5 changes what is drawn and how it is ranked, not what is found.**
+  Three additions, all additive and all visible on every card:
+  1. **the rectangle is the order block** — it starts at the exact high/low the
+     pattern is about and extends to the far side of the last opposite-colour
+     candle with the biggest body (`ob` on every zone). Before, the box was the
+     body of the pivot candle, which is why a rectangle could look tiny and still
+     say "active" after price had already been through the area.
+  2. **a market-regime gauge** (Kaufman efficiency ratio + Wilder ADX) per
+     instrument and timeframe, exposed live as `now_trend` and per zone as
+     `trend` (the regime when it formed) and `entry_trend` (the regime at the
+     touch).
+  3. **a grade** (A+ … C, score 0–100) built from measured features and
+     **calibrated on 90 days of real 1m BTC** — see
+     [`docs/quality-btcusdt-1m.md`](docs/quality-btcusdt-1m.md). Reproduce it
+     with `python tools/zone_quality.py --csv data/btc90/BTCUSDT-1m-90d.csv
+     --timeframe 1m --horizon 240`.
+
+The default quality filter shows **A+ and A** (83% of those zones travel 2×ATR
+in your favour before the level is closed through, against 54% for C). Nothing
+is deleted: choose *everything, incl. thin / range* in the quality filter and
+every zone comes back, with the reason it was hidden shown on its card.
 
 ## 3. Settings (all of them are in `config.json`)
 
@@ -199,6 +226,13 @@ above, and two regression tests that pin it:
 | `max_zone_age` | 2000 | bars before an unmoved zone is retired |
 | `mitigation_mode` | `zone` | `zone` = price enters the block, `level` = the exact high/low |
 | `sessions` | Asia 0–8, London 7–16, NY 12–21 (UTC) | session edges for rejection blocks |
+| `ob_lookback` | 8 | how many candles are searched for the order-block candle |
+| `ob_min_height_atr` | 0.12 | a rectangle is never thinner than this × ATR |
+| `trend_lookback` | 40 | bars behind the efficiency ratio |
+| `trend_er_min` | 0.25 | efficiency ratio at/above which the market counts as trending |
+| `trend_adx_min` | 18 | and the ADX(14) must agree |
+| `confluence_tol_atr` | 0.5 | "the same level" is within this × ATR |
+| `confluence_age` | 400 | bars a strong level stays relevant for confluence |
 
 Live-only keys (top level of `config.json`):
 
@@ -212,10 +246,11 @@ Live-only keys (top level of `config.json`):
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 32 passed
+../.venv/bin/python -m pytest tests -q                 # 40 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
+../.venv/bin/python tools/zone_quality.py --csv data/btc90/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
-cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs
+cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node quality.mjs
 ```
 
 The scan above runs on **real Binance 1-minute candles** for BTCUSDT,
@@ -240,7 +275,29 @@ Tests (`tests/test_map.py`, `tests/test_engine.py`) pin the definitions:
 * the engine turns real candles into every timeframe, keeps 240 bars, pushes a
   JSON state, and a settings change from the UI lands in `config.json`.
 
-New in this round, all covered by `tests/` and `tools/`:
+New in round 5, all covered by `tests/` and `tools/`:
+
+* the rectangle **starts at the exact high/low** and reaches the far side of the
+  **biggest opposite-colour candle** (green at a high, red at a low) —
+  `test_high_block_starts_at_the_exact_high_and_marks_the_order_block_candle`,
+  `test_low_block_mirrors_it_with_a_red_candle`;
+* a block can never collapse to a line (`test_block_never_collapses_to_a_line`;
+  found by `tools/ui/quality.mjs`, which caught a zero-height box on real data);
+* the regime gauge separates a trend from a range
+  (`test_regime_separates_a_trend_from_a_range`);
+* every zone carries a grade, and a thicker block scores higher
+  (`test_every_zone_carries_a_grade_and_its_reason`,
+  `test_a_thin_block_scores_below_a_thick_one`);
+* the API and the push carry the grade, the live regime, the order-block candle
+  and the confluence, and **no zone is ever "active" while carrying a mitigation
+  time** (`test_every_pushed_zone_carries_its_grade_and_live_regime`,
+  `test_the_zone_api_serves_the_same_fields_and_never_hides_mitigation`);
+* `tools/ui/quality.mjs` checks the page end to end: the grade chips, the live
+  regime, the quality filter narrowing and widening, the rectangles appearing on
+  the chart, the `OB` marker, **vertical drag**, keyboard panning and the
+  full-screen button.
+
+Older coverage, unchanged:
 
 * a **dead socket** (`connected: true`, nothing ever delivered) still produces
   closed candles **and** ticks, without duplicating candles in the chart
@@ -293,7 +350,18 @@ candle path by a test that feeds an unfinished 1m bar and reads it back through
   link; here the same candle appears on each timeframe separately, and it is
   your call which one is the HTF. The tags make that visible, but the app does
   not yet draw the HTF↔LTF pair as one object.
-* **This is a map, not a strategy.** It does not say buy or sell, has no stop or
-  target, and no win rate is claimed. Nothing here has been backtested for edge —
-  adding a number to a structure would be exactly the invented rule we agreed
-  not to add.
+* **This is a map, not a strategy.** It does not say buy or sell, and it has no
+  stop or target of its own. The one number it does defend is the **grade**, and
+  the study behind it is published with its data, its method and its limits
+  ([`docs/quality-btcusdt-1m.md`](docs/quality-btcusdt-1m.md)). That study
+  measures how far a zone travels after price comes back into it; it is not a
+  profit curve, and it is BTC 1m only. Re-run the command for another market
+  before trusting the same weights there.
+* **The grade is a ranking, not a guarantee.** A+ and A have the same 2-ATR hit
+  rate (83%); A+ is kept for its larger average travel. C zones still work about
+  half the time — they are ranked last, not declared wrong.
+* **The "tradeable now" badge is the book's rule, not a measured edge.** With a
+  fixed 1–2 ATR target, trend alignment at the touch showed no difference
+  (77% vs 76%); with the *next liquidity pool* as the target an earlier version
+  of the study showed 62% vs 35%, because in a trend price simply travels
+  further. Both numbers are in the report; neither is a promise.

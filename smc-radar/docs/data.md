@@ -62,8 +62,16 @@ The verification in `README.md` uses real Binance 1-minute data for BTCUSDT,
 smc-radar/data/btc/BTCUSDT-1m-2025-01.csv
 ```
 
-That folder is **git-ignored** (see the root `.gitignore`): market data is
-downloaded, never committed. To rebuild the file, concatenate daily
+The quality study (`tools/zone_quality.py`, results in
+`docs/quality-btcusdt-1m.md`) uses a longer file built the same way, 1 January –
+31 March 2025:
+
+```
+smc-radar/data/btc90/BTCUSDT-1m-90d.csv          # 129,600 real 1m candles
+```
+
+Both files live in a folder that is **git-ignored** (see the root `.gitignore`):
+market data is downloaded, never committed. To rebuild the file, concatenate daily
 `BTCUSDT-1m-YYYY-MM-DD.csv` files from any real provider (the public
 `Thaum-blip/TradinBot` dataset was used while building this) — the app does not
 care where the file came from, only that the candles are real.

@@ -6,7 +6,7 @@
 //   node transports.mjs            (BASE=http://localhost:8800)
 import { JSDOM } from "jsdom";
 import WebSocket from "ws";
-import { EventSource } from "eventsource";
+import EventSource from "eventsource";   // CJS package: the class is the default export
 
 const BASE = process.env.BASE || "http://localhost:8800";
 const fail = [];
