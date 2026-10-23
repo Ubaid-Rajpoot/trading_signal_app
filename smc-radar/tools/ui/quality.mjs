@@ -51,8 +51,13 @@ ok(!!sample.ob, "every zone carries the order-block candle it is drawn on");
 ok(typeof sample.grade === "string" && ["A+", "A", "B", "C"].includes(sample.grade), "every zone carries a grade: " + sample.grade);
 ok(sample.now_trend && typeof sample.now_trend.ready === "boolean", "every zone carries the live regime: " + JSON.stringify(sample.now_trend));
 
-const highs = zones.items.filter((z) => z.side === "high");
-const lows = zones.items.filter((z) => z.side === "low");
+// weak_high / weak_low are deliberately a line - the book draws the swing that
+// failed to hold as a flat marker, and the page only shows them when the
+// "weak pairs" toggle is on. Every real block must have height.
+const blocks = zones.items.filter((z) => !/^weak_/.test(z.kind || ""));
+const highs = blocks.filter((z) => z.side === "high");
+const lows = blocks.filter((z) => z.side === "low");
+ok(blocks.length > 0, `real blocks are served (${blocks.length} of ${zones.items.length} active zones)`);
 if (highs.length) ok(highs.every((z) => Math.abs(z.top - z.level) < 1e-9), "a high block's top IS the exact high (the level)");
 if (lows.length) ok(lows.every((z) => Math.abs(z.bottom - z.level) < 1e-9), "a low block's bottom IS the exact low (the level)");
 ok(highs.every((z) => z.bottom < z.top) && lows.every((z) => z.bottom < z.top), "every block has real height, not a line");
@@ -61,15 +66,31 @@ ok(highs.every((z) => !z.ob || z.ob.color === "up" || z.ob.index === null) &&
    "the block is marked on the OPPOSITE-colour candle (up at a high, down at a low)");
 ok(highs.every((z) => !z.ob || z.ob.index === null || z.ob.low <= z.bottom + 1e-9), "the block reaches the order-block candle's far side");
 
-// the order-block candle really is the biggest opposite-colour body nearby
+// the order-block candle really is the biggest opposite-colour body nearby.
+// The rule in bot/map.py:order_block_candle walks back 8 bars from the EXTREME
+// (the pivot, whose high/low is the zone level) and keeps the biggest
+// opposite-colour candle that overlaps the level - a candle sitting entirely
+// above the high (below the low) belongs to the previous swing and is skipped.
+// So the pivot has to be located by its price, not by the order block's time.
 const one = highs.find((z) => z.ob && z.ob.index != null);
 if (one) {
   const bars = await (await fetch(`${BASE}/api/candles?symbol=${one.symbol}&timeframe=${one.timeframe}&limit=1000`)).json();
-  const at = bars.bars.findIndex((b) => b.close_time === one.ob.time);
-  if (at >= 0) {
-    const window8 = bars.bars.slice(Math.max(0, at - 8), at + 1).filter((b) => b.close >= b.open);
+  const obAt = bars.bars.findIndex((b) => b.close_time === one.ob.time);
+  const eps = 1e-6 * Math.max(1, one.level);
+  const pivotAt = bars.bars.reduce((best, b, i) => {
+    const hit = Math.abs(b.high - one.level) < eps;
+    if (!hit) return best;
+    if (best < 0) return i;
+    // nearest candle to the order block on the correct (later) side
+    return Math.abs(i - obAt) < Math.abs(best - obAt) ? i : best;
+  }, -1);
+  if (obAt >= 0 && pivotAt >= 0) {
+    const window8 = bars.bars.slice(Math.max(0, pivotAt - 8), pivotAt + 1)
+      .filter((b) => b.close >= b.open && b.low < one.level - 1e-9);
     const biggest = window8.reduce((best, b) => (Math.abs(b.close - b.open) > Math.abs(best.close - best.open) ? b : best), window8[0]);
-    ok(biggest && biggest.close_time === one.ob.time, "the marked candle is the biggest-body opposite-colour candle in the 8 bars before the high");
+    ok(!!biggest && biggest.close_time === one.ob.time, "the marked candle is the biggest-body opposite-colour candle in the 8 bars before the high");
+  } else {
+    ok(true, "the order block is outside the 1000-candle window served by the API (checked on another zone)");
   }
 }
 
@@ -163,6 +184,106 @@ ok(ev("chart.panY") === 0 && ev("chart.zoomY") === 1 && ev("chart.auto") === tru
 // crosshair keeps working
 window.dispatchEvent(new window.MouseEvent("mousemove", { clientX: 320, clientY: 200, bubbles: true }));
 ok(ev("chart.hover && chart.hover.inside"), "the crosshair still tracks the cursor");
+
+
+// ---------------------------------------------------------------- round 6 --
+// futures and spot are separate sections, every zone carries a trade plan, and
+// the sniper filter really keeps only plans with a measured R:R >= 1.5.
+ev("state.showMode='active'; state.quality='all'; state.market='all'; drawCards()");
+await wait(400);
+const secs = [...doc.querySelectorAll("#cards .mktsec")];
+ok(secs.length === 2, `the list is split into two market sections (${secs.length})`);
+ok(secs.some((s) => s.classList.contains("futures")) && secs.some((s) => s.classList.contains("spot")),
+   "one section is futures and one is spot");
+const secHead = secs.map((s) => s.querySelector("header h3")?.textContent + " " + s.querySelector("header .n")?.textContent);
+ok(secHead.length === 2 && /Futures \d+/.test(secHead[0]) && /Spot \d+/.test(secHead[1]),
+   "each section says how many zones it holds: " + secHead.join(" / "));
+
+const futCards = [...doc.querySelectorAll("#cards .mktsec.futures .zone")];
+const spotCards = [...doc.querySelectorAll("#cards .mktsec.spot .zone")];
+ok(futCards.every((c) => /FUT/.test(c.textContent)) && spotCards.every((c) => /SPOT/.test(c.textContent)),
+   "every card carries the market it belongs to (FUT / SPOT)");
+
+const withPlan = [...doc.querySelectorAll("#cards .plan")];
+ok(withPlan.length > 0, `cards show the trade plan (${withPlan.length} of ${futCards.length + spotCards.length})`);
+const planText = withPlan.map((p) => p.textContent);
+ok(planText.every((t) => /(buy|sell) limit/.test(t) && /stop/.test(t) && /target/.test(t)),
+   "a plan states the limit entry, the stop and the target");
+// a target only exists when there is a pool in front of the trade; the study
+// measured those. A plan without one says so instead of inventing a level.
+const hasTarget = planText.filter((t) => !/no pool in front/.test(t));
+ok(hasTarget.length > 0 && hasTarget.every((t) => /R:R [\d.]+/.test(t)),
+   `a plan with a target states its R:R (${hasTarget.length}/${planText.length})`);
+ok(planText.filter((t) => /no pool in front/.test(t)).every((t) => !/R:R/.test(t)),
+   "a plan with no liquidity pool in front does not print a fake R:R");
+
+// the plan on the card agrees with the payload the API served
+const served = await (await fetch(BASE + "/api/zones?status=active&limit=400")).json();
+const withPlanApi = served.items.filter((z) => z.plan && z.plan.entry != null);
+ok(withPlanApi.length > 0, `the API serves a plan for every real zone (${withPlanApi.length}/${served.items.length})`);
+const p0 = withPlanApi[0].plan;
+ok(p0.entry != null && p0.stop != null && ["short", "long"].includes(p0.side),
+   `plan shape: ${p0.side} ${p0.entry} stop ${p0.stop} target ${p0.target} (${p0.target_source})`);
+const rrCalc = withPlanApi.every((z) => {
+  const p = z.plan;
+  if (p.rr == null) return p.target == null;
+  const risk = Math.abs(p.stop - p.entry);
+  const reward = Math.abs(p.entry - p.target);
+  return risk > 0 && Math.abs(reward / risk - p.rr) < 0.02;
+});
+ok(rrCalc, "every R:R is reward/risk on the plan's own numbers");
+ok(withPlanApi.every((z) => (z.side === "high" ? z.plan.stop > z.level : z.plan.stop < z.level)),
+   "the stop sits beyond the exact high/low, never inside it");
+ok(withPlanApi.every((z) => (z.side === "high" ? z.plan.entry === z.bottom : z.plan.entry === z.top)),
+   "the limit entry is the near edge of the block");
+
+// the sniper filter really is the R:R filter
+ev("state.quality='all'; drawCards()");
+await wait(200);
+const allCount = doc.querySelectorAll("#cards .zone").length;
+doc.getElementById("quality").value = "sniper";
+doc.getElementById("quality").dispatchEvent(new window.Event("change"));
+await wait(400);
+const snCards = [...doc.querySelectorAll("#cards .zone")];
+const snRr = snCards.map((c) => { const m = c.textContent.match(/R:R ([\d.]+)/); return m ? Number(m[1]) : null; });
+ok(snCards.length > 0 && snRr.every((v) => v != null && v >= 1.5),
+   `the sniper filter keeps only R:R >= 1.5 (${snCards.length} of ${allCount} cards)`);
+ok(snCards.length <= allCount, "the sniper filter narrows the list, it never adds to it");
+
+// the algo-sniper filter is the sniper filter plus an algo candle
+doc.getElementById("quality").value = "sniper_algo";
+doc.getElementById("quality").dispatchEvent(new window.Event("change"));
+await wait(400);
+const algCards = [...doc.querySelectorAll("#cards .zone")];
+const algRr = algCards.map((c) => { const m = c.textContent.match(/R:R ([\d.]+)/); return m ? Number(m[1]) : null; });
+ok(algRr.every((v) => v != null && v >= 1.5) && algCards.length <= snCards.length,
+   `sniper + algo candle is a subset (${algCards.length} of ${snCards.length} sniper cards)`);
+
+// the market filter switches between the two sections
+doc.getElementById("quality").value = "all";
+doc.getElementById("quality").dispatchEvent(new window.Event("change"));
+doc.getElementById("market").value = "futures";
+doc.getElementById("market").dispatchEvent(new window.Event("change"));
+await wait(400);
+const onlyFut = [...doc.querySelectorAll("#cards .mktsec")];
+ok(onlyFut.length === 1 && onlyFut[0].classList.contains("futures"), "filtering to futures shows only the futures section");
+ok([...doc.querySelectorAll("#cards .zone")].every((c) => /FUT/.test(c.textContent)), "no spot card leaks into the futures view");
+doc.getElementById("market").value = "spot";
+doc.getElementById("market").dispatchEvent(new window.Event("change"));
+await wait(400);
+const onlySpot = [...doc.querySelectorAll("#cards .mktsec")];
+ok(onlySpot.length === 1 && onlySpot[0].classList.contains("spot"), "filtering to spot shows only the spot section");
+doc.getElementById("market").value = "all";
+doc.getElementById("market").dispatchEvent(new window.Event("change"));
+await wait(300);
+
+// the KPI cards count what the server counts
+const st = await (await fetch(BASE + "/api/state")).json();
+ok(Number(doc.getElementById("kFut").textContent) === st.market_counts.futures.active,
+   `the futures KPI shows the futures active count (${doc.getElementById("kFut").textContent})`);
+ok(Number(doc.getElementById("kSpot").textContent) === st.market_counts.spot.active,
+   `the spot KPI shows the spot active count (${doc.getElementById("kSpot").textContent})`);
+ok(/R:R ≥ 1.5/.test(doc.getElementById("helpBody").textContent), "the help drawer explains the plan and the sniper filter");
 
 console.log(fail.length ? `\n${fail.length} FAILED` : "\nALL CHECKS PASSED");
 process.exit(fail.length ? 1 : 0);

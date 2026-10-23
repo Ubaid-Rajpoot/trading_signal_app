@@ -136,6 +136,50 @@ def outcome(zone, bars: list[dict], atr: list[float | None], horizon: int) -> di
     }
 
 
+def plan_outcome(zone, bars: list[dict], horizon: int) -> dict | None:
+    """Trade the zone's own plan: limit at the block edge, stop beyond the level,
+    target at the next liquidity pool.
+
+    * the limit **fills** the first time price trades back to the entry,
+    * then the first of stop / target decides the trade; if both can be touched
+      inside the same candle the **stop** is assumed (conservative),
+    * the result is reported in R, so groups with different stop distances are
+      still comparable.
+    """
+    plan = getattr(zone, "plan", None)
+    if not plan or plan.get("target") is None or not plan.get("rr"):
+        return None
+    entry = float(plan["entry"])
+    stop = float(plan["stop"])
+    target = float(plan["target"])
+    short = plan["side"] == "short"
+    start = int(zone.index) + 1
+    if start >= len(bars):
+        return None
+    filled_at = None
+    for i in range(start, min(len(bars), start + horizon)):
+        bar = bars[i]
+        if (short and float(bar["high"]) >= entry) or ((not short) and float(bar["low"]) <= entry):
+            filled_at = i
+            break
+    if filled_at is None:
+        return {"plan": "no fill", "filled": False, "result": "no fill", "r": 0.0, "bars": None}
+    for i in range(filled_at, min(len(bars), filled_at + horizon)):
+        bar = bars[i]
+        hit_stop = float(bar["high"]) >= stop if short else float(bar["low"]) <= stop
+        hit_target = float(bar["low"]) <= target if short else float(bar["high"]) >= target
+        if hit_stop:
+            return {"plan": "stopped", "filled": True, "result": "stopped", "r": -1.0, "bars": i - filled_at}
+        if hit_target:
+            return {"plan": "target", "filled": True, "result": "target", "r": float(plan["rr"]), "bars": i - filled_at}
+    last = bars[min(len(bars) - 1, filled_at + horizon - 1)]
+    if short:
+        r = (entry - float(last["close"])) / max(1e-12, stop - entry)
+    else:
+        r = (float(last["close"]) - entry) / max(1e-12, entry - stop)
+    return {"plan": "open", "filled": True, "result": "open", "r": round(r, 3), "bars": horizon}
+
+
 def bucket(value, edges, labels) -> str:
     if value is None:
         return "n/a"
@@ -168,6 +212,8 @@ def main() -> int:
     parser.add_argument("--timeframe", default="1m")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--horizon", type=int, default=120, help="bars to follow a zone after entry")
+    parser.add_argument("--mode", choices=("zone", "plan"), default="zone",
+                        help="zone = did price travel in favour; plan = trade the entry/stop/target")
     parser.add_argument("--json", default="", help="write the full table here")
     parser.add_argument("--min-grade", default="", help="only count zones at or above this grade")
     args = parser.parse_args()
@@ -194,12 +240,14 @@ def main() -> int:
     for zone in zones:
         if zone.kind.startswith("weak_"):
             continue
-        res = outcome(zone, bars, atr, args.horizon)
+        res = plan_outcome(zone, bars, args.horizon) if args.mode == "plan" else outcome(zone, bars, atr, args.horizon)
         if res is None:
             continue
         rows.append(
             {
                 "kind": zone.kind,
+                "rr": (zone.plan or {}).get("rr"),
+                "result": res.get("result"),
                 "side": zone.side,
                 "grade": zone.grade,
                 "score": zone.score,

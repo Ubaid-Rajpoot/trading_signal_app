@@ -75,6 +75,10 @@ DEFAULTS: dict[str, Any] = {
     "trend_adx_min": 18.0,      # and the ADX has to agree
     "confluence_tol_atr": 0.5,  # "the same level" means within this fraction of ATR
     "confluence_age": 400,      # bars a strong level stays relevant for confluence
+    # --- the execution plan that goes with every zone ------------------------
+    "plan_stop_atr": 0.10,      # stop distance beyond the exact high/low, in ATR
+    "plan_pool_bars": 120,      # how far back the next liquidity pool is looked for
+    "plan_pool_age": 600,       # bars a strong level stays a valid target
     "sessions": [            # UTC, inclusive start, exclusive end
         {"name": "Asia", "start": 0, "end": 8},
         {"name": "London", "start": 7, "end": 16},
@@ -174,6 +178,14 @@ class Zone:
     disp_atr: float | None = None
     block_atr: float | None = None
     swept_major: bool = False
+    # entry / stop / target, from the book's own exit rule (next liquidity)
+    plan: dict[str, Any] | None = None
+    # and what happened to it: waiting -> filled -> target | stopped
+    plan_state: str = "waiting"
+    plan_filled_at: int | None = None
+    plan_filled_price: float | None = None
+    plan_result_at: int | None = None
+    plan_result_r: float | None = None
 
     @property
     def key(self) -> str:
@@ -231,7 +243,17 @@ class Zone:
             "disp_atr": self.disp_atr,
             "block_atr": self.block_atr,
             "swept_major": self.swept_major,
+            "plan": self.plan,
+            "plan_state": self.plan_state,
+            "plan_filled_at": self.plan_filled_at,
+            "plan_filled_price": self.plan_filled_price,
+            "plan_result_at": self.plan_result_at,
+            "plan_result_r": self.plan_result_r,
         }
+
+
+def isfinite_p(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
 
 
 # ------------------------------------------------------------------- helpers
@@ -617,6 +639,99 @@ class MarketMap:
                 out.append(text)
         return out
 
+    def next_liquidity(self, side: str, entry: float) -> tuple[float | None, str | None]:
+        """The next pool of liquidity on the other side of this trade.
+
+        This is the exit the trader asked for - "target = previous low/high" -
+        not an invented R multiple. Candidates, nearest first:
+
+        * a strong / very strong level of the opposite side already on the map,
+        * a minor swing low (for a short) or swing high (for a long),
+        * the lowest low (highest high) of the last ``plan_pool_bars`` candles.
+
+        Only levels in front of the entry count: above it for a short, below it
+        for a long.
+        """
+        atr = self.atr_now() or 0.0
+        closest: tuple[float, str] | None = None
+
+        def offer(price: float | None, label: str) -> None:
+            nonlocal closest
+            if price is None or not isfinite_p(price):
+                return
+            if side == HIGH:          # a short: the target is below the entry
+                if price >= entry:
+                    return
+                if closest is None or price > closest[0]:
+                    closest = (price, label)
+            else:                     # a long: the target is above the entry
+                if price <= entry:
+                    return
+                if closest is None or price < closest[0]:
+                    closest = (price, label)
+
+        for zone in self.zones:
+            if zone.side == side:
+                continue
+            if self.count - zone.created_index > int(self.cfg.get("plan_pool_age", 600)):
+                continue
+            label = "very strong level" if zone.kind.startswith("very_strong") else "strong level"
+            offer(float(zone.level), f"next {zone.kind.replace('_', ' ')}")
+        for pivot in self.minor:
+            if pivot.side == side:
+                continue
+            offer(float(pivot.price), "swing")
+
+        window = self._bars_list()[-int(self.cfg.get("plan_pool_bars", 120)) :]
+        if window:
+            if side == HIGH:
+                offer(min(float(b["low"]) for b in window), "session low")
+            else:
+                offer(max(float(b["high"]) for b in window), "session high")
+        if closest is None:
+            return None, None
+        if atr and abs(closest[0] - entry) < 0.25 * atr:
+            return None, None  # too close to be a target
+        return closest
+
+    def plan_for(self, zone: Zone) -> dict[str, Any]:
+        """Entry, stop and target for the trade this zone is about.
+
+        * **entry** - the near edge of the block (its bottom for a short from a
+          high, its top for a long from a low): the limit order fills the moment
+          price comes back into the block, which is what "mitigation" means.
+        * **stop** - ``plan_stop_atr`` ATR beyond the exact high/low. A wick
+          through the level is the invalidation the book describes, so the stop
+          sits just outside it.
+        * **target** - :meth:`next_liquidity`: the next pool of liquidity, the
+          trader's own exit rule.
+        """
+        atr = self.atr_now() or 0.0
+        buffer = float(self.cfg.get("plan_stop_atr", 0.10)) * atr
+        if buffer <= 0:
+            # no ATR yet (the first bars of a warm-up still produce zones): the
+            # stop must still sit *beyond* the level, so use a hair of the price
+            buffer = max(abs(float(zone.level)) * 1e-4, 1e-9)
+        high_side = zone.side == HIGH
+        entry = float(zone.bottom) if high_side else float(zone.top)
+        stop = float(zone.level) + buffer if high_side else float(zone.level) - buffer
+        target, source = self.next_liquidity(zone.side, entry)
+        risk = abs(stop - entry)
+        reward = abs(entry - target) if target is not None else None
+        rr = (reward / risk) if (risk > 0 and reward) else None
+        return {
+            "side": "short" if high_side else "long",
+            "entry": round(entry, 8),
+            "stop": round(stop, 8),
+            "target": round(target, 8) if target is not None else None,
+            "target_source": source,
+            "risk": round(risk, 8),
+            "reward": round(reward, 8) if reward is not None else None,
+            "rr": round(rr, 2) if rr is not None else None,
+            "entry_kind": "limit at the block edge",
+            "stop_kind": f"{self.cfg.get('plan_stop_atr', 0.10)} ATR beyond the level",
+        }
+
     def score_zone(self, zone: Zone, regime: dict[str, Any] | None = None) -> Zone:
         """Turn the evidence into one number, and say why.
 
@@ -717,6 +832,8 @@ class MarketMap:
                 )
         zone.confluence = self.confluence_at(zone.side, zone.level)
         self.score_zone(zone)
+        if zone.kind not in ("weak_high", "weak_low"):
+            zone.plan = self.plan_for(zone)
         self.zones.append(zone)
         # keep the list bounded: drop the oldest resolved zone first
         if len(self.zones) > 400:
@@ -752,6 +869,7 @@ class MarketMap:
         events: dict[str, Any] = {"pivots": [], "sweeps": [], "breaks": [], "zones": [], "resolved": []}
         self._confirm_pivots(index, events)
         self._resolve_zones(bar, index, events)
+        self._track_plans(bar, index, events)
         self._track_sweeps(bar, index, events)
         self.last_events = {k: v for k, v in events.items() if v}
         return events
@@ -1176,6 +1294,39 @@ class MarketMap:
             events["zones"].append(weak.as_dict())
         events["breaks"].append({"side": side, "level": opposite.price, "time": int(bar["close_time"])})
 
+    def _fill_plan(self, zone: Zone, index: int, at: float) -> None:
+        """Price came back into the block: the plan's limit order is filled."""
+        if zone.plan_state != "waiting":
+            return
+        zone.plan_state = "filled"
+        zone.plan_filled_at = int(at)
+        zone.plan_filled_price = zone.plan.get("entry") if zone.plan else zone.mitigated_price
+        # a target that the very same candle already reached counts as filled and done
+        if zone.plan and zone.plan.get("target") is not None:
+            bar = self._bars_list()[-1]
+            target = float(zone.plan["target"])
+            short = zone.plan.get("side") == "short"
+            if (short and float(bar["low"]) <= target) or ((not short) and float(bar["high"]) >= target):
+                zone.plan_state = "target"
+                zone.plan_result_at = int(at)
+                zone.plan_result_r = zone.plan.get("rr")
+
+    def _break_plan(self, zone: Zone, bar: dict) -> None:
+        """A close through the level: whatever the plan's state, the trade is over."""
+        if not zone.plan or zone.plan.get("target") is None:
+            return
+        if zone.plan_state in ("target", "stopped"):
+            return
+        if zone.plan_state == "waiting":
+            # price had to trade through the block to close beyond the level,
+            # so the limit filled first and the stop was taken
+            zone.plan_state = "filled"
+            zone.plan_filled_at = int(bar["close_time"])
+            zone.plan_filled_price = zone.plan.get("entry")
+        zone.plan_state = "stopped"
+        zone.plan_result_at = int(bar["close_time"])
+        zone.plan_result_r = -1.0
+
     def _entry_regime(self, zone: Zone) -> dict[str, Any]:
         """Regime at the touch, plus whether it agrees with the zone's trade."""
         regime = self.regime()
@@ -1204,6 +1355,7 @@ class MarketMap:
                     zone.status = "invalidated"
                     zone.invalidated_at = int(bar["close_time"])
                     zone.invalidated_price = close
+                    self._break_plan(zone, bar)
                     events["resolved"].append({"key": zone.key, "status": "invalidated"})
                     continue
                 reached = high >= zone.level if self.mitigation_mode == "level" else high >= zone.bottom
@@ -1215,12 +1367,14 @@ class MarketMap:
                     # highest point of the returning candle inside the block
                     zone.mitigated_price = high if self.mitigation_mode == "level" else min(high, zone.top)
                     zone.entry_trend = self._entry_regime(zone)
+                    self._fill_plan(zone, index, float(bar["close_time"]))
                     events["resolved"].append({"key": zone.key, "status": "mitigated"})
             else:
                 if close < zone.bottom:
                     zone.status = "invalidated"
                     zone.invalidated_at = int(bar["close_time"])
                     zone.invalidated_price = close
+                    self._break_plan(zone, bar)
                     events["resolved"].append({"key": zone.key, "status": "invalidated"})
                     continue
                 reached = low <= zone.level if self.mitigation_mode == "level" else low <= zone.top
@@ -1230,7 +1384,38 @@ class MarketMap:
                     zone.mitigated_index = index
                     zone.mitigated_price = low if self.mitigation_mode == "level" else max(low, zone.bottom)
                     zone.entry_trend = self._entry_regime(zone)
+                    self._fill_plan(zone, index, float(bar["close_time"]))
                     events["resolved"].append({"key": zone.key, "status": "mitigated"})
+
+    def _track_plans(self, bar: dict, index: int, events: dict) -> None:
+        """Follow a filled plan until it reaches its target or its stop.
+
+        This is bookkeeping, not a new rule: the target and the stop are the ones
+        already printed on the zone, and they are only ever checked on candles
+        that came **after** the entry filled. If a single candle can touch both,
+        the stop is assumed - the conservative reading.
+        """
+        high, low = float(bar["high"]), float(bar["low"])
+        for zone in self.zones:
+            if zone.plan_state != "filled" or not zone.plan:
+                continue
+            plan = zone.plan
+            stop, target = plan.get("stop"), plan.get("target")
+            if stop is None or target is None:
+                continue
+            short = plan.get("side") == "short"
+            hit_stop = high >= stop if short else low <= stop
+            hit_target = low <= target if short else high >= target
+            if hit_stop:
+                zone.plan_state = "stopped"
+                zone.plan_result_at = int(bar["close_time"])
+                zone.plan_result_r = -1.0
+                events["resolved"].append({"key": zone.key, "status": "plan_stopped"})
+            elif hit_target:
+                zone.plan_state = "target"
+                zone.plan_result_at = int(bar["close_time"])
+                zone.plan_result_r = plan.get("rr")
+                events["resolved"].append({"key": zone.key, "status": "plan_target"})
 
     # ------------------------------------------------------------------ view
     def counts(self) -> dict[str, int]:

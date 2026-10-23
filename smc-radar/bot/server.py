@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import config_store
 from .engine import Engine
+from .feed import is_futures, market_of, to_futures
 from .poller import RestPoller
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
@@ -247,7 +248,7 @@ def create_app(
         return JSONResponse(engine.snapshot())
 
     @app.get("/api/zones")
-    async def zones(status: str = "active", since: int = 0, limit: int = 1000) -> dict[str, Any]:
+    async def zones(status: str = "active", since: int = 0, limit: int = 1000, market: str = "all") -> dict[str, Any]:
         """``active``, ``mitigated``, ``invalidated``, ``resolved`` or ``all``.
 
         ``since`` (a candle timestamp) keeps the payload to zones that formed or
@@ -260,6 +261,8 @@ def create_app(
             items = [z for z in engine.zones.values() if z.get("status") != "active"]
         else:
             items = [z for z in engine.zones.values() if z.get("status") == status]
+        if market in ("spot", "futures"):
+            items = [z for z in items if (z.get("market") or market_of(z.get("symbol", ""))) == market]
         if since:
             items = [
                 z
@@ -320,6 +323,8 @@ def create_app(
     async def get_config() -> dict[str, Any]:
         return {
             "symbols": engine.symbols,
+            "spot_symbols": [s for s in engine.symbols if not is_futures(s)],
+            "futures_symbols": [s for s in engine.symbols if is_futures(s)],
             "timeframes": engine.timeframes,
             "exchange": engine.exchange,
             "settings": engine.settings,
@@ -329,6 +334,13 @@ def create_app(
         }
 
     # --------------------------------------------------------------- symbols
+    def _market_lists() -> dict[str, Any]:
+        """Spot and futures are stored in their own lists in config.json."""
+        return {
+            "symbols": [s for s in engine.symbols if not is_futures(s)],
+            "futures_symbols": [s for s in engine.symbols if is_futures(s)],
+        }
+
     def _persist(updates: dict[str, Any]) -> str | None:
         if getattr(feed, "source", "live") == "replay":
             # A replay is a demonstration: it must never overwrite the real
@@ -387,7 +399,7 @@ def create_app(
                 }
             )
 
-        problem = _persist({"symbols": list(engine.symbols)})
+        problem = _persist(_market_lists())
         if problem:
             warnings.append(problem)
         await engine._emit_state(force=True)  # noqa: SLF001 - same module boundary
@@ -415,27 +427,39 @@ def create_app(
         return universe_cache
 
     @app.get("/api/universe")
-    async def universe(force: int = 0) -> dict[str, Any]:
+    async def universe(force: int = 0, market: str = "all") -> dict[str, Any]:
         data = await _universe(force=bool(force))
+        items = data["items"]
+        if market in ("spot", "futures"):
+            items = [i for i in items if (i.get("market") or market_of(i["symbol"])) == market]
         return {
             "exchange": engine.exchange,
             "error": data["error"],
-            "count": len(data["items"]),
+            "count": len(items),
+            "futures": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "futures"]),
+            "spot": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "spot"]),
             "fetched_at": data["at"],
-            "items": data["items"][:4000],
+            "items": items[:4000],
         }
 
     @app.post("/api/universe/add")
     async def add_from_universe(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """``{"preset": "top50"|"all"}`` or ``{"symbols": [...]}`` from the browser."""
         preset = payload.get("preset")
+        market = str(payload.get("market") or "spot").lower()
         symbols = config_store.clean_symbols(payload.get("symbols") or [])
+        if market == "futures":
+            symbols = [to_futures(s) for s in symbols]
         warnings: list[str] = []
         data = await _universe()
         if preset:
             if data["error"]:
                 return {"ok": False, "error": data["error"], "added": []}
-            ranked = [item["symbol"] for item in data["items"]]
+            ranked = [
+                item["symbol"]
+                for item in data["items"]
+                if (item.get("market") or market_of(item["symbol"])) == market
+            ]
             if preset == "all":
                 symbols = ranked
             else:
@@ -463,7 +487,7 @@ def create_app(
         if added:
             feed.add_symbols(added)
             queue_warm(added)
-        problem = _persist({"symbols": list(engine.symbols)})
+        problem = _persist(_market_lists())
         if problem:
             warnings.append(problem)
         await engine._emit_state(force=True)  # noqa: SLF001

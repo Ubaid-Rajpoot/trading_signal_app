@@ -26,7 +26,15 @@ import uvicorn  # noqa: E402
 
 from bot import config_store  # noqa: E402
 from bot.engine import Engine  # noqa: E402
-from bot.feed import FeedError, ReplayFeed, make_feed  # noqa: E402
+from bot.feed import (  # noqa: E402
+    FeedError,
+    MexcFuturesFeed,
+    ReplayFeed,
+    is_futures,
+    make_feed,
+    make_market_feed,
+    to_futures,
+)
 from bot.server import create_app  # noqa: E402
 
 CONFIG_PATH = ROOT / "config.json"
@@ -39,9 +47,16 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         raise SystemExit(f"{path} is not valid JSON: {exc}")
 
 
+def market_symbols(config: dict) -> list[str]:
+    """Spot pairs and futures contracts in one list, without duplicates."""
+    spot = [str(s) for s in (config.get("symbols") or [])]
+    futures = [to_futures(s) for s in (config.get("futures_symbols") or [])]
+    return list(dict.fromkeys(spot + futures))
+
+
 def make_engine(config: dict) -> Engine:
     return Engine(
-        symbols=config["symbols"],
+        symbols=market_symbols(config),
         timeframes=config["timeframes"],
         settings=config.get("settings"),
         preview_max_symbols=int(config.get("preview_max_symbols", 200)),
@@ -49,6 +64,18 @@ def make_engine(config: dict) -> Engine:
 
 
 async def check(config: dict, exchange: str) -> int:
+    if exchange == "mexc" and (config.get("futures_symbols") or []):
+        spot = [s for s in (config.get("symbols") or []) if not is_futures(s)]
+        futures = [to_futures(s) for s in (config.get("futures_symbols") or [])]
+        print("0) MEXC futures REST ...")
+        try:
+            feed = MexcFuturesFeed(futures[:1] or ["BTC_USDT"])
+            bars = await feed.history(feed.symbols[0], "1m", 10)
+            print(f"   OK  {len(bars)} futures candles, last close {bars[-1]['close']} ({feed.symbols[0]})")
+        except Exception as exc:
+            print(f"   FAIL  {type(exc).__name__}: {exc}")
+            print("   -> futures REST is not reachable; spot can still work.")
+        config = {**config, "symbols": spot or config["symbols"]}
     symbol = config["symbols"][0] if config.get("symbols") else "BTCUSDT"
     print(f"1) {exchange} REST history for {symbol} ...")
     feed = make_feed(exchange, [symbol])
@@ -83,14 +110,19 @@ async def check(config: dict, exchange: str) -> int:
     return 0
 
 
-async def universe(exchange: str, top: int) -> int:
-    feed = make_feed(exchange, [])
+async def universe(exchange: str, top: int, market: str = "spot") -> int:
+    if market == "futures":
+        feed = MexcFuturesFeed([])
+    else:
+        feed = make_feed(exchange, [])
     try:
         items = await feed.universe()
     except Exception as exc:
         print(f"FAIL {type(exc).__name__}: {exc}")
         return 1
-    print(f"{len(items)} USDT pairs on {exchange} (by 24h turnover):")
+    if market == "futures":
+        items = [i for i in items if is_futures(i["symbol"])]
+    print(f"{len(items)} USDT {market} instruments on {exchange} (by 24h turnover):")
     for item in items[:top]:
         print(f"  {item['symbol']:<16} {item['price']:>14,.8g}  {item['change']:>7.2f}%  {item['turnover']:>16,.0f}")
     print("\nAdd any of them from the web page, or: python run.py serve --symbols BTCUSDT,ETHUSDT")
@@ -137,6 +169,8 @@ def main() -> int:
     ap.add_argument("--symbols", default="", help="comma-separated override, e.g. BTCUSDT,ETHUSDT")
     ap.add_argument("--exchange", default="", help="mexc (default) or binance")
     ap.add_argument("--top", type=int, default=20, help="universe: how many to print")
+    ap.add_argument("--futures", default="", help="comma-separated futures contracts, e.g. BTC_USDT,ETH_USDT")
+    ap.add_argument("--market", default="", choices=["", "spot", "futures"], help="universe: which market to list")
     ap.add_argument("--port", type=int, default=0, help="override the port from config.json")
     ap.add_argument("--host", default="", help="override the host from config.json")
     ap.add_argument("--preroll", type=int, default=2400, help="replay: candles loaded before streaming starts")
@@ -146,7 +180,9 @@ def main() -> int:
     config_path = Path(args.config)
     config = load_config(config_path)
     if args.symbols:
-        config["symbols"] = config_store.clean_symbols(args.symbols.split(","))
+        config["symbols"] = [s for s in config_store.clean_symbols(args.symbols.split(",")) if not is_futures(s)]
+    if args.futures:
+        config["futures_symbols"] = [to_futures(s) for s in config_store.clean_symbols(args.futures.split(","))]
     if args.exchange:
         config["exchange"] = args.exchange
     exchange = str(config.get("exchange", "mexc")).lower()
@@ -155,11 +191,15 @@ def main() -> int:
         return asyncio.run(check(config, exchange))
 
     if args.command == "universe":
-        return asyncio.run(universe(exchange, args.top))
+        return asyncio.run(universe(exchange, args.top, args.market or "spot"))
 
     if args.command == "serve":
         try:
-            feed = make_feed(exchange, config["symbols"])
+            feed = make_market_feed(
+                exchange,
+                [s for s in config["symbols"] if not is_futures(s)],
+                [to_futures(s) for s in (config.get("futures_symbols") or [])],
+            )
         except FeedError as exc:
             print(f"feed error: {exc}")
             return 2
@@ -172,7 +212,7 @@ def main() -> int:
     try:
         feed = ReplayFeed(
             data_dir,
-            config["symbols"],
+            market_symbols(config),
             speed=args.speed,
             loop=True,
             skip=max(0, args.preroll),

@@ -1,11 +1,40 @@
 {
   "exchange": "mexc",
   "symbols": [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
-    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
-    "LINKUSDT", "TONUSDT", "SUIUSDT", "PEPEUSDT"
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "TONUSDT",
+    "SUIUSDT",
+    "PEPEUSDT"
   ],
-  "timeframes": ["1m", "5m", "15m", "30m", "1h"],
+  "futures_symbols": [
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "BNB_USDT",
+    "XRP_USDT",
+    "DOGE_USDT",
+    "ADA_USDT",
+    "AVAX_USDT",
+    "LINK_USDT",
+    "TON_USDT",
+    "SUI_USDT",
+    "PEPE_USDT"
+  ],
+  "timeframes": [
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h"
+  ],
   "max_symbols": 400,
   "rest_poll_seconds": 6,
   "rest_poll_quiet_after": 45,
@@ -23,10 +52,25 @@
     "mitigation_mode": "zone",
     "atr_period": 14,
     "sessions": [
-      {"name": "Asia", "start": 0, "end": 8},
-      {"name": "London", "start": 7, "end": 16},
-      {"name": "New York", "start": 12, "end": 21}
+      {
+        "name": "Asia",
+        "start": 0,
+        "end": 8
+      },
+      {
+        "name": "London",
+        "start": 7,
+        "end": 16
+      },
+      {
+        "name": "New York",
+        "start": 12,
+        "end": 21
+      }
     ]
   },
-  "server": {"host": "0.0.0.0", "port": 8800}
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8800
+  }
 }

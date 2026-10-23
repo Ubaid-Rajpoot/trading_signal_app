@@ -13,7 +13,7 @@
 
 ```bash
 cd smc-radar
-python tools/zone_quality.py --csv data/btc90/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
+python tools/zone_quality.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 ```
 
 * Data: real Binance/BTCUSDT 1m klines, **1 Jan – 31 Mar 2025**, 129,600 candles

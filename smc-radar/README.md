@@ -5,13 +5,21 @@ not invent an entry model: it maps the four structures from the trader's own
 order-block book, on every instrument it is given, on every timeframe, and it
 keeps each one on screen — with the time it formed — **until price mitigates it**.
 
+**Futures and spot are separate markets** with their own lists, their own
+candles and their own section on the page, and **every zone carries a trade
+plan** — limit entry at the block edge, stop just beyond the exact high/low,
+target at the next liquidity pool — with its live state and its R:R. What that
+plan was measured to do on 90 days of real 1m BTC is in
+[`docs/plan-btcusdt-1m.md`](docs/plan-btcusdt-1m.md).
+
 ```bash
 cd smc-radar
 python run.py serve                       # live: MEXC, every symbol you add
-python run.py replay data/btc 40          # replay recorded candles: 2400 loaded first,
-                                          # and each candle shown forming (--ticks 4)
-python run.py check                       # can this machine reach the exchange?
-python run.py universe --top 20           # what the exchange lists, biggest first
+python run.py replay data 40              # replay BOTH markets (spot + futures files):
+                                          # 4800 candles loaded first, then streamed
+python run.py check                       # can this machine reach MEXC (spot AND futures)?
+python run.py universe --top 20                    # spot pairs, biggest turnover first
+python run.py universe --top 20 --market futures   # contracts, biggest turnover first
 python tools/scan_now.py --preset top20   # one-shot scan, prints a table
 ```
 
@@ -78,8 +86,9 @@ its resolution time and price; the tape keeps the record; only a zone older than
   live count of *active* zones of that kind.
 * **Filters** — symbol search, timeframe chips, **view: active only / active +
   recently mitigated (default) / everything**, a window selector (15 min … 24 h),
-  **quality: A+ and A (default) / A+ only / tradeable now / on a strong level /
-  everything**, weak
+  **market: futures + spot (default) / futures only / spot only**, **quality:
+  A+ and A (default) / A+ only / sniper (R:R ≥ 1.5) / sniper + algo candle /
+  tradeable now / on a strong level / everything**, weak
   pairs, sort by newest / closest to price / strongest evidence / symbol.
   Active zones always lead the list; a resolved zone keeps its card, dimmed,
   with the time it formed **and** the time and price that mitigated it. That is
@@ -203,13 +212,45 @@ refresh returns only new bars, and both SSE and the websocket push.
   3. **a grade** (A+ … C, score 0–100) built from measured features and
      **calibrated on 90 days of real 1m BTC** — see
      [`docs/quality-btcusdt-1m.md`](docs/quality-btcusdt-1m.md). Reproduce it
-     with `python tools/zone_quality.py --csv data/btc90/BTCUSDT-1m-90d.csv
+     with `python tools/zone_quality.py --csv study-data/BTCUSDT-1m-90d.csv
      --timeframe 1m --horizon 240`.
 
 The default quality filter shows **A+ and A** (83% of those zones travel 2×ATR
 in your favour before the level is closed through, against 54% for C). Nothing
 is deleted: choose *everything, incl. thin / range* in the quality filter and
 every zone comes back, with the reason it was hidden shown on its card.
+
+### Round 6 — two markets and a trade plan
+
+* **Futures is a first-class market, not a spot alias.** `bot/feed.py` has
+  `MexcFuturesFeed` (contract REST + contract websocket) and `CompositeFeed`,
+  which routes each symbol to its own market's feed and merges the queue;
+  `market_of()` tags a symbol as `futures` whenever it is written the contract
+  way (`BTC_USDT`). The engine stamps `market` on every zone and reports
+  `market_counts`; the API serves `/api/zones?market=`, `/api/universe?market=`
+  and persists **two** lists (`symbols`, `futures_symbols`). The page shows two
+  sections, **futures first**, each with its own count, its own KPI card, and a
+  `FUT` / `SPOT` badge on every card. The market filter shows one, the other, or
+  both.
+* **Every zone carries a trade plan** (entry / stop / target / R:R) and its live
+  state: `waiting for the entry` → `filled` → `target hit` / `stopped out`. The
+  entry is the block edge, the stop is `0.10 × ATR` beyond the exact high/low,
+  the target is `next_liquidity()` — the next strong level, swing or session
+  extreme in front of the trade, i.e. the user's own exit rule. A zone with no
+  pool in front says *"no pool in front"* rather than inventing a level.
+* **Two new quality filters** — `sniper · R:R ≥ 1.5` and
+  `sniper · R:R ≥ 1.5 + algo candle`. They exist because the study found them to
+  be the only subsets with a clearly positive expectancy on the 90-day sample
+  (+0.80 R and +0.96 R per trade), while every plan together is −0.11 R.
+* **The replay plays both markets at once.** `ReplayFeed` merges the CSV files
+  on time (one cursor per file, oldest candle first) instead of playing one file
+  after the other — otherwise one section would freeze while the other
+  streamed, which is not what two feeds look like. `chart.mjs` caught exactly
+  that: its "the newest candle is the one still forming" check failed while the
+  spot file was finished and the futures file had not started.
+* **Nothing was deleted.** Detection, grading and the round-5 drawing are
+  unchanged; the default quality filter is still A+ and A; old modes are one
+  click away.
 
 ## 3. Settings (all of them are in `config.json`)
 
@@ -233,6 +274,9 @@ every zone comes back, with the reason it was hidden shown on its card.
 | `trend_adx_min` | 18 | and the ADX(14) must agree |
 | `confluence_tol_atr` | 0.5 | "the same level" is within this × ATR |
 | `confluence_age` | 400 | bars a strong level stays relevant for confluence |
+| `plan_stop_atr` | 0.10 | the stop sits this × ATR beyond the exact high/low |
+| `plan_pool_bars` | 120 | how far back the session extreme used as a target may be |
+| `plan_pool_age` | 600 | bars a strong level stays a valid target |
 
 Live-only keys (top level of `config.json`):
 
@@ -246,9 +290,10 @@ Live-only keys (top level of `config.json`):
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 40 passed
+../.venv/bin/python -m pytest tests -q                 # 45 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
-../.venv/bin/python tools/zone_quality.py --csv data/btc90/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
+../.venv/bin/python tools/zone_quality.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
+../.venv/bin/python tools/plan_study.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
 cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node quality.mjs
 ```
@@ -296,6 +341,18 @@ New in round 5, all covered by `tests/` and `tools/`:
   regime, the quality filter narrowing and widening, the rectangles appearing on
   the chart, the `OB` marker, **vertical drag**, keyboard panning and the
   full-screen button.
+* **Round 6**, also pinned by tests: every real zone carries a plan whose entry
+  is the block edge, whose stop is beyond the level and whose R:R is
+  reward/risk on its own numbers (`test_every_real_zone_carries_a_tradeable_plan`);
+  the plan fills on the retest and ends at its target
+  (`test_a_plan_fills_at_the_block_edge_and_ends_at_its_target`); a close
+  through the level stops it (`test_a_close_through_the_level_stops_the_plan`);
+  a flat weak marker never gets a plan; futures and spot are separate books
+  end to end (`test_futures_and_spot_are_separate_markets_end_to_end`,
+  `test_zones_and_universe_can_be_filtered_by_market`); and
+  `tools/ui/quality.mjs` asserts the two sections, the FUT/SPOT badges, the plan
+  block, the sniper filters, the market filter and the two KPI cards on the
+  running page.
 
 Older coverage, unchanged:
 
@@ -350,13 +407,22 @@ candle path by a test that feeds an unfinished 1m bar and reads it back through
   link; here the same candle appears on each timeframe separately, and it is
   your call which one is the HTF. The tags make that visible, but the app does
   not yet draw the HTF↔LTF pair as one object.
-* **This is a map, not a strategy.** It does not say buy or sell, and it has no
-  stop or target of its own. The one number it does defend is the **grade**, and
-  the study behind it is published with its data, its method and its limits
-  ([`docs/quality-btcusdt-1m.md`](docs/quality-btcusdt-1m.md)). That study
-  measures how far a zone travels after price comes back into it; it is not a
-  profit curve, and it is BTC 1m only. Re-run the command for another market
-  before trusting the same weights there.
+* **The plan is measured, not promised.** Round 6 gives every zone an entry, a
+  stop and a target, but that does not make the app a signal service with a win
+  rate: what it defends is **expectancy**, published with its data, method and
+  limits in [`docs/plan-btcusdt-1m.md`](docs/plan-btcusdt-1m.md) (90 days of
+  real 1m BTC, 9,541 trades, no fees or slippage). The headline is uncomfortable
+  and stays on the page: **all plans together are −0.11 R**, the sniper subset
+  (R:R ≥ 1.5) is +0.80 R, and **100 % accuracy does not exist** — a stop placed
+  outside the noise gets hit. Re-run the command for another instrument before
+  trusting the same numbers there.
+* **The futures candles in the replay are spot candles under a contract name.**
+  MEXC's contract API is unreachable from the build sandbox, so
+  `data/fut/BTC_USDT-1m-2025-01.csv` is real *spot* BTC data renamed (see
+  `data/fut/README.md`). It proves the plumbing — two markets, two feeds, two
+  sections, two persisted lists — not that contract candles behave differently.
+  On your machine the live futures feed uses `contract.mexc.com` and the
+  contract websocket, and `python run.py check` reports both markets.
 * **The grade is a ranking, not a guarantee.** A+ and A have the same 2-ATR hit
   rate (83%); A+ is kept for its larger average travel. C zones still work about
   half the time — they are ranked last, not declared wrong.

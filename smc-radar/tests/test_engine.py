@@ -591,3 +591,45 @@ def test_the_zone_api_serves_the_same_fields_and_never_hides_mitigation():
                 assert zone["bottom"] < zone["top"]
 
     asyncio.run(go())
+
+
+# ------------------------------------------------- round 6: futures vs spot
+def test_futures_and_spot_are_separate_markets_end_to_end():
+    rows = load(1200)
+    engine = Engine(symbols=["BTCUSDT", "BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+
+    async def go():
+        await engine.warmup(FakeFeed(rows))
+        return engine.snapshot()
+
+    state = asyncio.run(go())
+    assert state["markets"] == {"spot": ["BTCUSDT"], "futures": ["BTC_USDT"]}
+    counts = state["market_counts"]
+    assert counts["spot"]["symbols"] == 1 and counts["futures"]["symbols"] == 1
+    # every zone says which book it came from, and both books are being mapped
+    for zone in state["active"] + state["history"]:
+        assert zone["market"] in ("spot", "futures")
+        assert zone["market"] == ("futures" if "_" in zone["symbol"] else "spot")
+    assert counts["spot"]["zones"] > 0
+    assert counts["futures"]["zones"] > 0
+
+
+def test_zones_and_universe_can_be_filtered_by_market(tmp_path):
+    rows = load(1200)
+    engine = Engine(symbols=["BTCUSDT", "BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    config = {"symbols": ["BTCUSDT"], "futures_symbols": ["BTC_USDT"], "timeframes": ["5m"], "settings": {}}
+    app = create_app(config, FakeFeed(rows), engine, tmp_path / "config.json")
+
+    async def go():
+        await engine.warmup(FakeFeed(rows))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+            fut = (await client.get("/api/zones", params={"status": "all", "market": "futures"})).json()
+            spot = (await client.get("/api/zones", params={"status": "all", "market": "spot"})).json()
+            both = (await client.get("/api/zones", params={"status": "all"})).json()
+        return fut, spot, both
+
+    fut, spot, both = asyncio.run(go())
+    assert fut["items"] and spot["items"]
+    assert all(z["market"] == "futures" for z in fut["items"])
+    assert all(z["market"] == "spot" for z in spot["items"])
+    assert len(both["items"]) == len(fut["items"]) + len(spot["items"])

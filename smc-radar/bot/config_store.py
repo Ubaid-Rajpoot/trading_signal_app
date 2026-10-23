@@ -19,9 +19,18 @@ DEFAULT_SETTINGS: dict[str, Any] = dict(DEFAULTS)
 
 
 def clean_symbols(values: Any) -> list[str]:
+    """Upper-case instrument names, keeping the one separator that matters.
+
+    ``BTC_USDT`` is a futures contract and ``BTCUSDT`` is the spot pair, so the
+    underscore is kept (``BTC/USDT`` from a screenshot becomes ``BTC_USDT``);
+    every other stray character is still removed.
+    """
     out: list[str] = []
     for value in values or []:
-        symbol = "".join(ch for ch in str(value).upper().strip() if ch.isalnum())
+        raw = str(value).upper().strip().replace("/", "_").replace("-", "_")
+        symbol = "".join(ch for ch in raw if ch.isalnum() or ch == "_").strip("_")
+        while "__" in symbol:
+            symbol = symbol.replace("__", "_")
         if symbol and symbol not in out:
             out.append(symbol)
     return out

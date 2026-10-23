@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable
 from collections import deque
 
 from .buckets import TIMEFRAMES, Rollup
+from .feed import market_of, pretty_symbol
 from .map import DEFAULTS, KINDS, TREND_KINDS, MarketMap
 
 MAX_ZONES = 1200
@@ -54,6 +55,7 @@ class Engine:
         self.history: dict[tuple[str, str], deque] = {}
         self.partial: dict[tuple[str, str], dict] = {}   # the candle still forming
         self.last_open: dict[str, int] = {}              # last closed 1m open_time per symbol
+        self.markets: dict[str, str] = {s: market_of(s) for s in self.symbols}
         self.zones: dict[str, dict] = {}          # key -> zone dict (live state)
         self.events: list[dict] = []              # newest first: formed / mitigated
         self.kinds: dict[str, int] = {}
@@ -103,6 +105,7 @@ class Engine:
             if not symbol or symbol in self.symbols:
                 continue
             self.symbols.append(symbol)
+            self.markets[symbol] = market_of(symbol)
             self.add_cells(symbol)
             added.append(symbol)
         if added:
@@ -198,7 +201,7 @@ class Engine:
             if len(self.history.get(key, ())) >= 150:
                 self.warm_done += 1   # already warm (a replay pre-roll, say)
                 continue
-            interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
+            interval = self._interval_for_timeframe(feed, symbol, tf)
             if interval is None:
                 await self._warm_from_minutes(feed, symbol, tf)
                 self.warm_done += 1
@@ -216,6 +219,21 @@ class Engine:
             for bar in candles:
                 self._append(key, {**bar, "closed": True})
             self.warm_done += 1
+
+    @staticmethod
+    def _interval_for_timeframe(feed, symbol: str, tf: str) -> str | None:
+        """Ask the feed for its own name for this timeframe, per symbol.
+
+        A feed that fronts two markets (spot + futures) can only answer when it
+        knows which symbol, and a test double written before this existed only
+        takes one argument - so both are handled, instead of crashing a warm-up.
+        """
+        if not hasattr(feed, "exchange_interval"):
+            return tf
+        try:
+            return feed.exchange_interval(tf, symbol)
+        except TypeError:
+            return feed.exchange_interval(tf)
 
     async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> None:
         key = (symbol, tf)
@@ -289,6 +307,7 @@ class Engine:
         events = map_.add(bar)
         if events.get("zones"):
             for zone in events["zones"]:
+                zone["market"] = market_of(zone["symbol"])
                 self.zones[zone["key"]] = zone
                 self.kinds[zone["kind"]] = self.kinds.get(zone["kind"], 0) + 1
                 self.events.insert(0, {"type": "formed", "zone": zone})
@@ -553,7 +572,25 @@ class Engine:
                 "ready": bool(aligned and regime["state"] in ("trend_up", "trend_down")),
             }
         zone["htf"] = self._htf_confluence(zone, index)
+        zone["market"] = market_of(zone.get("symbol", ""))
+        zone["pretty"] = pretty_symbol(zone.get("symbol", ""))
         return zone
+
+    # -------------------------------------------------------------- markets
+    def market_counts(self, active: list[dict] | None = None) -> dict[str, Any]:
+        """How many zones each market has - the page shows them side by side."""
+        active = active if active is not None else self.active_zones()
+        out: dict[str, Any] = {}
+        for market in ("spot", "futures"):
+            zones = [z for z in self.zones.values() if z.get("market") == market]
+            live = [z for z in active if z.get("market") == market]
+            out[market] = {
+                "symbols": len([s for s in self.symbols if self.markets.get(s) == market]),
+                "zones": len(zones),
+                "active": len(live),
+                "tradable": len([z for z in live if (z.get("plan") or {}).get("rr")]),
+            }
+        return out
 
     # -------------------------------------------------------------- snapshot
     @staticmethod
@@ -570,6 +607,9 @@ class Engine:
                 "ob", "block_src", "trend", "trend_state", "aligned", "confluence", "htf",
                 "grade", "score", "entry_trend", "entry_state", "entry_aligned",
                 "fvg_atr", "disp_atr", "block_atr", "swept_major", "now_trend",
+                # round 6: which market, and the trade plan that goes with it
+                "market", "plan", "plan_state", "plan_filled_at", "plan_filled_price",
+                "plan_result_at", "plan_result_r",
             )
         }
 
@@ -589,12 +629,19 @@ class Engine:
                 self.enrich(zone, index)
         active = [z for z in self.zones.values() if z.get("status") == "active"]
         active.sort(key=lambda z: -int(z.get("time") or 0))
+        for zone in active:
+            zone["market"] = market_of(zone.get("symbol", ""))
         history = [z for z in self.zones.values() if z.get("status") != "active"]
         history.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or 0))
         return {
             "source": self.source,
             "exchange": self.exchange,
             "symbols": self.symbols,
+            "markets": {
+                "spot": [s for s in self.symbols if self.markets.get(s) != "futures"],
+                "futures": [s for s in self.symbols if self.markets.get(s) == "futures"],
+            },
+            "market_counts": self.market_counts(active),
             "timeframes": self.timeframes,
             "settings": self.settings,
             "kinds": [k for k in KINDS] + ["weak_high", "weak_low"],
