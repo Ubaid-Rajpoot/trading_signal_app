@@ -633,3 +633,65 @@ def test_zones_and_universe_can_be_filtered_by_market(tmp_path):
     assert all(z["market"] == "futures" for z in fut["items"])
     assert all(z["market"] == "spot" for z in spot["items"])
     assert len(both["items"]) == len(fut["items"]) + len(spot["items"])
+
+
+# ------------------------------------- round 7: ranking, scale, the signals API
+def test_snapshot_ranks_by_measurement_and_is_capped():
+    rows = load(3000)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["5m", "15m"], settings=dict(DEFAULTS))
+
+    async def go():
+        await engine.warmup(FakeFeed(rows))
+        return engine.snapshot()
+
+    state = asyncio.run(go())
+    assert len(state["active"]) <= 200, "one frame never carries an unbounded list"
+    ranks = [engine.rank_key(z) for z in state["active"]]
+    assert ranks == sorted(ranks, reverse=True), "the pushed list is best-first"
+    assert state["grade_counts"]["A+"] >= 0 and "tradable_count" in state
+    for zone in state["active"]:
+        assert "prob" in zone and "cond_met" in zone and "cond_missing" in zone
+
+
+def test_the_zone_store_is_bounded_but_never_drops_a_live_zone():
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    engine.max_zones = 10
+    engine.zones = {
+        f"k{i}": {"key": f"k{i}", "status": "active" if i % 5 == 0 else "mitigated",
+                  "mitigated_at": i, "symbol": "BTCUSDT", "timeframe": "1m"}
+        for i in range(40)
+    }
+    engine._prune_zones()
+    live = [z for z in engine.zones.values() if z["status"] == "active"]
+    assert len(live) == 8, "every live zone survives the pruning"
+    assert len(engine.zones) <= max(1000, engine.max_zones) or len(engine.zones) == 8
+
+
+def test_the_signals_endpoint_is_ranked_and_filterable():
+    rows = load(2500)
+    engine = Engine(symbols=["BTCUSDT", "BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    config = {"symbols": ["BTCUSDT"], "futures_symbols": ["BTC_USDT"], "timeframes": ["5m"], "settings": {}}
+    app = create_app(config, FakeFeed(rows), engine, None)
+
+    async def go():
+        await engine.warmup(FakeFeed(rows))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+            ranked = (await client.get("/api/signals", params={"limit": 30})).json()
+            ready = (await client.get("/api/signals", params={"tradable": 1, "limit": 30})).json()
+            futures = (await client.get("/api/signals", params={"market": "futures", "limit": 30})).json()
+            top = (await client.get("/api/signals", params={"grade": "A+", "limit": 30})).json()
+        return ranked, ready, futures, top
+
+    ranked, ready, futures, top = asyncio.run(go())
+    assert ranked["items"], "the app finds signals on real candles"
+    # the contract: the measured chance leads, then expectancy, then the letter
+    keys = [Engine.rank_key(z) for z in ranked["items"]]
+    assert keys == sorted(keys, reverse=True), "the list follows the ranked key"
+    probs = [z["prob"] for z in ranked["items"]]
+    assert probs == sorted(probs, reverse=True), "best measured chance first"
+    first = ranked["items"][0]
+    assert first["grade"] == "A+" and first["prob"] >= 0.85, "the list opens on the most likely plan"
+    assert ranked["model"]["available"] is True
+    assert all(z["market"] == "futures" for z in futures["items"])
+    assert all(z["tradable"] for z in ready["items"])
+    assert all(z["grade"] == "A+" for z in top["items"])

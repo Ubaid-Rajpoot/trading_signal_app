@@ -378,3 +378,63 @@ def test_a_close_through_the_level_stops_the_plan():
     map_.add(bar(n, zone.top + 1.0, high=zone.top + 1.05, low=float(zone.plan["entry"])))
     assert zone.plan_state == "stopped", "a close through the high invalidates the short"
     assert zone.plan_result_r == -1.0
+
+
+# ------------------------------- round 7: conditions, probability and the fee
+def test_every_zone_is_checked_against_all_ten_conditions():
+    from bot.map import CONDITION_NAMES
+
+    map_ = run(real_path(strong_high_path() * 2))
+    assert len(CONDITION_NAMES) == 10
+    checked = 0
+    for zone in map_.zones:
+        if zone.kind.startswith("weak_"):
+            continue
+        checked += 1
+        assert set(zone.conds) == set(CONDITION_NAMES), "no condition is left unchecked"
+        assert zone.cond_met == sum(1 for v in zone.conds.values() if v)
+        assert 2 <= zone.cond_met <= 10
+    assert checked > 0
+
+
+def test_the_grade_is_the_measured_probability_not_the_condition_count():
+    """A setup with fewer conditions can still be the better trade - that is what
+    the 90-day study found, so the letter has to follow the measurement."""
+    from bot.model import model
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    m = model()
+    assert m.available, m.problem
+    prob = m.probability(zone)
+    assert prob is not None and 0.0 < prob < 1.0
+    cuts = DEFAULTS["prob_cuts"]
+    assert m.grade_for(prob, DEFAULTS) == (
+        "A+" if prob >= cuts["a_plus"] else "A" if prob >= cuts["a"] else "B" if prob >= cuts["b"] else "C"
+    )
+    # the letter moves with the probability, not with the count of conditions
+    zone.cond_met = 3
+    assert m.grade_for(0.99, DEFAULTS) == "A+"
+
+
+def test_a_plan_smaller_than_the_fee_is_never_marked_tradable():
+    from bot.model import SignalModel
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    zone.plan = {"rr": 2.0, "risk_pct": 0.02}      # 0.02% stop vs a 0.08% round trip
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.fee_r > 1.0, "a stop this tight costs more than the risk itself"
+    assert zone.tradable is False
+
+    zone.plan = {"rr": 2.0, "risk_pct": 0.6}       # a stop the fee cannot swallow
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.fee_r <= 0.30
+    assert zone.tradable is True
+
+
+def test_a_plan_with_no_target_gets_no_probability_free_pass():
+    from bot.model import SignalModel
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    zone.plan = {"rr": None, "risk_pct": 1.0}
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.net_r is None and zone.tradable is False

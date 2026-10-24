@@ -810,7 +810,8 @@ class CompositeFeed(BaseFeed):
             symbols += list(feed.symbols)
         super().__init__(symbols)
         self.feeds = feeds
-        self._reader: asyncio.Task | None = None
+        self._own_status = "starting"
+        self.universe_errors: dict[str, str] = {}
 
     def market_of(self, symbol: str) -> str:
         return market_of(symbol)
@@ -853,17 +854,22 @@ class CompositeFeed(BaseFeed):
     def force_reconnect(self) -> None:
         for feed in self.feeds.values():
             feed.force_reconnect()
-        self.connected = False
 
     # ------------------------------------------------------------- plumbing
     @property
     def status(self) -> str:  # type: ignore[override]
-        parts = [f"{key}: {feed.status}" for key, feed in self.feeds.items()]
-        return " | ".join(parts)
+        return " | ".join(self.statuses.values()) if self.statuses else self._own_status
 
     @status.setter
     def status(self, value: str) -> None:
-        self._status = value
+        self._own_status = value
+
+    @property
+    def statuses(self) -> dict[str, str]:
+        return {key: feed.status for key, feed in self.feeds.items()}
+
+    def markets(self) -> list[str]:
+        return list(self.feeds)
 
     def stats(self) -> dict:
         return {
@@ -872,7 +878,9 @@ class CompositeFeed(BaseFeed):
                 "status": feed.status,
                 "messages": feed.messages,
                 "parsed": feed.parsed,
+                "candles": feed.frames,
                 "symbols": len(feed.symbols),
+                "samples": list(feed.samples[-2:]),
             }
             for key, feed in self.feeds.items()
         }
@@ -886,70 +894,69 @@ class CompositeFeed(BaseFeed):
         mapped = feed.exchange_interval(interval, symbol) if interval in getattr(feed, "tf_map", {}) else interval
         return await feed.history(symbol, mapped or interval, limit, include_open)
 
-    def _rows(self, path: Path) -> Iterator[dict]:
-        """Every recorded candle of one file, as a plain generator."""
-        with path.open(newline="") as handle:
-            for index, row in enumerate(csv.reader(handle)):
-                if len(row) < 6 or index < self.skip:
-                    continue
-                raw_time = int(row[0])
-                open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
-                if open_time < 10**12:  # seconds
-                    open_time *= 1000
-                yield {
-                    "open_time": open_time,
-                    "close_time": open_time + 59_999,
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
-                    "trades": 0,
-                    "closed": True,
-                }
+    # --------------------------------------------------------------- stream
+    async def _pump(self, feed: BaseFeed) -> None:
+        """Take one sub-feed's candles and put them on the composite queue.
 
-    async def candles(self) -> AsyncIterator[dict]:
-        """Both markets at once: the files are merged on time, not played in turn.
-
-        Playing one file after the other would leave one market frozen while the
-        other streamed - which is not what two feeds look like. Each pass keeps
-        one cursor per file and always emits the oldest candle next, so spot and
-        futures advance together, exactly as they do live.
+        The sub-feed does its own reconnecting; this only forwards. If it ever
+        stops (a replay that ran out of file), the pump restarts it instead of
+        leaving half of the market silent.
         """
         while True:
-            heads: list[list] = [[self._rows(path), None] for _, path in self.files]
-            for head in heads:
-                head[1] = next(head[0], None)
-            while any(head[1] is not None for head in heads):
-                at = min(
-                    (i for i, h in enumerate(heads) if h[1] is not None),
-                    key=lambda i: (heads[i][1]["open_time"], i),
-                )
-                head = heads[at]
-                base = head[1]
-                head[1] = next(head[0], None)
-                symbol = self.files[at][0]
-                bar = {**base, "symbol": symbol}
-                if self.ticks > 1:
-                    for k in range(1, self.ticks):
-                        p = k / self.ticks
-                        o = bar["open"]
-                        close_p = o + (bar["close"] - o) * p
-                        high_p = max(o, close_p, o + (bar["high"] - o) * p)
-                        low_p = min(o, close_p, o + (bar["low"] - o) * p)
-                        yield {
-                            **bar,
-                            "high": high_p,
-                            "low": low_p,
-                            "close": close_p,
-                            "volume": bar["volume"] * p,
-                            "closed": False,
-                        }
-                        await asyncio.sleep(1.0 / (self.speed * self.ticks))
-                yield bar
-                await asyncio.sleep(1.0 / self.speed)
-            if not self.loop:
-                return
+            try:
+                async for candle in feed.candles():
+                    await self._push(candle)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    async def candles(self) -> AsyncIterator[dict]:  # type: ignore[override]
+        """Both markets on one stream: whatever either feed produces, as it comes.
+
+        This is the object the engine reads, so a futures contract and a spot
+        pair arrive interleaved and neither waits for the other.
+        """
+        tasks = [asyncio.create_task(self._pump(feed)) for feed in self.feeds.values()]
+        try:
+            while True:
+                yield await self.queue.get()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @property
+    def connected(self) -> bool:  # type: ignore[override]
+        return any(feed.connected for feed in self.feeds.values())
+
+    @connected.setter
+    def connected(self, value: bool) -> None:
+        self._connected = value
+
+    # ------------------------------------------------------------- universe
+    async def universe(self) -> list[dict]:
+        """Every instrument on every market, biggest turnover first.
+
+        One market failing must not hide the other: the items that did arrive are
+        returned, and the failure is recorded on :attr:`universe_errors` (shown in
+        the symbols drawer) instead of raising away the working half.
+        """
+        items: list[dict] = []
+        self.universe_errors: dict[str, str] = {}
+        for market, feed in self.feeds.items():
+            try:
+                for item in await feed.universe():
+                    items.append({**item, "market": market})
+            except Exception as exc:
+                self.universe_errors[market] = f"{type(exc).__name__}: {exc}"
+        if not items:
+            raise FeedError(
+                "; ".join(f"{k}: {v}" for k, v in self.universe_errors.items())
+                or "no market feed answered"
+            )
+        return sorted(items, key=lambda x: -float(x.get("turnover") or 0))
 
 
 # ------------------------------------------------------------------- replay

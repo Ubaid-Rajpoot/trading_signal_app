@@ -35,7 +35,7 @@
     "30m",
     "1h"
   ],
-  "max_symbols": 400,
+  "max_symbols": 2000,
   "rest_poll_seconds": 6,
   "rest_poll_quiet_after": 45,
   "rest_poll_always": false,
@@ -67,10 +67,21 @@
         "start": 12,
         "end": 21
       }
-    ]
+    ],
+    "plan_min_risk_pct": 0.0,
+    "prob_cuts": {
+      "a_plus": 0.85,
+      "a": 0.7,
+      "b": 0.55
+    },
+    "fee_maker_bps": 2.0,
+    "fee_taker_bps": 6.0,
+    "fee_max_r": 0.3
   },
   "server": {
     "host": "0.0.0.0",
     "port": 8800
-  }
+  },
+  "max_active_zones": 200,
+  "max_zones": 20000
 }

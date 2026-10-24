@@ -32,6 +32,7 @@ from bot.feed import (  # noqa: E402
     ReplayFeed,
     is_futures,
     make_feed,
+    market_of,
     make_market_feed,
     to_futures,
 )
@@ -76,6 +77,28 @@ async def check(config: dict, exchange: str) -> int:
             print(f"   FAIL  {type(exc).__name__}: {exc}")
             print("   -> futures REST is not reachable; spot can still work.")
         config = {**config, "symbols": spot or config["symbols"]}
+    # the universe on both markets: this is what the "add instruments" panel uses
+    if exchange == "mexc":
+        print("0b) MEXC instrument list, spot and futures ...")
+        try:
+            lookup = make_market_feed(
+                "mexc",
+                [s for s in (config.get("symbols") or []) if not is_futures(s)][:1] or ["BTCUSDT"],
+                [to_futures(s) for s in (config.get("futures_symbols") or [])][:1] or ["BTC_USDT"],
+            )
+            items = await lookup.universe()
+            per_market = {}
+            for item in items:
+                per_market[item.get("market") or market_of(item["symbol"])] = per_market.get(
+                    item.get("market") or market_of(item["symbol"]), 0
+                ) + 1
+            print(f"   OK  {len(items)} instruments: " + ", ".join(f"{k} {v}" for k, v in sorted(per_market.items())))
+            errors = getattr(lookup, "universe_errors", {}) or {}
+            for market, problem in errors.items():
+                print(f"   FAIL {market}: {problem}")
+        except Exception as exc:
+            print(f"   FAIL  {type(exc).__name__}: {exc}")
+
     symbol = config["symbols"][0] if config.get("symbols") else "BTCUSDT"
     print(f"1) {exchange} REST history for {symbol} ...")
     feed = make_feed(exchange, [symbol])

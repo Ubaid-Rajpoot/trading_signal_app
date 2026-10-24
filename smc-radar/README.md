@@ -87,9 +87,12 @@ its resolution time and price; the tape keeps the record; only a zone older than
 * **Filters** — symbol search, timeframe chips, **view: active only / active +
   recently mitigated (default) / everything**, a window selector (15 min … 24 h),
   **market: futures + spot (default) / futures only / spot only**, **quality:
-  A+ and A (default) / A+ only / sniper (R:R ≥ 1.5) / sniper + algo candle /
-  tradeable now / on a strong level / everything**, weak
-  pairs, sort by newest / closest to price / strongest evidence / symbol.
+  trade-ready (default) / A+ and A (≥ 70 %) / A+ only (≥ 85 %) / sniper
+  (R:R ≥ 1.5) / tradeable now / on a strong level / everything**, weak
+  pairs, sort by **measured chance (default)** / newest / closest to price /
+  strongest evidence / symbol. The default order is the measured probability of
+  reaching the target, best first, so the first card on the page is the best
+  setup the scan has found — wherever it is in the list of instruments.
   Active zones always lead the list; a resolved zone keeps its card, dimmed,
   with the time it formed **and** the time and price that mitigated it. That is
   what keeps a 1m pattern on screen: a 1m zone is usually mitigated within
@@ -252,6 +255,52 @@ every zone comes back, with the reason it was hidden shown on its card.
   unchanged; the default quality filter is still A+ and A; old modes are one
   click away.
 
+### Round 7 — the letter is measured, the fee is part of the plan, and the live feed works
+
+Three complaints came back from the user, and all three were real:
+
+* **"Adding a symbol gives an error."** `CompositeFeed` — the object that fronts
+  spot *and* futures in live mode — carried the *replay* implementation over it:
+  its `candles()` iterated `self.files` (which it does not have) and it had **no
+  `universe()` at all**, so in live mode it streamed nothing and adding from the
+  exchange list failed. Both are rewritten (one pump task per market, merged
+  queue; a universe that tags every item with its market and keeps the working
+  half when one market is down), and `tests/test_feed.py` pins them. `python
+  run.py check` now tests **both** markets, and `/api/universe` reports per-market
+  errors instead of one opaque failure. The page side was hardened too: adding a
+  symbol, "add top 50" and "add every instrument" now print the actual answer
+  (HTTP status, the exchange's complaint, a rate limit) instead of a button that
+  looks dead when the request fails.
+* **"A+ is printed on setups that meet few conditions."** Correct, and the fix is
+  not to count conditions. Measured: the count does not rank outcomes (5 cond.
+  62 %, 8 cond. 59 %, same on a held-out block). So the grade is now
+  **P(the plan reaches its target before its stop)**, from a model fitted on 90
+  days and validated on the next 90 (AUC 0.735; A+ band 87–95 % actual, C band
+  28–46 %). The card lists **all ten of the book's conditions**, met and missed,
+  so nothing is hidden. Full report: [`docs/conditions.md`](docs/conditions.md).
+* **"For futures no signal comes at all, though MEXC has 1600 coins."** The feed
+  bug above was the main cause; on top of it the scan is now sized for 1600
+  instruments: `max_symbols` 2000, parallel warm-up workers (`warm_concurrency`),
+  a bounded zone store (`max_zones`), a capped and **ranked** push
+  (`max_active_zones`), a lean frame above 120 instruments, and a new ranked
+  endpoint `GET /api/signals?market=&timeframe=&grade=&tradable=&limit=` that
+  returns the best setups across every instrument instead of the newest 200.
+
+**The finding that explains "my stops get hit":** the fee is charged on the whole
+position while the risk is only the stop distance, so cost in R is
+`round-trip fee ÷ stop distance`. The median stop on 1m BTC is **0.11 % of price**
+and a MEXC futures round trip is **0.08 %** — the fee was **0.7–1.8 × the entire
+risk**. Every zone now carries `plan.risk_pct`, `fee_r`, `net_r` and a
+`tradable` flag, the card prints them, and the default filter is
+**trade-ready**. On the measured data that takes 1m from −1.29 R to break-even and
+makes 15m/30m genuinely positive (+0.23 / +0.58 R).
+
+The page's quality filter is now: **trade-ready (default) · A+ and A (≥ 70 %) ·
+A+ only (≥ 85 %) · sniper (R:R ≥ 1.5) · tradeable now (in trend) · on a strong
+level · everything**, and the list is sorted by measured chance unless you pick
+another order. Nothing was removed: every older filter, tab and toggle is still
+there.
+
 ## 3. Settings (all of them are in `config.json`)
 
 | key | default | meaning |
@@ -277,6 +326,10 @@ every zone comes back, with the reason it was hidden shown on its card.
 | `plan_stop_atr` | 0.10 | the stop sits this × ATR beyond the exact high/low |
 | `plan_pool_bars` | 120 | how far back the session extreme used as a target may be |
 | `plan_pool_age` | 600 | bars a strong level stays a valid target |
+| `cond_disp_atr` | 2.0 | "aggressive displacement" = this many ATR (a condition) |
+| `prob_cuts` | A+ 0.85, A 0.70, B 0.55 | measured probability → letter |
+| `fee_maker_bps` / `fee_taker_bps` | 2 / 6 | MEXC futures fees used to cost the plan |
+| `fee_max_r` | 0.30 | a plan costing more than this share of the risk is not tradable |
 
 Live-only keys (top level of `config.json`):
 
@@ -290,10 +343,13 @@ Live-only keys (top level of `config.json`):
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 45 passed
+../.venv/bin/python -m pytest tests -q                 # 58 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
 ../.venv/bin/python tools/zone_quality.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 ../.venv/bin/python tools/plan_study.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
+../.venv/bin/python tools/condition_study.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m
+../.venv/bin/python tools/fit_model.py --train study-data/BTCUSDT-1m-90d.csv \
+    --holdout study-data/BTCUSDT-1m-90d-holdout.csv --timeframe 1m
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
 cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node quality.mjs
 ```
@@ -383,10 +439,16 @@ candle path by a test that feeds an unfinished 1m bar and reads it back through
 
 ## 5. Honest limits
 
-* **The exchange is not reachable from the machine this was built on.** MEXC's
-  REST and websocket are blocked in the build sandbox, so the *connectivity*
-  path was verified only up to "the server starts in half a second, serves the
-  page, and reports the feed as reconnecting". The behaviour after a socket
+* **The live feed is verified with fakes, not against MEXC.** MEXC's REST and
+  websocket are blocked in the build sandbox, so the two-market feed was tested
+  with two fake sub-feeds (`tests/test_feed.py`: merged stream, one market
+  failing, both failing, universe tagging) and the *connectivity* path only up to
+  "the server starts, serves the page, and reports the feed as reconnecting".
+  Round 7 exists because a live-only bug survived exactly that gap — the
+  composite feed was never exercised. What is still unverified against the real
+  exchange: the futures websocket payload, the contract REST shapes and the
+  per-market universe endpoint. `python run.py check` prints one line per market
+  so the first run on your machine tells you which of them is answering. The behaviour after a socket
   connects but stays silent is covered by an integration test that reproduces
   exactly that state and then checks that candles and ticks still arrive. Everything else — deep history, the forming candle,
   the push, the three transports, the reconnect logic — is covered by the tests

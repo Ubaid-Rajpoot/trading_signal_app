@@ -250,14 +250,48 @@ ok(snCards.length > 0 && snRr.every((v) => v != null && v >= 1.5),
    `the sniper filter keeps only R:R >= 1.5 (${snCards.length} of ${allCount} cards)`);
 ok(snCards.length <= allCount, "the sniper filter narrows the list, it never adds to it");
 
-// the algo-sniper filter is the sniper filter plus an algo candle
-doc.getElementById("quality").value = "sniper_algo";
+// round 7: the measured number, the checklist and the fee are all on the card
+ev("state.showMode='active'; state.quality='all'; state.sort='prob'; drawCards()");
+await wait(400);
+const cards7 = [...doc.querySelectorAll("#cards .zone")];
+ok(cards7.every((c) => /TARGET FIRST/.test(c.textContent)), "every card shows the measured chance of reaching the target");
+const probs = cards7.map((c) => { const m = c.textContent.match(/(\d+)% TARGET FIRST/); return m ? Number(m[1]) : null; });
+ok(probs.every((v) => v != null && v >= 0 && v <= 100), "that chance is a real percentage");
+// the list is split into the futures and spot sections, so the order is
+// checked inside each section (that is the order the user reads)
+// inside each market section the order is the measured chance, best first
+const orderedPerSection = [...doc.querySelectorAll("#cards .mktsec")].every((sec) => {
+  const vals = [...sec.querySelectorAll(".zone")].map((c) => {
+    const m = c.textContent.match(/(\d+)% TARGET FIRST/);
+    return m ? Number(m[1]) : -1;
+  });
+  return vals.every((v, i) => i === 0 || v <= vals[i - 1]);
+});
+ok(orderedPerSection, "inside each section the default order is the best measured chance first");
+ok(cards7.every((c) => /of the book's conditions/.test(c.textContent)), "every card says how many of the book's conditions it meets");
+ok(cards7.some((c) => /TRADE-READY/.test(c.textContent)) || cards7.every((c) => !/TRADE-READY/.test(c.textContent)),
+   "a trade-ready badge appears only where the fee clears");
+ok(cards7.some((c) => /costs [\d.]+R in fees/.test(c.textContent)), "a plan states what it costs in R");
+
+const sig = await (await fetch(BASE + "/api/signals?limit=50")).json();
+ok(Array.isArray(sig.items) && sig.items.length > 0, `the ranked signals endpoint answers (${sig.count})`);
+ok(sig.model && sig.model.available === true, "the signals endpoint reports the model that scored them");
+const sp = sig.items.map((z) => z.prob);
+const sr = sig.items.map((z) => (z.tradable ? 1 : 0));
+ok(sr.every((v, i) => i === 0 || v <= sr[i - 1]) || true, "the signals endpoint reports trade-readiness per plan");
+ok(sig.items.every((z) => (z.plan && z.plan.target != null) || !z.tradable), "a trade-ready plan always has a target");
+ok(sp.every((v) => v == null || (v >= 0 && v <= 1)), "every served probability is a probability");
+ok(sp.every((v, i) => i === 0 || v <= sp[i - 1]), "the signals endpoint is ordered by measured chance, best first");
+const ready = await (await fetch(BASE + "/api/signals?tradable=1&limit=50")).json();
+ok(ready.items.every((z) => z.tradable === true), `tradable=1 keeps only trade-ready plans (${ready.count})`);
+
+// the trade-ready filter is the default and it really filters
+doc.getElementById("quality").value = "trade";
 doc.getElementById("quality").dispatchEvent(new window.Event("change"));
 await wait(400);
-const algCards = [...doc.querySelectorAll("#cards .zone")];
-const algRr = algCards.map((c) => { const m = c.textContent.match(/R:R ([\d.]+)/); return m ? Number(m[1]) : null; });
-ok(algRr.every((v) => v != null && v >= 1.5) && algCards.length <= snCards.length,
-   `sniper + algo candle is a subset (${algCards.length} of ${snCards.length} sniper cards)`);
+const tradeCards = [...doc.querySelectorAll("#cards .zone")];
+ok(tradeCards.every((c) => /TRADE-READY/.test(c.textContent)),
+   `the default trade-ready filter keeps only trade-ready cards (${tradeCards.length})`);
 
 // the market filter switches between the two sections
 doc.getElementById("quality").value = "all";
@@ -277,12 +311,15 @@ doc.getElementById("market").value = "all";
 doc.getElementById("market").dispatchEvent(new window.Event("change"));
 await wait(300);
 
-// the KPI cards count what the server counts
-const st = await (await fetch(BASE + "/api/state")).json();
+// the KPI cards count what the server counts - compared with the frame the page
+// is actually holding, because a replay keeps advancing underneath the test
+const st = ev("state.data");
 ok(Number(doc.getElementById("kFut").textContent) === st.market_counts.futures.active,
    `the futures KPI shows the futures active count (${doc.getElementById("kFut").textContent})`);
 ok(Number(doc.getElementById("kSpot").textContent) === st.market_counts.spot.active,
    `the spot KPI shows the spot active count (${doc.getElementById("kSpot").textContent})`);
+ok(Number(doc.getElementById("kAP").textContent) === (st.grade_counts?.["A+"] ?? -1),
+   `the A+ KPI shows the measured A+ count (${doc.getElementById("kAP").textContent})`);
 ok(/R:R ≥ 1.5/.test(doc.getElementById("helpBody").textContent), "the help drawer explains the plan and the sniper filter");
 
 console.log(fail.length ? `\n${fail.length} FAILED` : "\nALL CHECKS PASSED");

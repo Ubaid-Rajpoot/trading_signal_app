@@ -74,6 +74,7 @@ def read_csv(path: Path) -> list[dict]:
 
 
 def roll(bars: list[dict], timeframe: str) -> list[dict]:
+    """Aggregate 1m candles into a higher timeframe (1m is returned as it is)."""
     if timeframe == "1m":
         return bars
     bucket = Rollup(timeframe)
@@ -81,7 +82,7 @@ def roll(bars: list[dict], timeframe: str) -> list[dict]:
     for bar in bars:
         closed = bucket.add(bar)
         if closed:
-            out.append(closed)
+            out.extend(closed)
     return out
 
 

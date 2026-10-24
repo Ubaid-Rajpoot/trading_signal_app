@@ -77,8 +77,27 @@ DEFAULTS: dict[str, Any] = {
     "confluence_age": 400,      # bars a strong level stays relevant for confluence
     # --- the execution plan that goes with every zone ------------------------
     "plan_stop_atr": 0.10,      # stop distance beyond the exact high/low, in ATR
+    # A stop that is closer than the round-trip fee cannot be traded: the fee is
+    # charged on the whole notional while the risk is only the stop distance, so
+    # the cost in R is fee / risk. Measured on 90d of 1m BTC the median stop was
+    # 0.11% of price against a 0.12% round-trip taker fee - i.e. 1.07 R of fees
+    # per trade, which is why a 95% "win rate" still loses money. This floor is
+    # the minimum stop distance as a percentage of price; 0 keeps the old plan.
+    "plan_min_risk_pct": 0.0,
     "plan_pool_bars": 120,      # how far back the next liquidity pool is looked for
     "plan_pool_age": 600,       # bars a strong level stays a valid target
+    # --- the checklist behind the grade (round 7) ----------------------------
+    "cond_disp_atr": 2.0,       # "aggressive displacement" = this many ATR
+    # The letter is the measured probability, not a count: on 90d of 1m BTC the
+    # count of conditions did not rank outcomes (docs/conditions.md), while the
+    # model's top decile won 95% on a held-out 90d block. These cuts are the
+    # bands that report printed (85%+ / 70%+ / 55%+).
+    "prob_cuts": {"a_plus": 0.85, "a": 0.70, "b": 0.55},
+    # MEXC futures: 0.02% maker, 0.06% taker. The plan is limit-in, limit-out,
+    # and a stop crosses the spread - so a plan costs (maker + taker) in R.
+    "fee_maker_bps": 2.0,
+    "fee_taker_bps": 6.0,
+    "fee_max_r": 0.30,          # more than this share of the risk is fee: not tradable
     "sessions": [            # UTC, inclusive start, exclusive end
         {"name": "Asia", "start": 0, "end": 8},
         {"name": "London", "start": 7, "end": 16},
@@ -103,6 +122,30 @@ KINDS = (
     "rejection_block_bear",   # algo candle on a session HIGH
     "rejection_block_bull",   # algo candle on a session LOW
 )
+
+# ---------------------------------------------------------------- conditions
+# The book states, for each pattern, a list of things that make it stronger:
+# a grabbed level, a major (strong) level taken, an inducement, an algo candle,
+# aggressive displacement, a real order block, a session extreme, another strong
+# level at the same price - and the user's own rule that a setup must not form
+# in a sideways market. Every zone is checked against **all ten** of them, so a
+# card can say "6/10 conditions, these four are missing" instead of showing a
+# bare letter. The names are the vocabulary used by the API, the page and the
+# study tools; the grade is derived from how many are met (see grade_for).
+CONDITIONS: tuple[tuple[str, str], ...] = (
+    ("grab", "liquidity grabbed: the previous swing was taken"),
+    ("ms", "structure broke the other way (MS)"),
+    ("major", "the level it grabbed was a strong (major) level"),
+    ("inducement", "inducement: equal highs/lows at the extreme"),
+    ("algo", "algo candle: displacement left an FVG"),
+    ("displacement", "displacement of 2 ATR or more"),
+    ("block", "a real opposite-colour order block was found"),
+    ("session", "the extreme is a session high/low"),
+    ("confluence", "another strong level sits at the same price"),
+    ("trend", "the market is trending, not ranging"),
+)
+CONDITION_NAMES = tuple(name for name, _ in CONDITIONS)
+CONDITION_LABELS = dict(CONDITIONS)
 
 
 # ---------------------------------------------------------------------- pieces
@@ -170,6 +213,15 @@ class Zone:
     htf: list[str] = field(default_factory=list)
     grade: str = "C"                      # A+ / A / B / C
     score: int = 0
+    # --- round 7: the checklist behind the letter ---------------------------
+    conds: dict[str, bool] = field(default_factory=dict)   # every condition, met or not
+    cond_met: int = 0
+    cond_total: int = len(CONDITION_NAMES)
+    # --- round 7: the measured number behind the letter ---------------------
+    prob: float | None = None      # P(target before stop), from bot/signal_model.json
+    fee_r: float | None = None     # round-trip cost of the plan, in R
+    net_r: float | None = None     # expectancy in R after that cost
+    tradable: bool = False         # the fee does not swallow the edge
     # the regime at the moment price came back into the block: this is the
     # moment a trade is actually taken, so it gets its own snapshot
     entry_trend: dict[str, Any] | None = None
@@ -236,6 +288,14 @@ class Zone:
             "htf": list(self.htf),
             "grade": self.grade,
             "score": self.score,
+            "conds": dict(self.conds),
+            "cond_met": self.cond_met,
+            "cond_total": self.cond_total,
+            "cond_missing": [n for n in CONDITION_NAMES if not self.conds.get(n)],
+            "prob": self.prob,
+            "fee_r": self.fee_r,
+            "net_r": self.net_r,
+            "tradable": self.tradable,
             "entry_trend": self.entry_trend,
             "entry_state": (self.entry_trend or {}).get("state"),
             "entry_aligned": (self.entry_trend or {}).get("aligned"),
@@ -507,8 +567,32 @@ def block_geometry(
     return top, level, ob, "order block candle"
 
 
+def grade_for_conditions(met: int, total: int = len(CONDITION_NAMES), cfg: dict | None = None) -> str:
+    """The letter is the count of the book's conditions the setup satisfies.
+
+    The cut-offs are not a taste: they were set on 90 days of real 1m BTC and
+    then checked on a held-out 90 days (``tools/condition_study.py`` and
+    ``docs/conditions.md``). ``grade_cuts`` in the settings moves them without a
+    code change, so a different instrument can be re-calibrated from the same
+    tool instead of the numbers being hard-coded.
+    """
+    cuts = (cfg or {}).get("grade_cuts") or {}
+    a_plus = int(cuts.get("a_plus", 5))
+    a = int(cuts.get("a", 4))
+    b = int(cuts.get("b", 3))
+    if total <= 0:
+        return "C"
+    if met >= a_plus:
+        return "A+"
+    if met >= a:
+        return "A"
+    if met >= b:
+        return "B"
+    return "C"
+
+
 def grade_for(score: int) -> str:
-    """A+ is the top of the measured range, C is the tail the study says fails."""
+    """The old score-only grade, kept for the ranking study and old reports."""
     if score >= 62:
         return "A+"
     if score >= 48:
@@ -715,6 +799,12 @@ class MarketMap:
         high_side = zone.side == HIGH
         entry = float(zone.bottom) if high_side else float(zone.top)
         stop = float(zone.level) + buffer if high_side else float(zone.level) - buffer
+        # a stop tighter than this fraction of price is inside the fee
+        floor = float(self.cfg.get("plan_min_risk_pct", 0.0)) / 100.0 * abs(entry)
+        distance = abs(stop - entry)
+        if floor > 0 and distance < floor:
+            distance = floor
+            stop = entry + distance if high_side else entry - distance
         target, source = self.next_liquidity(zone.side, entry)
         risk = abs(stop - entry)
         reward = abs(entry - target) if target is not None else None
@@ -729,8 +819,39 @@ class MarketMap:
             "reward": round(reward, 8) if reward is not None else None,
             "rr": round(rr, 2) if rr is not None else None,
             "entry_kind": "limit at the block edge",
-            "stop_kind": f"{self.cfg.get('plan_stop_atr', 0.10)} ATR beyond the level",
+            "stop_kind": (
+                f"{self.cfg.get('plan_stop_atr', 0.10)} ATR beyond the level"
+                if not (floor > 0 and distance > 0 and abs(abs(stop - entry) - floor) < 1e-12 and abs(zone.level - stop) < buffer * 1.5 + 1e-12)
+                else f"{self.cfg.get('plan_min_risk_pct')}% of price (fee floor)"
+            ),
+            "risk_pct": round(distance / abs(entry) * 100.0, 4) if entry else None,
         }
+
+    def evaluate_conditions(self, zone: Zone, regime: dict[str, Any] | None = None) -> Zone:
+        """Check the zone against all ten conditions of the book.
+
+        Nothing here changes *whether* a pattern exists - it only says which of
+        the book's strengthening conditions this particular one satisfies, so the
+        grade is a count of real, named conditions rather than a bare score.
+        """
+        regime = regime or self.regime()
+        state = regime.get("state")
+        conds = {
+            "grab": zone.swept_level is not None,
+            "ms": zone.break_level is not None,
+            "major": bool(zone.swept_major),
+            "inducement": zone.inducement >= int(self.cfg["induce_count"]),
+            "algo": zone.fvg is not None,
+            "displacement": (zone.disp_atr or 0.0) >= float(self.cfg.get("cond_disp_atr", 2.0)),
+            "block": zone.block_src == "order block candle",
+            "session": zone.session is not None,
+            "confluence": bool(zone.confluence),
+            "trend": state in ("trend_up", "trend_down"),
+        }
+        zone.conds = conds
+        zone.cond_met = sum(1 for met in conds.values() if met)
+        zone.cond_total = len(conds)
+        return zone
 
     def score_zone(self, zone: Zone, regime: dict[str, Any] | None = None) -> Zone:
         """Turn the evidence into one number, and say why.
@@ -800,7 +921,8 @@ class MarketMap:
         if trending and aligned:
             score += 4
         zone.score = int(max(0, min(100, score)))
-        zone.grade = grade_for(zone.score)
+        self.evaluate_conditions(zone, regime)
+        zone.grade = grade_for_conditions(zone.cond_met, zone.cond_total, self.cfg)
         zone.trend = {
             **regime,
             "aligned": bool(trending and aligned),
@@ -834,6 +956,9 @@ class MarketMap:
         self.score_zone(zone)
         if zone.kind not in ("weak_high", "weak_low"):
             zone.plan = self.plan_for(zone)
+            from .model import model as _model
+
+            _model().rate(zone, self.cfg)
         self.zones.append(zone)
         # keep the list bounded: drop the oldest resolved zone first
         if len(self.zones) > 400:
@@ -1245,6 +1370,20 @@ class MarketMap:
 
         session = session_of(int(candle["close_time"]), self.cfg["sessions"])
 
+        # p.89: how aggressive was the leg out of this extreme? Measured on every
+        # pattern, not only on the algo-candle path, because the checklist below
+        # asks the same question of all of them.
+        disp = None
+        if atr:
+            leg = bars[k + 1 :]
+            if leg:
+                if side == HIGH:
+                    furthest = min(float(b["low"]) for b in leg)
+                    disp = (level - furthest) / atr
+                else:
+                    furthest = max(float(b["high"]) for b in leg)
+                    disp = (furthest - level) / atr
+
         # strong high/low
         kind = "strong_high" if side == HIGH else "strong_low"
         zone = Zone(
@@ -1267,6 +1406,8 @@ class MarketMap:
             ob=ob,
             block_src=block_src,
         )
+        if disp is not None and disp > 0:
+            zone.disp_atr = round(disp, 3)
         # p.45: very strong = grabbed liquidity + broke a strong high/low + inducement
         if strong_level and induce >= int(self.cfg["induce_count"]):
             zone.kind = "very_strong_high" if side == HIGH else "very_strong_low"
