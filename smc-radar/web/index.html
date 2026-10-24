@@ -221,6 +221,51 @@
   #chartPanel:fullscreen .chartwrap { flex: 1; min-height: 0; }
   #chartPanel:fullscreen #chart { height: 100% !important; }
   body.fs-lock { overflow: hidden; }
+
+  /* ---- the two markets, side by side (round 6) */
+  .mktsec { padding: 0 12px 12px; }
+  .mktsec:first-child { padding-top: 12px; }
+  .mktsec > header {
+    display: flex; align-items: center; gap: 10px; margin: 2px 0 10px;
+    padding-bottom: 7px; border-bottom: 1px solid var(--line);
+  }
+  .mktsec > header h3 { margin: 0; font-size: 12px; letter-spacing: .13em; text-transform: uppercase; }
+  .mktsec > header .n { font-size: 11px; font-weight: 800; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-variant-numeric: tabular-nums; }
+  .mktsec > header .hint { margin-left: auto; font-size: 11px; color: var(--muted-2); }
+  .mktsec.futures > header h3 { color: #b487ff; }
+  .mktsec.spot > header h3 { color: #63a8ff; }
+  .mktsec .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
+  .mktsec .none { color: var(--muted); font-size: 12px; padding: 6px 2px 10px; }
+  .mkt { font-size: 10px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; padding: 1px 6px; border-radius: 5px; border: 1px solid #3a2b5e; color: #c9a8ff; background: rgba(180,135,255,.08); }
+  .mkt.spot { border-color: #24466e; color: #8fc4ff; background: rgba(99,168,255,.07); }
+
+  /* the trade plan that goes with a zone */
+  /* round 7: the measured number, the checklist, the fee */
+  .prob { display: inline-flex; align-items: baseline; gap: 3px; margin-left: auto; font-weight: 900; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .prob small { font-size: 9.5px; font-weight: 700; color: var(--muted-2); letter-spacing: .06em; }
+  .prob.hi { color: #2ee6a8; } .prob.mid { color: #ffd479; } .prob.lo { color: var(--muted); }
+  .conds { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+  .cond { font-size: 10px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted-2); }
+  .cond.on { color: #8ff3cf; border-color: #1f5c47; background: rgba(46,230,168,.07); }
+  .cond.off { text-decoration: line-through; opacity: .55; }
+  .fee { margin-top: 7px; font-size: 11px; line-height: 1.45; border-radius: 7px; padding: 5px 8px; }
+  .fee.ok { color: #9ff5d6; background: rgba(46,230,168,.07); border: 1px solid #1f5c47; }
+  .fee.bad { color: #ffb3c1; background: rgba(255,92,122,.06); border: 1px solid #5c2430; }
+  .readytag { font-size: 9.5px; font-weight: 900; letter-spacing: .1em; padding: 1px 7px; border-radius: 5px; color: #08111f; background: linear-gradient(180deg,#8ff3cf,#2ee6a8); }
+  .plan { margin-top: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px; background: rgba(8,12,19,.55); }
+  .plan .row { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: var(--muted); }
+  .plan .row + .row { margin-top: 3px; }
+  .plan .row b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 700; }
+  .plan .rr { margin-left: auto; font-weight: 900; font-size: 12px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--line-2); }
+  .plan .rr.good { color: #08111f; background: linear-gradient(180deg,#8ff3cf,#2ee6a8); border-color: #8ff3cf; }
+  .plan .rr.ok { color: #ffd479; border-color: #7a5f22; background: rgba(255,212,121,.08); }
+  .plan .rr.thin { color: var(--muted); }
+  .plan .state { font-size: 10.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+  .plan .state.waiting { color: var(--amber); }
+  .plan .state.filled { color: var(--blue); }
+  .plan .state.target { color: var(--green); }
+  .plan .state.stopped { color: var(--red); }
+  .plan .src { color: var(--muted-2); font-size: 10.5px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -248,6 +293,10 @@
   </header>
 
   <section class="kpis">
+    <div class="kpi" style="--accent:#b487ff"><div class="label">Futures</div><div class="value" id="kFut">0</div><div class="sub" id="kFutSub">contracts watched</div></div>
+    <div class="kpi" style="--accent:#63a8ff"><div class="label">Spot</div><div class="value" id="kSpot">0</div><div class="sub" id="kSpotSub">pairs watched</div></div>
+    <div class="kpi" style="--accent:#2ee6a8"><div class="label">Trade-ready</div><div class="value" id="kReady">0</div><div class="sub" id="kReadySub">fee clears, edge positive</div></div>
+    <div class="kpi" style="--accent:#2ee6a8"><div class="label">A+ measured</div><div class="value" id="kAP">0</div><div class="sub" id="kAPSub">≥ 85% reached target first</div></div>
     <div class="kpi" style="--accent:#63a8ff"><div class="label">Active zones</div><div class="value" id="kActive">0</div><div class="sub" id="kActiveSub">waiting for mitigation</div></div>
     <div class="kpi" style="--accent:#ff5c7a"><div class="label">Strong high</div><div class="value" id="kSH">0</div><div class="sub">manipulation + break</div></div>
     <div class="kpi" style="--accent:#ff8fb0"><div class="label">Very strong high</div><div class="value" id="kVSH">0</div><div class="sub">+ strong level + inducement</div></div>
@@ -277,10 +326,19 @@
         <option value="1440">24 hours</option>
       </select>
     </div>
+    <div class="field"><label>market</label>
+      <select id="market">
+        <option value="all" selected>futures + spot</option>
+        <option value="futures">futures only</option>
+        <option value="spot">spot only</option>
+      </select>
+    </div>
     <div class="field"><label>quality</label>
       <select id="quality">
-        <option value="prime" selected>A+ and A (measured)</option>
-        <option value="ap">A+ only</option>
+        <option value="trade" selected>trade-ready · fee clears + edge (default)</option>
+        <option value="prime">A+ and A · measured ≥ 70%</option>
+        <option value="ap">A+ only · measured ≥ 85%</option>
+        <option value="sniper">sniper · R:R ≥ 1.5</option>
         <option value="ready">tradeable now (in trend)</option>
         <option value="conf">on a strong / very strong level</option>
         <option value="all">everything, incl. thin / range</option>
@@ -290,6 +348,8 @@
     <div class="spacer"></div>
     <div class="field"><label>sort</label>
       <select id="sort">
+        <option value="prob">measured chance (best first)</option>
+        <option value="net">expectancy after fees</option>
         <option value="new">newest</option>
         <option value="near">closest to price</option>
         <option value="strength">strongest evidence</option>
@@ -382,9 +442,13 @@
   <header><h3>Instruments</h3><div class="spacer"></div><button class="btn ghost" data-close>Close</button></header>
   <div class="body">
     <p class="note" id="symNote">Every instrument listed on the exchange can be added; the list is stored in <code>config.json</code> and streamed live.</p>
+    <div class="chips" style="margin-bottom:2px">
+      <button class="chip on" data-uni-market="spot">spot</button>
+      <button class="chip" data-uni-market="futures">futures</button>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn primary" id="btnAdd50">Add top 50 by turnover</button>
-      <button class="btn ghost" id="btnAddAll">Add every pair</button>
+      <button class="btn ghost" id="btnAddAll">Add every instrument</button>
       <button class="btn ghost" id="btnRefreshUniverse">Refresh list</button>
     </div>
     <div class="field"><label>search</label><input type="search" id="uniSearch" placeholder="btc, eth, sol…" /></div>
@@ -434,9 +498,9 @@ const TABS = [
   { id: "rejection_block_bull", label: "Rejection block · low", kinds: ["rejection_block_bull"], cls: "lo" },
 ];
 const state = {
-  data: null, tab: "all", search: "", tfs: new Set(), sort: "new",
+  data: null, tab: "all", search: "", tfs: new Set(), sort: "prob",
   showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
-  quality: "prime", hiddenByQuality: 0,
+  quality: "prime", hiddenByQuality: 0, market: "all",
   historyItems: [], historyAt: 0,
   chartKey: "", lastRender: 0,
 };
@@ -618,6 +682,21 @@ function scheduleHistory() {
   if (Date.now() - (state.historyAt || 0) < 20000) return;
   loadHistory();
 }
+const marketOf = (z) => z.market || (String(z.symbol || "").includes("_") ? "futures" : "spot");
+const RR_MIN = 1.5;
+const CONDITION_ORDER = [
+  ["grab", "grab"], ["ms", "MS"], ["major", "major level"], ["inducement", "inducement"],
+  ["algo", "algo candle"], ["displacement", "displacement"], ["block", "order block"],
+  ["session", "session"], ["confluence", "confluence"], ["trend", "trending"],
+];
+const planOf = (z) => (z && z.plan) || null;
+const planRR = (z) => { const p = planOf(z); return p && p.rr != null ? p.rr : null; };
+const isSniper = (z) => (planRR(z) || 0) >= RR_MIN;
+const probOf = (z) => (z && z.prob != null ? z.prob : null);
+const probText = (z) => { const p = probOf(z); return p == null ? "–" : Math.round(p * 100) + "%"; };
+const gradeRankOf = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
+const isTradeReady = (z) => !!z.tradable;
+
 function kindsForTab(tabId) {
   const tab = TABS.find((t) => t.id === tabId) || TABS[0];
   return new Set(tab.kinds);
@@ -634,11 +713,16 @@ function visibleZones() {
     const q = state.search.toUpperCase();
     items = items.filter((z) => z.symbol.includes(q));
   }
+  if (state.market === "futures") items = items.filter((z) => marketOf(z) === "futures");
+  else if (state.market === "spot") items = items.filter((z) => marketOf(z) === "spot");
   const gradeRank = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
   const readyOf = (z) => !!(z.now_trend && z.now_trend.ready);
   const before = items.length;
-  if (state.quality === "prime") items = items.filter((z) => gradeRank(z) >= 2);   // A+ and A
-  else if (state.quality === "ap") items = items.filter((z) => gradeRank(z) >= 3);  // A+ only
+  if (state.quality === "trade") items = items.filter(isTradeReady);
+  else if (state.quality === "prime") items = items.filter((z) => gradeRank(z) >= 2);   // A+ and A (measured)
+  else if (state.quality === "ap") items = items.filter((z) => gradeRank(z) >= 3);      // A+ only
+  else if (state.quality === "sniper") items = items.filter(isSniper);
+  else if (state.quality === "sniper_algo") items = items.filter((z) => isSniper(z) && /algo/.test(z.kind || ""));
   else if (state.quality === "ready") items = items.filter(readyOf);
   else if (state.quality === "conf") items = items.filter((z) => (z.confluence || []).length || (z.htf || []).length);
   state.hiddenByQuality = before - items.length;
@@ -650,7 +734,11 @@ function visibleZones() {
   const rank = (z) => (z.status === "active" ? 0 : 1);
   items.sort((a, b) => rank(a) - rank(b));   // active zones always lead the list
   const lead = (a, b) => (rank(a) - rank(b)) || (readyOf(b) ? 1 : 0) - (readyOf(a) ? 1 : 0) || gradeRank(b) - gradeRank(a);
-  if (state.sort === "near") items.sort((a, b) => lead(a, b) || dist(a) - dist(b));
+  if (state.sort === "prob") items.sort((a, b) => (rank(a) - rank(b))
+    || ((probOf(b) || -1) - (probOf(a) || -1))
+    || ((b.net_r || -99) - (a.net_r || -99)) || (b.time - a.time));
+  else if (state.sort === "net") items.sort((a, b) => (rank(a) - rank(b)) || ((b.net_r || -99) - (a.net_r || -99)) || (b.time - a.time));
+  else if (state.sort === "near") items.sort((a, b) => lead(a, b) || dist(a) - dist(b));
   else if (state.sort === "strength") items.sort((a, b) => lead(a, b) || (b.strength - a.strength) || (b.time - a.time));
   else if (state.sort === "symbol") items.sort((a, b) => lead(a, b) || a.symbol.localeCompare(b.symbol) || (b.time - a.time));
   else items.sort((a, b) => lead(a, b) || (b.time - a.time));
@@ -671,6 +759,21 @@ function onState() {
   const active = d.active || [];
   const byKind = {};
   active.forEach((z) => { byKind[z.kind] = (byKind[z.kind] || 0) + 1; });
+  const mc = d.market_counts || {};
+  const fut = mc.futures || {};
+  const spot = mc.spot || {};
+  $("kFut").textContent = (fut.active || 0);
+  $("kFutSub").textContent = `${fut.symbols || 0} contracts · ${fut.zones || 0} zones`;
+  $("kSpot").textContent = (spot.active || 0);
+  $("kSpotSub").textContent = `${spot.symbols || 0} pairs · ${spot.zones || 0} zones`;
+  const gc = d.grade_counts || {};
+  $("kReady").textContent = d.tradable_count || 0;
+  $("kReadySub").textContent = "fee clears, edge positive";
+  $("kAP").textContent = gc["A+"] || 0;
+  $("kAPSub").textContent = "≥ 85% reached target first";
+  if (d.model && d.model.available === false) {
+    $("kAPSub").textContent = "model missing: " + (d.model.problem || "");
+  }
   $("kActive").textContent = active.length;
   $("kSH").textContent = byKind.strong_high || 0;
   $("kVSH").textContent = byKind.very_strong_high || 0;
@@ -782,7 +885,30 @@ function drawCards() {
     host.appendChild(e);
     return;
   }
-  items.slice(0, 400).forEach((z) => host.appendChild(card(z, price[z.symbol])));
+  const groups = state.market === "all"
+    ? [["futures", "Futures", items.filter((z) => marketOf(z) === "futures")],
+       ["spot", "Spot", items.filter((z) => marketOf(z) === "spot")]]
+    : [[state.market, state.market === "futures" ? "Futures" : "Spot", items]];
+  groups.forEach(([key, label, list]) => {
+    const section = el("section", "mktsec " + key);
+    const head = el("header");
+    head.appendChild(el("h3", null, label));
+    head.appendChild(el("span", "n", String(list.length)));
+    const activeIn = list.filter((z) => z.status === "active").length;
+    const sniperIn = list.filter(isSniper).length;
+    head.appendChild(el("span", "hint", `${activeIn} active · ${sniperIn} with a measured R:R ≥ ${RR_MIN}`));
+    section.appendChild(head);
+    if (!list.length) {
+      section.appendChild(el("div", "none", key === "futures"
+        ? "no futures zone passes the current filters"
+        : "no spot zone passes the current filters"));
+    } else {
+      const grid = el("div", "grid");
+      list.slice(0, 300).forEach((z) => grid.appendChild(card(z, price[z.symbol])));
+      section.appendChild(grid);
+    }
+    host.appendChild(section);
+  });
 }
 
 function card(z, price) {
@@ -792,6 +918,9 @@ function card(z, price) {
 
   const r1 = el("div", "row1");
   r1.appendChild(el("span", "sym", z.symbol.replace("USDT", "") + (z.symbol.endsWith("USDT") ? "/USDT" : "")));
+  const mk = el("span", "mkt" + (marketOf(z) === "spot" ? " spot" : ""), marketOf(z) === "futures" ? "FUT" : "SPOT");
+  mk.title = marketOf(z) === "futures" ? "perpetual futures (MEXC contract)" : "spot pair";
+  r1.appendChild(mk);
   r1.appendChild(el("span", "tf", z.timeframe));
   const tag = el("span", "kindtag", meta.label);
   tag.style.color = meta.color;
@@ -800,8 +929,23 @@ function card(z, price) {
   r1.appendChild(tag);
   if (z.grade) {
     const g = el("span", "grade " + String(z.grade).toLowerCase().replace("+", "p"), z.grade);
-    g.title = `quality score ${z.score || 0}/100 — measured on real candles, see the README`;
+    g.title = probOf(z) == null
+      ? "no measured probability for this zone (the model file is missing)"
+      : `measured: ${probText(z)} of these plans reached their target before their stop `
+        + `(90 days of real 1m BTC, checked on a held-out 90 days - docs/conditions.md)`;
     r1.appendChild(g);
+  }
+  const p = probOf(z);
+  if (p != null) {
+    const pc = el("span", "prob " + (p >= 0.85 ? "hi" : p >= 0.7 ? "mid" : "lo"), probText(z));
+    pc.appendChild(el("small", null, " TARGET FIRST"));
+    pc.title = "measured chance that this plan reaches its liquidity target before its stop";
+    r1.appendChild(pc);
+  }
+  if (z.tradable) {
+    const t = el("span", "readytag", "TRADE-READY");
+    t.title = "the measured edge survives the exchange fee on this plan";
+    r1.appendChild(t);
   }
   r1.appendChild(el("span", "status " + z.status, z.status === "active" ? "active" : z.status));
   node.appendChild(r1);
@@ -839,6 +983,69 @@ function card(z, price) {
   if (z.block_atr != null) ctx.appendChild(el("span", null, `block ${z.block_atr}×ATR`));
   if (z.disp_atr != null) ctx.appendChild(el("span", null, `leg ${z.disp_atr}×ATR`));
   node.appendChild(ctx);
+
+  const plan = planOf(z);
+  if (plan && plan.entry != null) {
+    const box = el("div", "plan");
+    const stateRow = el("div", "row");
+    const rr = plan.rr == null ? null : plan.rr;
+    const stateName = z.plan_state || (z.status === "active" ? "waiting" : "filled");
+    stateRow.appendChild(el("span", "state " + stateName, {
+      waiting: "waiting for the entry", filled: "filled", target: "target hit", stopped: "stopped out",
+    }[stateName] || stateName));
+    if (rr != null) {
+      const chip = el("span", "rr " + (rr >= 2 ? "good" : rr >= RR_MIN ? "ok" : "thin"), `R:R ${rr}`);
+      chip.title = "target = the next liquidity pool, stop = beyond the level";
+      stateRow.appendChild(chip);
+    }
+    box.appendChild(stateRow);
+    const line = (label, value, cls) => {
+      const row = el("div", "row");
+      row.appendChild(el("span", null, label + " "));
+      row.appendChild(el("b", cls || null, value));
+      return row;
+    };
+    box.appendChild(line(plan.side === "short" ? "sell limit" : "buy limit", fmtPx(plan.entry)));
+    box.appendChild(line("stop", fmtPx(plan.stop)));
+    box.appendChild(line("target", plan.target != null ? fmtPx(plan.target) : "no pool in front"));
+    if (plan.target_source) box.appendChild(el("div", "src", "target = " + plan.target_source));
+    if (plan.risk_pct != null) {
+      const line2 = el("div", "src");
+      line2.textContent = `risk ${plan.risk_pct}% of price · plan costs ${z.fee_r == null ? "?" : z.fee_r + "R"} in fees`;
+      box.appendChild(line2);
+    }
+    node.appendChild(box);
+  }
+
+  // why this one: the book's conditions, one by one
+  if (z.cond_total) {
+    const missing = new Set(z.cond_missing || []);
+    const box = el("div", "conds");
+    const title = el("div", "src");
+    title.textContent = `${z.cond_met}/${z.cond_total} of the book's conditions`;
+    box.appendChild(title);
+    CONDITION_ORDER.forEach(([name, label]) => {
+      const on = !missing.has(name);
+      const c = el("span", "cond " + (on ? "on" : "off"), label);
+      c.title = label;
+      box.appendChild(c);
+    });
+    node.appendChild(box);
+  }
+
+  // does the trade survive the fee?
+  if (z.fee_r != null && planOf(z)) {
+    const ok = z.tradable;
+    const f = el("div", "fee " + (ok ? "ok" : "bad"));
+    if (ok) {
+      f.textContent = `tradable: ${probText(z)} chance × R:R ${planRR(z)} − fees ${z.fee_r}R = ${z.net_r}R expected per trade`;
+    } else if (z.net_r != null && z.net_r <= 0) {
+      f.textContent = `skip: at ${probText(z)} and R:R ${planRR(z)} the trade is worth ${z.net_r}R after ${z.fee_r}R of fees`;
+    } else {
+      f.textContent = `skip: the stop sits ${(planOf(z) || {}).risk_pct}% from the entry, so the round trip costs ${z.fee_r}R and eats the edge — trade this on a higher timeframe, or widen the stop`;
+    }
+    node.appendChild(f);
+  }
 
   const ev = el("ul", "evid");
   (z.evidence || []).slice(0, 5).forEach((text) => ev.appendChild(el("li", null, text)));
@@ -1373,6 +1580,11 @@ $("recentWindow").onchange = (e) => {
   state.recentMinutes = Number(e.target.value) || 120;
   loadHistory();
 };
+$("market").onchange = (e) => {
+  state.market = e.target.value;
+  drawCards();
+  if (chart.zone) renderChart();
+};
 $("quality").onchange = (e) => {
   state.quality = e.target.value;
   drawCards();
@@ -1439,9 +1651,15 @@ async function loadUniverse(force) {
     const res = await (await fetch("/api/universe" + (force ? "?force=1" : ""))).json();
     state.universe = res.items || [];
     state.uniError = res.error;
+    const f = res.futures || 0;
+    const sp = res.spot || 0;
+    const errs = res.errors || {};
+    const partial = Object.entries(errs).map(([m, e]) => `${m}: ${e}`).join(" · ");
     note.textContent = res.error
       ? `the exchange list is not reachable: ${res.error}`
-      : `${res.count} pairs listed on ${res.exchange}, biggest turnover first. Changes are saved to config.json.`;
+      : `${sp} spot pairs and ${f} futures contracts listed, biggest turnover first.`
+        + (partial ? ` One market failed: ${partial}` : "")
+        + " Spot and futures are added to their own lists and both are saved to config.json.";
   } catch (err) {
     state.uniError = String(err);
     note.textContent = "could not load the exchange list: " + err;
@@ -1453,11 +1671,16 @@ function drawUniverse() {
   const q = ($("uniSearch").value || "").trim().toUpperCase();
   const known = new Set((state.data && state.data.symbols) || []);
   host.innerHTML = "";
-  const items = state.universe.filter((it) => !q || it.symbol.includes(q)).slice(0, 120);
+  const uniMarket = state.uniMarket || "spot";
+  const items = state.universe
+    .filter((it) => (it.market || (String(it.symbol).includes("_") ? "futures" : "spot")) === uniMarket)
+    .filter((it) => !q || it.symbol.includes(q))
+    .slice(0, 120);
   if (!items.length) host.appendChild(el("div", "note", state.uniError ? "no exchange list available" : "no match"));
   items.forEach((it) => {
     const row = el("div", "symrow");
     row.appendChild(el("span", null, it.symbol));
+    if (it.max_leverage) row.appendChild(el("span", "n", `${it.max_leverage}x`));
     row.appendChild(el("span", "n", `${(it.change || 0).toFixed(1)}%`));
     const b = el("button", "btn " + (known.has(it.symbol) ? "ghost" : "primary"), known.has(it.symbol) ? "added" : "add");
     b.disabled = known.has(it.symbol);
@@ -1476,33 +1699,63 @@ function drawUniverse() {
     active.appendChild(row);
   });
 }
+// A failed add used to look like a dead button: the fetch rejected, nothing was
+// shown, and the symbol silently stayed out of the list. Every answer - a 500,
+// a rate limit, a body that is not JSON - is now printed against the drawer.
+async function postSymbols(body) {
+  try {
+    const r = await fetch("/api/symbols", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    let data = null;
+    try { data = await r.json(); } catch (e) { data = null; }
+    if (!r.ok || !data) {
+      toast(`could not change the list (HTTP ${r.status})${data && data.detail ? ": " + String(data.detail).slice(0, 120) : ""}`);
+      return null;
+    }
+    if (data.error) toast(String(data.error).slice(0, 160));
+    (data.warnings || []).forEach(toast);
+    return data;
+  } catch (e) {
+    toast(`could not reach the server: ${String(e.message || e).slice(0, 120)}`);
+    return null;
+  }
+}
 async function addSymbols(list) {
-  const res = await (await fetch("/api/symbols", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ add: list }) })).json();
-  (res.warnings || []).forEach(toast);
-  if (res.added && res.added.length) toast(`added ${res.added.length} instrument(s) - they warm up in the background`);
-  drawUniverse();
+  const res = await postSymbols({ add: list });
+  if (res && res.added && res.added.length) toast(`added ${res.added.length} instrument(s) - they warm up in the background`);
+  if (res) drawUniverse();
 }
 async function removeSymbol(sym) {
-  const res = await (await fetch("/api/symbols", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ remove: [sym] }) })).json();
-  (res.warnings || []).forEach(toast);
-  drawUniverse();
+  const res = await postSymbols({ remove: [sym] });
+  if (res) drawUniverse();
 }
 $("uniSearch").oninput = drawUniverse;
+document.querySelectorAll("[data-uni-market]").forEach((b) => {
+  b.onclick = () => {
+    state.uniMarket = b.dataset.uniMarket;
+    document.querySelectorAll("[data-uni-market]").forEach((o) => o.classList.toggle("on", o === b));
+    loadUniverse(false).then(drawUniverse);
+  };
+});
 $("btnRefreshUniverse").onclick = () => loadUniverse(true);
-$("btnAdd50").onclick = async () => {
-  const res = await (await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset: "top50" }) })).json();
-  if (res.error) return toast(res.error);
+// one path for both bulk buttons: the exchange list can be slow, rate-limited
+// or down, and the answer must say which of those happened instead of nothing
+async function addPreset(preset) {
+  let res = null;
+  try {
+    const r = await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset, market: state.uniMarket || "spot" }) });
+    try { res = await r.json(); } catch (e) { res = null; }
+    if (!r.ok || !res) return toast(`could not read the exchange list (HTTP ${r.status}) - try "Refresh list" again`);
+  } catch (e) {
+    return toast(`could not reach the server: ${String(e.message || e).slice(0, 120)}`);
+  }
+  if (res.error) return toast(String(res.error).slice(0, 160));
   (res.warnings || []).forEach(toast);
   toast(`added ${(res.added || []).length} instrument(s)`);
   drawUniverse();
-};
-$("btnAddAll").onclick = async () => {
-  const res = await (await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset: "all" }) })).json();
-  if (res.error) return toast(res.error);
-  (res.warnings || []).forEach(toast);
-  toast(`added ${(res.added || []).length} instrument(s)`);
-  drawUniverse();
-};
+}
+$("btnAdd50").onclick = () => addPreset("top50");
+$("btnAddAll").onclick = () => addPreset("all");
+
 
 $("helpBody").innerHTML = `
   <p><b style="color:#ff5c7a">Strong high</b> — a high that caused manipulation (price traded above a swing high) and then structure broke the other way (a candle closed below the opposing swing). Every strong high leaves a weak low behind it.</p>
@@ -1516,6 +1769,11 @@ $("helpBody").innerHTML = `
   <p><b style="color:#ffd479">The rectangle</b> is the order block, not the pivot body: it starts at the <b>exact high/low</b> the pattern is about and runs to the far side of the <b>last opposite-colour candle with the biggest body</b> — green at a high, red at a low. That candle is outlined in amber and labelled <b>OB</b> on the chart (with <b>◀ OB</b> / <b>OB ▶</b> if it is outside the visible window). A block is never thinner than <b>0.12 × ATR</b>.</p>
   <p><b>Grade (A+ … C)</b> — a ranking built from features that were measured on 90 days of real 1m BTC: block thickness, displacement size, FVG size and the pattern kind score the most; same-level strong confluence and the trend score a little. Measured on that data: A+ / A zones travel <b>2 × ATR</b> in your favour before the level is closed through in <b>83%</b> of cases, B in 68%, C in 54%. Full table and method: <code>docs/quality-btcusdt-1m.md</code>. The default filter shows A+ and A; "everything" brings the rest back.</p>
   <p><b>Market regime</b> — Kaufman efficiency ratio (net travel ÷ total travel over 40 bars) plus Wilder's ADX(14). Both must agree before the market is called a trend, which is what stops a wide, choppy range from looking like one. <b>TRADEABLE NOW</b> means the live trend is on this zone's side (the book's HTF-direction rule). It is not a signal to enter.</p>
+  <p><b>Futures and spot are separate sections.</b> A futures zone comes from MEXC's contract API under the contract's own name (<code>BTC_USDT</code>), a spot zone from the spot pair (<code>BTCUSDT</code>) — two different order books, two different candles. Use the <b>market</b> filter to see one or both.</p>
+  <p><b>Every zone carries a plan.</b> Entry = the near edge of the block (the limit fills as price comes back into it). Stop = <code>0.1 × ATR</code> beyond the exact high/low. Target = the <b>next liquidity pool</b> — the nearest strong level, swing or session extreme in front of the trade. The card shows the R:R and what happened: <b>waiting</b> → <b>filled</b> → <b>target hit</b> / <b>stopped out</b>. "Sniper" keeps only plans with R:R ≥ 1.5, which is the subset measured in <code>docs/quality-btcusdt-1m.md</code>.</p>
+  <p><b style="color:#2ee6a8">A+ / A / B / C is measured, not counted.</b> The letter is the probability that this plan reaches its liquidity target <i>before</i> its stop, taken from a model fitted on 90 days of real 1m BTC and checked on a held-out 90 days: A+ ≥ 85%, A ≥ 70%, B ≥ 55%. On that held-out block the A+ band reached the target 87–95% of the time and the C band 28–46%. The card also lists <b>which of the book's ten conditions</b> the setup satisfies — the count alone did <i>not</i> predict the outcome (5 conditions 62%, 8 conditions 59%), which is why the letter is not simply a count.</p>
+  <p><b style="color:#ffb3c1">Why stops got hit: the fee.</b> The fee is charged on the whole position while your risk is only the stop distance. A 1m stop here is often 0.04–0.1% of price, so a 0.08% round trip costs <b>1–2R</b> — more than the trade can make. That is why a 95% "win rate" still loses money on 1m. Every card now shows <code>risk % of price</code>, the plan's cost in R and its expected R per trade, and <b>TRADE-READY</b> only when the edge survives the fee. On the measured data that happens from 5m upwards, not on 1m.</p>
+  <p><b>More signals, best first.</b> The list is sorted by measured chance by default. The default filter <b>trade-ready</b> is the honest shortlist; below it, "everything" shows every zone the scanner found — widen the symbol list (futures contracts included) to widen the net. Breadth is what buys you more signals; the ranking is what keeps the accuracy.</p>
   <p><b>Chart</b> — drag to move it in both directions, scroll to zoom, drag the right edge for the price scale, <b>F</b> or ⛶ for full screen, <b>+ / −</b> to zoom, arrows to pan, <b>R</b> to reset.</p>
 `;
 

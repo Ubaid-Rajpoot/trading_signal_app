@@ -21,6 +21,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import config_store
 from .engine import Engine
+from .model import model as signal_model
+from .feed import is_futures, market_of, to_futures
 from .poller import RestPoller
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
@@ -71,7 +73,12 @@ def create_app(
     engine.broadcast = hub.send_all
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "mexc")
-    max_symbols = int(config.get("max_symbols", 400))
+    max_symbols = int(config.get("max_symbols", 2000))
+    scoring = signal_model()
+    engine.model_available = scoring.available
+    engine.model_problem = scoring.problem
+    engine.max_active_zones = int(config.get("max_active_zones", 200))
+    engine.max_zones = int(config.get("max_zones", 20000))
     poller = RestPoller(
         feed,
         engine,
@@ -80,15 +87,19 @@ def create_app(
         force=bool(config.get("rest_poll_always", False)),
     )
     app_state: dict[str, Any] = {"warmed": False, "warm_task": None, "poller": poller, "started_at": time.time()}
-    universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None}
+    universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None, "errors": {}}
     tasks: list[asyncio.Task] = []
     warm_queue: asyncio.Queue[str] = asyncio.Queue()
     warm_pending: set[str] = set()
+    # 1600 contracts x 5 timeframes is 8000 REST calls: one at a time would take
+    # half an hour. A few workers in parallel warm the map in minutes while the
+    # exchange's own rate limit is still respected.
+    warm_workers = max(1, int(config.get("warm_concurrency", 4)))
 
     def queue_warm(symbols: list[str]) -> None:
-        """Warm newly added instruments one at a time.
+        """Warm newly added instruments in the background, a few at a time.
 
-        Adding 300 symbols must not fire 1,500 REST calls at once - the exchange
+        Adding 1600 symbols must not fire 8,000 REST calls at once - the exchange
         would rate-limit us and every row would look broken. They warm in the
         background and show "warming" until they are ready.
         """
@@ -109,7 +120,7 @@ def create_app(
             finally:
                 warm_pending.discard(symbol)
                 warm_queue.task_done()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
 
     async def pump() -> None:
         try:
@@ -153,7 +164,8 @@ def create_app(
         # a while, so it runs next to the server, never in front of it.
         tasks.append(asyncio.create_task(warm_background()))
         tasks.append(asyncio.create_task(pump()))
-        tasks.append(asyncio.create_task(warmer()))
+        for _ in range(warm_workers):
+            tasks.append(asyncio.create_task(warmer()))
         tasks.append(asyncio.create_task(heartbeat()))
         if engine.source != "replay" or bool(config.get("rest_poll_in_replay", False)):
             tasks.append(asyncio.create_task(poller.run()))
@@ -247,7 +259,7 @@ def create_app(
         return JSONResponse(engine.snapshot())
 
     @app.get("/api/zones")
-    async def zones(status: str = "active", since: int = 0, limit: int = 1000) -> dict[str, Any]:
+    async def zones(status: str = "active", since: int = 0, limit: int = 1000, market: str = "all") -> dict[str, Any]:
         """``active``, ``mitigated``, ``invalidated``, ``resolved`` or ``all``.
 
         ``since`` (a candle timestamp) keeps the payload to zones that formed or
@@ -260,6 +272,8 @@ def create_app(
             items = [z for z in engine.zones.values() if z.get("status") != "active"]
         else:
             items = [z for z in engine.zones.values() if z.get("status") == status]
+        if market in ("spot", "futures"):
+            items = [z for z in items if (z.get("market") or market_of(z.get("symbol", ""))) == market]
         if since:
             items = [
                 z
@@ -316,10 +330,58 @@ def create_app(
             "bars": bars,
         }
 
+    @app.get("/api/signals")
+    async def signals(
+        market: str = "all",
+        timeframe: str = "",
+        grade: str = "",
+        kind: str = "",
+        tradable: int = 0,
+        status: str = "active",
+        limit: int = 200,
+        detail: int = 0,
+    ) -> dict[str, Any]:
+        """The ranked list: the best measured setups first, across every market.
+
+        This is what a wide scan needs: the top of the list is asked for, not
+        every zone of every instrument. ``detail=1`` returns the full zone (what
+        a card shows when it is opened), the default is the same compact shape
+        the live push uses.
+        """
+        items = engine.ranked(market=market, limit=max(1, min(int(limit), 2000)),
+                              only_tradable=bool(tradable), status=status)
+        if timeframe:
+            items = [z for z in items if z.get("timeframe") == timeframe]
+        if grade:
+            wanted = {g.strip().upper() for g in grade.split(",") if g.strip()}
+            items = [z for z in items if str(z.get("grade") or "").upper() in wanted]
+        if kind:
+            wanted = {k.strip() for k in kind.split(",") if k.strip()}
+            items = [z for z in items if z.get("kind") in wanted]
+        index = engine._strong_levels()  # noqa: SLF001 - the same index the push uses
+        out = []
+        for zone in items:
+            if detail:
+                engine.enrich(zone, index)
+                out.append(zone)
+            else:
+                out.append(engine.slim(zone))
+        return {
+            "count": len(out),
+            "total": len(engine.zones),
+            "tradable": engine.snapshot(cells=False, with_history=False)["tradable_count"],
+            "model": {"available": scoring.available, "problem": scoring.problem,
+                      "trained_on": scoring.meta.get("trained_on"),
+                      "holdout": (scoring.meta.get("results") or {}).get("holdout")},
+            "items": out,
+        }
+
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
         return {
             "symbols": engine.symbols,
+            "spot_symbols": [s for s in engine.symbols if not is_futures(s)],
+            "futures_symbols": [s for s in engine.symbols if is_futures(s)],
             "timeframes": engine.timeframes,
             "exchange": engine.exchange,
             "settings": engine.settings,
@@ -329,6 +391,13 @@ def create_app(
         }
 
     # --------------------------------------------------------------- symbols
+    def _market_lists() -> dict[str, Any]:
+        """Spot and futures are stored in their own lists in config.json."""
+        return {
+            "symbols": [s for s in engine.symbols if not is_futures(s)],
+            "futures_symbols": [s for s in engine.symbols if is_futures(s)],
+        }
+
     def _persist(updates: dict[str, Any]) -> str | None:
         if getattr(feed, "source", "live") == "replay":
             # A replay is a demonstration: it must never overwrite the real
@@ -387,7 +456,7 @@ def create_app(
                 }
             )
 
-        problem = _persist({"symbols": list(engine.symbols)})
+        problem = _persist(_market_lists())
         if problem:
             warnings.append(problem)
         await engine._emit_state(force=True)  # noqa: SLF001 - same module boundary
@@ -409,33 +478,49 @@ def create_app(
             return universe_cache
         try:
             items = await feed.universe()
-            universe_cache.update({"items": items, "at": now, "error": None})
+            errors = dict(getattr(feed, "universe_errors", {}) or {})
+            universe_cache.update(
+                {"items": items, "at": now, "error": None, "errors": errors}
+            )
         except Exception as exc:
             universe_cache["error"] = f"{type(exc).__name__}: {exc}"
         return universe_cache
 
     @app.get("/api/universe")
-    async def universe(force: int = 0) -> dict[str, Any]:
+    async def universe(force: int = 0, market: str = "all") -> dict[str, Any]:
         data = await _universe(force=bool(force))
+        items = data["items"]
+        if market in ("spot", "futures"):
+            items = [i for i in items if (i.get("market") or market_of(i["symbol"])) == market]
         return {
             "exchange": engine.exchange,
             "error": data["error"],
-            "count": len(data["items"]),
+            "errors": data.get("errors") or {},
+            "count": len(items),
+            "futures": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "futures"]),
+            "spot": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "spot"]),
             "fetched_at": data["at"],
-            "items": data["items"][:4000],
+            "items": items[:4000],
         }
 
     @app.post("/api/universe/add")
     async def add_from_universe(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """``{"preset": "top50"|"all"}`` or ``{"symbols": [...]}`` from the browser."""
         preset = payload.get("preset")
+        market = str(payload.get("market") or "spot").lower()
         symbols = config_store.clean_symbols(payload.get("symbols") or [])
+        if market == "futures":
+            symbols = [to_futures(s) for s in symbols]
         warnings: list[str] = []
         data = await _universe()
         if preset:
             if data["error"]:
                 return {"ok": False, "error": data["error"], "added": []}
-            ranked = [item["symbol"] for item in data["items"]]
+            ranked = [
+                item["symbol"]
+                for item in data["items"]
+                if (item.get("market") or market_of(item["symbol"])) == market
+            ]
             if preset == "all":
                 symbols = ranked
             else:
@@ -447,6 +532,10 @@ def create_app(
 
         known = set(engine.symbols)
         wanted = [s for s in symbols if s not in known]
+        if data["error"] and wanted:
+            # the exchange list is down: add what was asked for anyway, and say
+            # so - a symbol list is far more useful than a 500
+            warnings.append(f"the exchange list is unavailable ({data['error'][:80]}); added without checking it")
         if data["items"]:
             listed = {item["symbol"] for item in data["items"]}
             unknown = [s for s in wanted if s not in listed]
@@ -463,7 +552,7 @@ def create_app(
         if added:
             feed.add_symbols(added)
             queue_warm(added)
-        problem = _persist({"symbols": list(engine.symbols)})
+        problem = _persist(_market_lists())
         if problem:
             warnings.append(problem)
         await engine._emit_state(force=True)  # noqa: SLF001

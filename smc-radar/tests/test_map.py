@@ -301,3 +301,140 @@ def test_a_thin_block_scores_below_a_thick_one():
     zone.kind = "rejection_block_bear" if zone.side == "high" else "rejection_block_bull"
     map_.score_zone(zone)
     assert zone.grade in {"A+", "A"}
+
+
+# ------------------------------------------------- round 6: the trade plan
+def test_every_real_zone_carries_a_tradeable_plan():
+    """Round 6: entry at the block edge, stop beyond the level, target at the
+    liquidity pool - and never a plan on a weak (flat) marker."""
+    map_ = run(real_path(strong_high_path() * 2))
+    seen = 0
+    for zone in map_.zones:
+        if zone.kind in ("weak_high", "weak_low"):
+            assert zone.plan is None, "a flat weak marker is not a trade"
+            continue
+        seen += 1
+        plan = zone.plan
+        assert plan, f"{zone.kind} carries a plan"
+        assert plan["side"] == ("short" if zone.side == HIGH else "long")
+        # entry is the near edge of the block: the limit fills on the retest
+        assert plan["entry"] == pytest.approx(zone.bottom if zone.side == HIGH else zone.top)
+        # the stop is beyond the exact high/low, never inside it
+        if zone.side == HIGH:
+            assert plan["stop"] > zone.level
+            assert plan["stop"] > plan["entry"]
+        else:
+            assert plan["stop"] < zone.level
+            assert plan["stop"] < plan["entry"]
+        if plan["target"] is None:
+            assert plan["rr"] is None, "no pool in front means no R:R, not a made-up one"
+            assert plan["target_source"] is None
+            continue
+        # the target is the next pool IN FRONT of the trade
+        if zone.side == HIGH:
+            assert plan["target"] < plan["entry"]
+        else:
+            assert plan["target"] > plan["entry"]
+        risk = abs(plan["stop"] - plan["entry"])
+        reward = abs(plan["entry"] - plan["target"])
+        assert risk > 0 and reward > 0
+        assert plan["rr"] == pytest.approx(reward / risk, abs=0.01)  # the API rounds R:R to 2 dp
+        assert plan["target_source"], "every target names the pool it came from"
+    assert seen > 0
+
+
+def test_a_plan_fills_at_the_block_edge_and_ends_at_its_target():
+    bars = real_path(strong_high_path() * 2)
+    map_ = run(bars)
+    zone = next(
+        z for z in map_.zones
+        if z.side == HIGH and z.plan and z.plan["target"] is not None and z.plan["rr"] > 0.5
+    )
+    zone.status = "active"
+    zone.plan_state = "waiting"
+    entry, target = float(zone.plan["entry"]), float(zone.plan["target"])
+    n = len(bars)
+
+    # a candle comes back into the block and stops well above the target
+    back = (entry + target) / 2.0
+    map_.add(bar(n, back, open_=entry + (zone.top - entry) / 2, high=entry + 0.01, low=back - 0.01))
+    assert zone.plan_state == "filled", "the retest fills the limit at the block edge"
+    assert zone.plan_filled_price == pytest.approx(entry)
+
+    # the next candle reaches the pool the plan named
+    map_.add(bar(n + 1, target + 0.01, open_=back, high=back + 0.01, low=target - 0.01))
+    assert zone.plan_state == "target"
+    assert zone.plan_result_r == pytest.approx(zone.plan["rr"])
+
+
+def test_a_close_through_the_level_stops_the_plan():
+    bars = real_path(strong_high_path() * 2)
+    map_ = run(bars)
+    zone = next(z for z in map_.zones if z.side == HIGH and z.plan and z.plan["target"] is not None)
+    zone.status = "active"
+    zone.plan_state = "waiting"
+    n = len(bars)
+    # price trades up through the block and closes above the exact high
+    map_.add(bar(n, zone.top + 1.0, high=zone.top + 1.05, low=float(zone.plan["entry"])))
+    assert zone.plan_state == "stopped", "a close through the high invalidates the short"
+    assert zone.plan_result_r == -1.0
+
+
+# ------------------------------- round 7: conditions, probability and the fee
+def test_every_zone_is_checked_against_all_ten_conditions():
+    from bot.map import CONDITION_NAMES
+
+    map_ = run(real_path(strong_high_path() * 2))
+    assert len(CONDITION_NAMES) == 10
+    checked = 0
+    for zone in map_.zones:
+        if zone.kind.startswith("weak_"):
+            continue
+        checked += 1
+        assert set(zone.conds) == set(CONDITION_NAMES), "no condition is left unchecked"
+        assert zone.cond_met == sum(1 for v in zone.conds.values() if v)
+        assert 2 <= zone.cond_met <= 10
+    assert checked > 0
+
+
+def test_the_grade_is_the_measured_probability_not_the_condition_count():
+    """A setup with fewer conditions can still be the better trade - that is what
+    the 90-day study found, so the letter has to follow the measurement."""
+    from bot.model import model
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    m = model()
+    assert m.available, m.problem
+    prob = m.probability(zone)
+    assert prob is not None and 0.0 < prob < 1.0
+    cuts = DEFAULTS["prob_cuts"]
+    assert m.grade_for(prob, DEFAULTS) == (
+        "A+" if prob >= cuts["a_plus"] else "A" if prob >= cuts["a"] else "B" if prob >= cuts["b"] else "C"
+    )
+    # the letter moves with the probability, not with the count of conditions
+    zone.cond_met = 3
+    assert m.grade_for(0.99, DEFAULTS) == "A+"
+
+
+def test_a_plan_smaller_than_the_fee_is_never_marked_tradable():
+    from bot.model import SignalModel
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    zone.plan = {"rr": 2.0, "risk_pct": 0.02}      # 0.02% stop vs a 0.08% round trip
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.fee_r > 1.0, "a stop this tight costs more than the risk itself"
+    assert zone.tradable is False
+
+    zone.plan = {"rr": 2.0, "risk_pct": 0.6}       # a stop the fee cannot swallow
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.fee_r <= 0.30
+    assert zone.tradable is True
+
+
+def test_a_plan_with_no_target_gets_no_probability_free_pass():
+    from bot.model import SignalModel
+
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    zone.plan = {"rr": None, "risk_pct": 1.0}
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.net_r is None and zone.tradable is False

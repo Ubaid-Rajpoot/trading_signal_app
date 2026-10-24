@@ -30,4 +30,5 @@ frontend/dist/
 data/
 tdigm-live/data/
 smc-radar/data/
+smc-radar/study-data/
 smc-radar/tools/ui/node_modules/

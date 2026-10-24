@@ -35,7 +35,7 @@ BARS_WANTED = 400
 async def scan_symbol(feed, symbol: str, timeframes: list[str], settings: dict, minutes_per_bar: int = 0) -> list[dict]:
     zones: list[dict] = []
     for tf in timeframes:
-        interval = feed.exchange_interval(tf)
+        interval = feed.exchange_interval(tf, symbol)
         rollup = Rollup(tf) if tf != "1m" else None
         try:
             if tf == "1m" or interval is None:

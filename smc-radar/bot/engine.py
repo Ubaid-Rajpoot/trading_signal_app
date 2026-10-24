@@ -21,7 +21,10 @@ from typing import Any, Awaitable, Callable
 from collections import deque
 
 from .buckets import TIMEFRAMES, Rollup
-from .map import DEFAULTS, KINDS, TREND_KINDS, MarketMap
+from .feed import market_of, pretty_symbol
+from .map import CONDITION_NAMES, DEFAULTS, KINDS, TREND_KINDS, MarketMap
+
+ACTIVE_CAP = 200          # zones in one pushed frame (~1.8 KB each)
 
 MAX_ZONES = 1200
 MAX_HISTORY = 1500      # candles kept per instrument/timeframe for the chart
@@ -54,7 +57,13 @@ class Engine:
         self.history: dict[tuple[str, str], deque] = {}
         self.partial: dict[tuple[str, str], dict] = {}   # the candle still forming
         self.last_open: dict[str, int] = {}              # last closed 1m open_time per symbol
+        self.markets: dict[str, str] = {s: market_of(s) for s in self.symbols}
         self.zones: dict[str, dict] = {}          # key -> zone dict (live state)
+        # 1600 instruments x 5 timeframes can produce a lot of zones. The store
+        # is capped (oldest *resolved* first) so a wide scan cannot grow without
+        # bound; every live zone is always kept.
+        self.max_zones = 20000
+        self.max_active_zones = 300
         self.events: list[dict] = []              # newest first: formed / mitigated
         self.kinds: dict[str, int] = {}
         self.resolved: dict[str, int] = {"mitigated": 0, "invalidated": 0}
@@ -103,6 +112,7 @@ class Engine:
             if not symbol or symbol in self.symbols:
                 continue
             self.symbols.append(symbol)
+            self.markets[symbol] = market_of(symbol)
             self.add_cells(symbol)
             added.append(symbol)
         if added:
@@ -198,7 +208,7 @@ class Engine:
             if len(self.history.get(key, ())) >= 150:
                 self.warm_done += 1   # already warm (a replay pre-roll, say)
                 continue
-            interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
+            interval = self._interval_for_timeframe(feed, symbol, tf)
             if interval is None:
                 await self._warm_from_minutes(feed, symbol, tf)
                 self.warm_done += 1
@@ -216,6 +226,21 @@ class Engine:
             for bar in candles:
                 self._append(key, {**bar, "closed": True})
             self.warm_done += 1
+
+    @staticmethod
+    def _interval_for_timeframe(feed, symbol: str, tf: str) -> str | None:
+        """Ask the feed for its own name for this timeframe, per symbol.
+
+        A feed that fronts two markets (spot + futures) can only answer when it
+        knows which symbol, and a test double written before this existed only
+        takes one argument - so both are handled, instead of crashing a warm-up.
+        """
+        if not hasattr(feed, "exchange_interval"):
+            return tf
+        try:
+            return feed.exchange_interval(tf, symbol)
+        except TypeError:
+            return feed.exchange_interval(tf)
 
     async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> None:
         key = (symbol, tf)
@@ -289,6 +314,7 @@ class Engine:
         events = map_.add(bar)
         if events.get("zones"):
             for zone in events["zones"]:
+                zone["market"] = market_of(zone["symbol"])
                 self.zones[zone["key"]] = zone
                 self.kinds[zone["kind"]] = self.kinds.get(zone["kind"], 0) + 1
                 self.events.insert(0, {"type": "formed", "zone": zone})
@@ -306,9 +332,22 @@ class Engine:
                     self.resolved[status] += 1
                 self.events.insert(0, {"type": status, "key": item["key"], "zone": current})
         del self.events[400:]
+        self._prune_zones()
         if events.get("zones") or events.get("resolved"):
             self.last_event_at = time.time()
         return events
+
+    def _prune_zones(self) -> None:
+        """Keep the store bounded: resolved zones go first, oldest first."""
+        excess = len(self.zones) - max(1000, self.max_zones)
+        if excess <= 0:
+            return
+        resolved = sorted(
+            (z for z in self.zones.values() if z.get("status") != "active"),
+            key=lambda z: -(z.get("mitigated_at") or z.get("invalidated_at") or 0),
+        )
+        for zone in resolved[-excess:]:
+            self.zones.pop(zone.get("key"), None)
 
     def _reset_cell(self, key: tuple[str, str]) -> None:
         """A replay looped: start this cell again instead of stacking old bars."""
@@ -553,25 +592,79 @@ class Engine:
                 "ready": bool(aligned and regime["state"] in ("trend_up", "trend_down")),
             }
         zone["htf"] = self._htf_confluence(zone, index)
+        zone["market"] = market_of(zone.get("symbol", ""))
+        zone["pretty"] = pretty_symbol(zone.get("symbol", ""))
         return zone
+
+    # -------------------------------------------------------------- markets
+    def market_counts(self, active: list[dict] | None = None) -> dict[str, Any]:
+        """How many zones each market has - the page shows them side by side."""
+        active = active if active is not None else self.active_zones()
+        out: dict[str, Any] = {}
+        for market in ("spot", "futures"):
+            zones = [z for z in self.zones.values() if z.get("market") == market]
+            live = [z for z in active if z.get("market") == market]
+            out[market] = {
+                "symbols": len([s for s in self.symbols if self.markets.get(s) == market]),
+                "zones": len(zones),
+                "active": len(live),
+                "tradable": len([z for z in live if (z.get("plan") or {}).get("rr")]),
+            }
+        return out
 
     # -------------------------------------------------------------- snapshot
     @staticmethod
-    def slim(zone: dict) -> dict:
-        """Only the fields the page draws - keeps every push small."""
-        return {
+    def _regime(r: dict | None) -> dict | None:
+        """A regime in the few fields the page prints (the rest is derivable)."""
+        if not r:
+            return None
+        return {k: r.get(k) for k in ("state", "er", "adx", "aligned", "ready", "label") if k in r}
+
+    @staticmethod
+    def _plan(p: dict | None) -> dict | None:
+        if not p:
+            return None
+        return {k: p.get(k) for k in ("side", "entry", "stop", "target", "target_source",
+                                      "rr", "risk", "reward", "risk_pct", "stop_kind") if k in p}
+
+    @staticmethod
+    def slim(zone: dict, lean: bool = False) -> dict:
+        """Only the fields the page draws - keeps every push small.
+
+        ``lean`` drops the parts a wide scan cannot afford to push (the evidence
+        list, the order-block candle, the confluence detail). The page fetches
+        those from ``/api/zones`` the moment a card is opened, so nothing is
+        lost - it just is not repeated in every frame.
+        """
+        out = {
             key: zone.get(key)
             for key in (
                 "key", "kind", "side", "symbol", "timeframe", "top", "bottom", "level",
-                "time", "status", "strength", "evidence", "swept_level", "break_level",
-                "fvg", "inducement", "session", "mitigated_at", "mitigated_price",
+                "time", "status", "strength", "session", "mitigated_at", "mitigated_price",
                 "invalidated_at", "invalidated_price",
-                # round 5: the rectangle, the regime, the grade
-                "ob", "block_src", "trend", "trend_state", "aligned", "confluence", "htf",
-                "grade", "score", "entry_trend", "entry_state", "entry_aligned",
-                "fvg_atr", "disp_atr", "block_atr", "swept_major", "now_trend",
+                "block_src", "grade", "score", "block_atr", "disp_atr", "fvg_atr", "swept_major",
+                # round 6: which market, and the trade plan that goes with it
+                "market", "plan_state", "plan_filled_at", "plan_filled_price",
+                "plan_result_at", "plan_result_r",
+                # round 7: the measured probability and what it costs to trade
+                "prob", "fee_r", "net_r", "tradable", "cond_met", "cond_total",
             )
         }
+        out["plan"] = Engine._plan(zone.get("plan"))
+        out["cond_missing"] = [n for n in CONDITION_NAMES if not (zone.get("conds") or {}).get(n)]
+        if not lean:
+            out["evidence"] = zone.get("evidence")
+            out["ob"] = zone.get("ob")
+            out["fvg"] = zone.get("fvg")
+            out["confluence"] = zone.get("confluence")
+            out["htf"] = zone.get("htf")
+            out["swept_level"] = zone.get("swept_level")
+            out["break_level"] = zone.get("break_level")
+            out["inducement"] = zone.get("inducement")
+            out["trend"] = Engine._regime(zone.get("trend"))
+            out["now_trend"] = Engine._regime(zone.get("now_trend"))
+            out["entry_trend"] = Engine._regime(zone.get("entry_trend"))
+        return out
 
     @staticmethod
     def light(zone: dict) -> dict:
@@ -582,26 +675,83 @@ class Engine:
                         "mitigated_at", "invalidated_at")
         }
 
+    @staticmethod
+    def rank_key(zone: dict) -> tuple:
+        """Best first: measured chance, then expectancy, then the letter.
+
+        The letter is derived from the measured chance, so ordering by the
+        probability and *then* by the letter keeps a card whose stop is too tight
+        to pay its own fees from jumping over a card that is simply more likely
+        to reach its target. Trade-readiness is a filter - the page opens on it -
+        not a promotion: a 51 % plan is not better than a 92 % plan only because
+        its stop is wide enough to clear the fee.
+        """
+        grade = {"A+": 3, "A": 2, "B": 1, "C": 0}.get(zone.get("grade"), 0)
+        net = zone.get("net_r")
+        return (
+            1 if zone.get("status") == "active" else 0,
+            float(zone.get("prob") or 0.0),
+            float(net if net is not None else -99.0),
+            grade,
+            int(zone.get("time") or 0),
+        )
+
+    def ranked(
+        self, market: str = "", limit: int = 300, only_tradable: bool = False, status: str = "active"
+    ) -> list[dict]:
+        """Every zone, best first - the list the page's top section is built from."""
+        items = list(self.zones.values())
+        if status == "active":
+            items = [z for z in items if z.get("status") == "active"]
+        elif status != "all":
+            items = [z for z in items if z.get("status") == status]
+        if market in ("spot", "futures"):
+            items = [z for z in items if market_of(z.get("symbol", "")) == market]
+        if only_tradable:
+            items = [z for z in items if z.get("tradable")]
+        items.sort(key=self.rank_key, reverse=True)
+        return items[: max(1, int(limit))]
+
     def snapshot(self, cells: bool = True, with_history: bool = True) -> dict[str, Any]:
+        # A wide scan cannot push full detail for hundreds of zones every couple
+        # of seconds, so past this many instruments the frame goes lean and the
+        # page fetches the detail of the zone it opens.
+        lean = len(self.symbols) > 120
         index = self._strong_levels()
-        for zone in self.zones.values():
-            if zone.get("status") == "active":
-                self.enrich(zone, index)
-        active = [z for z in self.zones.values() if z.get("status") == "active"]
-        active.sort(key=lambda z: -int(z.get("time") or 0))
+        active = self.ranked("", limit=max(1, int(self.max_active_zones)))
+        # only what is actually sent is enriched: a wide scan must not pay for
+        # work the page will never see
+        for zone in active:
+            self.enrich(zone, index)
+        for zone in active:
+            zone["market"] = market_of(zone.get("symbol", ""))
         history = [z for z in self.zones.values() if z.get("status") != "active"]
         history.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or 0))
         return {
             "source": self.source,
             "exchange": self.exchange,
             "symbols": self.symbols,
+            "markets": {
+                "spot": [s for s in self.symbols if self.markets.get(s) != "futures"],
+                "futures": [s for s in self.symbols if self.markets.get(s) == "futures"],
+            },
+            "market_counts": self.market_counts(active),
             "timeframes": self.timeframes,
             "settings": self.settings,
             "kinds": [k for k in KINDS] + ["weak_high", "weak_low"],
             "counts": dict(self.kinds),
+            "grade_counts": {
+                g: sum(1 for z in self.zones.values() if z.get("status") == "active" and z.get("grade") == g)
+                for g in ("A+", "A", "B", "C")
+            },
+            "tradable_count": sum(1 for z in self.zones.values() if z.get("status") == "active" and z.get("tradable")),
+            "model": {
+                "available": bool(getattr(self, "model_available", False)),
+                "problem": getattr(self, "model_problem", None),
+            },
             "resolved": dict(self.resolved),
-            "active": [self.slim(z) for z in active[:300]],
-            "history": [self.slim(z) for z in history[:100]] if with_history else [],
+            "active": [self.slim(z, lean) for z in active[: ACTIVE_CAP]],
+            "history": [self.slim(z, lean) for z in history[:60]] if with_history else [],
             "events": [
                 {**event, "zone": self.light(event["zone"]) if isinstance(event.get("zone"), dict) else None}
                 for event in self.events[:30]

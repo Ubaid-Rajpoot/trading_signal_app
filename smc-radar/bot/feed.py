@@ -30,7 +30,7 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator, Iterable, Iterator
 
 import httpx
 
@@ -53,6 +53,46 @@ MEXC_WS_HOSTS = ["wss://wbs.mexc.com/ws", "wss://wbs-api.mexc.com/ws"]
 MEXC_WS = MEXC_WS_HOSTS[0]
 MEXC_TFS = {"1m": "1m", "3m": None, "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m"}
 MEXC_WS_INTERVAL = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60"}
+
+# ---------------------------------------------------------------- MEXC futures
+# A different host, a different namespace and a different naming convention from
+# spot: futures contracts are "BTC_USDT" and every endpoint lives under
+# contract.mexc.com. The app therefore treats the underscore as the market tag.
+MEXC_CONTRACT_REST = "https://contract.mexc.com"
+MEXC_CONTRACT_WS_HOSTS = ["wss://contract.mexc.com/edge"]
+MEXC_FUTURE_TFS = {"1m": "Min1", "3m": None, "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60"}
+FUTURE_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+
+
+def is_futures(symbol: str) -> bool:
+    """``BTC_USDT`` is a perpetual contract, ``BTCUSDT`` is the spot pair."""
+    return "_" in str(symbol)
+
+
+def market_of(symbol: str) -> str:
+    return "futures" if is_futures(symbol) else "spot"
+
+
+def to_spot(symbol: str) -> str:
+    return str(symbol).replace("_", "").upper()
+
+
+def to_futures(symbol: str) -> str:
+    """``BTCUSDT`` -> ``BTC_USDT``; anything already tagged is left alone."""
+    raw = str(symbol).upper()
+    if "_" in raw:
+        return raw
+    for quote in ("USDT", "USDC", "BTC", "ETH"):
+        if raw.endswith(quote) and len(raw) > len(quote):
+            return f"{raw[:-len(quote)]}_{quote}"
+    return raw
+
+
+def pretty_symbol(symbol: str) -> str:
+    raw = str(symbol).upper()
+    return raw.split("_")[0] + "/" + raw.split("_")[1] if "_" in raw else (
+        raw[:-4] + "/USDT" if raw.endswith("USDT") else raw
+    )
 
 
 class FeedError(RuntimeError):
@@ -120,7 +160,12 @@ class BaseFeed:
         self.connected = False
         self.status = "reconnecting (stalled stream)"
 
-    def exchange_interval(self, timeframe: str) -> str | None:
+    def exchange_interval(self, timeframe: str, symbol: str | None = None) -> str | None:
+        """The exchange's own name for this timeframe (``None`` = aggregate 1m).
+
+        ``symbol`` is optional: one market can have several feeds behind it, and
+        then only the feed that owns that symbol can answer.
+        """
         return self.tf_map.get(timeframe, timeframe)
 
     # ------------------------------------------------------------- history
@@ -512,6 +557,408 @@ class MexcFeed(BaseFeed):
         return sorted(out, key=lambda x: -x["turnover"])
 
 
+# ------------------------------------------------------------------- futures
+class MexcFuturesFeed(BaseFeed):
+    """MEXC **perpetual futures** (USDT-margined) - the contract API.
+
+    Documented shapes this class speaks (checked against the exchange's own API
+    docs, and pinned by tests with recorded frames):
+
+    * REST  ``GET https://contract.mexc.com/api/v1/contract/kline/BTC_USDT``
+      ``?interval=Min1&start=<sec>&end=<sec>`` ->
+      ``{"success": true, "data": {"time": [...], "open": [...], "close": [...],
+      "high": [...], "low": [...], "vol": [...]}}`` (seconds, max 2000 points)
+    * WS    ``wss://contract.mexc.com/edge``, subscribe one contract per frame:
+      ``{"method": "sub.kline", "param": {"symbol": "BTC_USDT", "interval": "Min1"}}``
+      and pushes ``{"channel": "push.kline", "data": {"symbol": "BTC_USDT",
+      "t": <sec>, "o": .., "c": .., "h": .., "l": .., "q": volume}}``
+    * universe ``GET /api/v1/contract/detail`` (+ ``/api/v1/contract/ticker``)
+
+    Futures candles are their own data, not spot candles relabelled: they come
+    from the contract endpoint and carry a funding-driven basis of their own.
+    """
+
+    name = "mexc_futures"
+    market = "futures"
+    tf_map = MEXC_FUTURE_TFS
+    chunk_size = 40
+
+    def __init__(self, symbols: Iterable[str], **kwargs: object) -> None:
+        canonical = []
+        for raw in symbols:
+            sym = to_futures(raw)
+            if sym and is_futures(sym):
+                canonical.append(sym)
+        super().__init__(canonical, **kwargs)
+        self._last_candle: dict[str, dict] = {}
+
+    # ------------------------------------------------------------------ rest
+    async def history(
+        self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
+    ) -> list[dict]:
+        symbol = to_futures(symbol)
+        mapped = MEXC_FUTURE_TFS.get(interval, interval)
+        if not mapped:
+            raise FeedError(f"MEXC futures has no {interval} interval - aggregate 1m instead")
+        seconds = FUTURE_SECONDS.get(interval, 60)
+        now = int(time.time())
+        start = now - min(max(1, int(limit)), 2000) * seconds - seconds
+        params = {"interval": mapped, "start": start, "end": now}
+        payload = await self._get_json(f"{MEXC_CONTRACT_REST}/api/v1/contract/kline/{symbol}", params)
+        block = (payload or {}).get("data") if isinstance(payload, dict) else None
+        if not isinstance(block, dict) or not block.get("time"):
+            raise FeedError(f"MEXC futures returned no kline for {symbol}")
+        times = block["time"]
+        now_ms = int(time.time() * 1000)
+        candles: list[dict] = []
+        for i, raw_time in enumerate(times):
+            open_time = int(raw_time) * 1000
+            close_time = open_time + seconds * 1000 - 1
+            try:
+                candles.append(
+                    {
+                        "symbol": symbol,
+                        "open_time": open_time,
+                        "close_time": close_time,
+                        "open": _num(block["open"][i]),
+                        "high": _num(block["high"][i]),
+                        "low": _num(block["low"][i]),
+                        "close": _num(block["close"][i]),
+                        "volume": _num(block.get("vol", [0] * len(times))[i]),
+                        "trades": 0,
+                        "closed": close_time < now_ms,
+                    }
+                )
+            except (IndexError, KeyError):
+                continue
+        candles = [c for c in candles if include_open or c["closed"]]
+        if not candles:
+            raise FeedError("MEXC futures returned no closed candles")
+        return sorted(candles, key=lambda c: c["open_time"])[-limit:]
+
+    # ---------------------------------------------------------------- stream
+    async def stream(self, symbols: list[str]) -> None:
+        if websockets is None:
+            raise FeedError("the 'websockets' package is not installed")
+        last_error: Exception | None = None
+        for host in MEXC_CONTRACT_WS_HOSTS:
+            try:
+                await self._stream_host(host, [to_futures(s) for s in symbols])
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self.connected = False
+                self.status = f"{host} failed: {type(exc).__name__}: {str(exc)[:70]}"
+                await asyncio.sleep(0.5)
+        raise FeedError(f"no MEXC futures websocket host delivered: {last_error}")
+
+    async def _stream_host(self, host: str, symbols: list[str]) -> None:
+        async with websockets.connect(host, ping_interval=None, close_timeout=5, max_queue=4096) as ws:
+            self.connected = True
+            self.subscribed = [f"sub.kline {s} Min1" for s in symbols]
+            for symbol in symbols:
+                await ws.send(json.dumps({"method": "sub.kline", "param": {"symbol": symbol, "interval": "Min1"}}))
+            self.status = f"futures live - {len(symbols)} contracts on {host.split('//')[1].split('/')[0]}"
+            ping = asyncio.create_task(self._ping(ws))
+            # a socket that connects and says nothing is not live: wait for one
+            first = asyncio.create_task(self._first_candle(ws))
+            try:
+                await asyncio.wait_for(asyncio.shield(first), timeout=20)
+            except asyncio.TimeoutError:
+                ping.cancel()
+                self.connected = False
+                self.status = f"{host} connected but sent no futures kline in 20s"
+                raise FeedError(self.status)
+            except Exception:
+                pass
+            finally:
+                if not first.done():
+                    first.cancel()
+            try:
+                async for raw in ws:
+                    self.sample(raw)
+                    try:
+                        message = json.loads(raw)
+                    except Exception:
+                        self.ignored += 1
+                        continue
+                    if message.get("channel") == "push.pong" or message.get("channel") == "rs.sub.kline":
+                        self.ignored += 1
+                        continue
+                    kline = self._parse(message)
+                    if kline is None:
+                        self.ignored += 1
+                        continue
+                    self.parsed += 1
+                    symbol = kline["symbol"]
+                    open_time = kline["open_time"]
+                    previous = self._last_candle.get(symbol)
+                    if previous is not None and open_time > previous["open_time"]:
+                        await self._push({**previous, "closed": True})
+                    self._last_candle[symbol] = {**kline, "closed": False}
+                    await self._push(dict(kline))
+            finally:
+                ping.cancel()
+
+    async def _first_candle(self, ws) -> None:
+        while True:
+            raw = await ws.recv()
+            self.sample(raw)
+            try:
+                message = json.loads(raw)
+            except Exception:
+                continue
+            kline = self._parse(message)
+            if kline is not None:
+                self.parsed += 1
+                self._last_candle[kline["symbol"]] = {**kline, "closed": False}
+                await self._push(dict(kline))
+                return
+
+    @staticmethod
+    def _parse(message: dict) -> dict | None:
+        """``{"channel": "push.kline", "data": {...}}`` -> a 1m candle.
+
+        The futures kline payload carries ``t`` (window start, seconds), the
+        prices ``o/h/l/c``, and the contract volume ``q``. It is not the spot
+        format, which is why a separate parser exists instead of a flag.
+        """
+        data = message.get("data")
+        if not isinstance(data, dict) or message.get("channel") != "push.kline":
+            return None
+        symbol = str(data.get("symbol") or message.get("symbol") or "").upper()
+        if not symbol:
+            return None
+        raw_time = int(_num(data.get("t"), 0))
+        if not raw_time:
+            return None
+        start = raw_time * 1000 if raw_time < 10**11 else raw_time
+        return {
+            "symbol": to_futures(symbol),
+            "open_time": start,
+            "close_time": start + 59_999,
+            "open": _num(data.get("o")),
+            "high": _num(data.get("h")),
+            "low": _num(data.get("l")),
+            "close": _num(data.get("c")),
+            "volume": _num(data.get("q") or data.get("v")),
+            "trades": 0,
+            "closed": False,
+        }
+
+    @staticmethod
+    async def _ping(ws) -> None:
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await ws.send('{"method":"ping"}')
+            except Exception:
+                return
+
+    async def universe(self) -> list[dict]:
+        detail = await self._get_json(f"{MEXC_CONTRACT_REST}/api/v1/contract/detail")
+        try:
+            tickers = await self._get_json(f"{MEXC_CONTRACT_REST}/api/v1/contract/ticker")
+        except Exception:
+            tickers = {"data": []}
+        stats = {
+            t.get("symbol"): t
+            for t in (tickers.get("data") or [])
+            if isinstance(t, dict) and t.get("symbol")
+        }
+        out = []
+        for item in (detail.get("data") or []):
+            if not isinstance(item, dict):
+                continue
+            symbol = to_futures(str(item.get("symbol") or ""))
+            if not symbol or not item.get("quoteCoin") == "USDT":
+                continue
+            tick = stats.get(item.get("symbol")) or stats.get(symbol) or {}
+            out.append(
+                {
+                    "symbol": symbol,
+                    "market": "futures",
+                    "base": item.get("baseCoin"),
+                    "quote": item.get("quoteCoin") or "USDT",
+                    "price": _num(tick.get("lastPrice")),
+                    "change": _num(tick.get("riseFallRate")) * 100,
+                    "turnover": _num(tick.get("amount24")) or _num(tick.get("volume24")),
+                    "max_leverage": item.get("maxLeverage"),
+                }
+            )
+        return sorted(out, key=lambda x: -x["turnover"])
+
+
+# ----------------------------------------------------------------- composite
+class CompositeFeed(BaseFeed):
+    """One feed in front of two markets: spot pairs and futures contracts.
+
+    The engine and the page only ever talk to this object. It routes every call
+    by the symbol's market tag (``BTCUSDT`` -> spot, ``BTC_USDT`` -> futures) and
+    merges both candle streams into the one queue the engine already reads, so a
+    futures contract is real futures data - not a spot candle wearing a label.
+    """
+
+    name = "mexc+spot+futures"
+    chunk_size = 100
+
+    def __init__(self, feeds: dict[str, BaseFeed], **_: object) -> None:
+        symbols: list[str] = []
+        for feed in feeds.values():
+            symbols += list(feed.symbols)
+        super().__init__(symbols)
+        self.feeds = feeds
+        self._own_status = "starting"
+        self.universe_errors: dict[str, str] = {}
+
+    def market_of(self, symbol: str) -> str:
+        return market_of(symbol)
+
+    def _feed_for(self, symbol: str) -> BaseFeed | None:
+        return self.feeds.get(market_of(symbol))
+
+    # ------------------------------------------------------------- symbols
+    def add_symbols(self, symbols: Iterable[str]) -> list[str]:
+        added: list[str] = []
+        for raw in symbols:
+            symbol = str(raw).upper()
+            feed = self._feed_for(symbol)
+            if feed is None:
+                continue
+            added += feed.add_symbols([symbol])
+        for symbol in added:
+            if symbol not in self._symbols:
+                self._symbols.append(symbol)
+        if added:
+            self._generation += 1
+        return sorted(set(added))
+
+    def remove_symbols(self, symbols: Iterable[str]) -> list[str]:
+        drop = {str(s).upper() for s in symbols}
+        removed: list[str] = []
+        for feed in self.feeds.values():
+            removed += feed.remove_symbols(drop)
+        self._symbols = [s for s in self._symbols if s not in drop]
+        if removed:
+            self._generation += 1
+        return sorted(set(removed))
+
+    def exchange_interval(self, timeframe: str, symbol: str | None = None) -> str | None:
+        feed = self._feed_for(symbol) if symbol else None
+        if feed is None:
+            return "1m" if timeframe == "1m" else None
+        return feed.exchange_interval(timeframe, symbol)
+
+    def force_reconnect(self) -> None:
+        for feed in self.feeds.values():
+            feed.force_reconnect()
+
+    # ------------------------------------------------------------- plumbing
+    @property
+    def status(self) -> str:  # type: ignore[override]
+        return " | ".join(self.statuses.values()) if self.statuses else self._own_status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        self._own_status = value
+
+    @property
+    def statuses(self) -> dict[str, str]:
+        return {key: feed.status for key, feed in self.feeds.items()}
+
+    def markets(self) -> list[str]:
+        return list(self.feeds)
+
+    def stats(self) -> dict:
+        return {
+            key: {
+                "connected": feed.connected,
+                "status": feed.status,
+                "messages": feed.messages,
+                "parsed": feed.parsed,
+                "candles": feed.frames,
+                "symbols": len(feed.symbols),
+                "samples": list(feed.samples[-2:]),
+            }
+            for key, feed in self.feeds.items()
+        }
+
+    async def history(
+        self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
+    ) -> list[dict]:
+        feed = self._feed_for(symbol)
+        if feed is None:
+            raise FeedError(f"no feed for {symbol}")
+        mapped = feed.exchange_interval(interval, symbol) if interval in getattr(feed, "tf_map", {}) else interval
+        return await feed.history(symbol, mapped or interval, limit, include_open)
+
+    # --------------------------------------------------------------- stream
+    async def _pump(self, feed: BaseFeed) -> None:
+        """Take one sub-feed's candles and put them on the composite queue.
+
+        The sub-feed does its own reconnecting; this only forwards. If it ever
+        stops (a replay that ran out of file), the pump restarts it instead of
+        leaving half of the market silent.
+        """
+        while True:
+            try:
+                async for candle in feed.candles():
+                    await self._push(candle)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    async def candles(self) -> AsyncIterator[dict]:  # type: ignore[override]
+        """Both markets on one stream: whatever either feed produces, as it comes.
+
+        This is the object the engine reads, so a futures contract and a spot
+        pair arrive interleaved and neither waits for the other.
+        """
+        tasks = [asyncio.create_task(self._pump(feed)) for feed in self.feeds.values()]
+        try:
+            while True:
+                yield await self.queue.get()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @property
+    def connected(self) -> bool:  # type: ignore[override]
+        return any(feed.connected for feed in self.feeds.values())
+
+    @connected.setter
+    def connected(self, value: bool) -> None:
+        self._connected = value
+
+    # ------------------------------------------------------------- universe
+    async def universe(self) -> list[dict]:
+        """Every instrument on every market, biggest turnover first.
+
+        One market failing must not hide the other: the items that did arrive are
+        returned, and the failure is recorded on :attr:`universe_errors` (shown in
+        the symbols drawer) instead of raising away the working half.
+        """
+        items: list[dict] = []
+        self.universe_errors: dict[str, str] = {}
+        for market, feed in self.feeds.items():
+            try:
+                for item in await feed.universe():
+                    items.append({**item, "market": market})
+            except Exception as exc:
+                self.universe_errors[market] = f"{type(exc).__name__}: {exc}"
+        if not items:
+            raise FeedError(
+                "; ".join(f"{k}: {v}" for k, v in self.universe_errors.items())
+                or "no market feed answered"
+            )
+        return sorted(items, key=lambda x: -float(x.get("turnover") or 0))
+
+
 # ------------------------------------------------------------------- replay
 class ReplayFeed(BaseFeed):
     """Real recorded candle files played back at ``speed`` bars per second."""
@@ -601,52 +1048,96 @@ class ReplayFeed(BaseFeed):
             "and open this panel again"
         )
 
-    async def candles(self) -> AsyncIterator[dict]:  # type: ignore[override]
+    def _rows(self, path: Path) -> Iterator[dict]:
+        """Every recorded candle of one file, as a plain generator."""
+        with path.open(newline="") as handle:
+            for index, row in enumerate(csv.reader(handle)):
+                if len(row) < 6 or index < self.skip:
+                    continue
+                raw_time = int(row[0])
+                open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
+                if open_time < 10**12:  # seconds
+                    open_time *= 1000
+                yield {
+                    "open_time": open_time,
+                    "close_time": open_time + 59_999,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "trades": 0,
+                    "closed": True,
+                }
+
+    async def candles(self) -> AsyncIterator[dict]:
+        """Both markets at once: the files are merged on time, not played in turn.
+
+        Playing one file after the other left one market frozen while the other
+        streamed, which is not what two live feeds look like. Each pass keeps one
+        cursor per file and always emits the oldest candle next, so spot and
+        futures advance together (``tools/ui/quality.mjs`` asserts both sections
+        stay alive on the same page).
+        """
         while True:
-            for symbol, path in self.files:
-                with path.open(newline="") as handle:
-                    for index, row in enumerate(csv.reader(handle)):
-                        if len(row) < 6 or index < self.skip:
-                            continue
-                        raw_time = int(row[0])
-                        open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
-                        if open_time < 10**12:  # seconds
-                            open_time *= 1000
-                        bar = {
-                            "symbol": symbol,
-                            "open_time": open_time,
-                            "close_time": open_time + 59_999,
-                            "open": float(row[1]),
-                            "high": float(row[2]),
-                            "low": float(row[3]),
-                            "close": float(row[4]),
-                            "volume": float(row[5]),
-                            "trades": 0,
-                            "closed": True,
+            heads: list[list] = [[self._rows(path), None] for _, path in self.files]
+            for head in heads:
+                head[1] = next(head[0], None)
+            while any(head[1] is not None for head in heads):
+                at = min(
+                    (i for i, h in enumerate(heads) if h[1] is not None),
+                    key=lambda i: (heads[i][1]["open_time"], i),
+                )
+                head = heads[at]
+                base = head[1]
+                head[1] = next(head[0], None)
+                bar = {**base, "symbol": self.files[at][0]}
+                if self.ticks > 1:
+                    for k in range(1, self.ticks):
+                        p = k / self.ticks
+                        o = bar["open"]
+                        close_p = o + (bar["close"] - o) * p
+                        high_p = max(o, close_p, o + (bar["high"] - o) * p)
+                        low_p = min(o, close_p, o + (bar["low"] - o) * p)
+                        yield {
+                            **bar,
+                            "high": high_p,
+                            "low": low_p,
+                            "close": close_p,
+                            "volume": bar["volume"] * p,
+                            "closed": False,
                         }
-                        if self.ticks > 1:
-                            for k in range(1, self.ticks):
-                                p = k / self.ticks
-                                o = bar["open"]
-                                close_p = o + (bar["close"] - o) * p
-                                high_p = max(o, close_p, o + (bar["high"] - o) * p)
-                                low_p = min(o, close_p, o + (bar["low"] - o) * p)
-                                yield {
-                                    **bar,
-                                    "high": high_p,
-                                    "low": low_p,
-                                    "close": close_p,
-                                    "volume": bar["volume"] * p,
-                                    "closed": False,
-                                }
-                                await asyncio.sleep(1.0 / (self.speed * self.ticks))
-                        yield bar
-                        await asyncio.sleep(1.0 / self.speed)
+                        await asyncio.sleep(1.0 / (self.speed * self.ticks))
+                yield bar
+                await asyncio.sleep(1.0 / self.speed)
             if not self.loop:
                 return
 
 
-FEEDS = {"binance": BinanceFeed, "mexc": MexcFeed}
+FEEDS = {"binance": BinanceFeed, "mexc": MexcFeed, "mexc_futures": MexcFuturesFeed}
+
+
+def make_market_feed(
+    exchange: str,
+    spot_symbols: Iterable[str],
+    futures_symbols: Iterable[str] | None = None,
+    **kwargs: object,
+) -> BaseFeed:
+    """The feed the app actually runs: spot and futures side by side.
+
+    With no futures symbols this returns the plain exchange feed, so every
+    existing entry point (and every test) keeps working unchanged.
+    """
+    key = (exchange or "binance").lower()
+    futures_symbols = [s for s in (futures_symbols or []) if str(s).strip()]
+    if key == "mexc" and futures_symbols:
+        return CompositeFeed(
+            {
+                "spot": MexcFeed(spot_symbols, **kwargs),
+                "futures": MexcFuturesFeed(futures_symbols, **kwargs),
+            }
+        )
+    return make_feed(key, list(spot_symbols) + [to_futures(s) for s in futures_symbols], **kwargs)
 
 
 def make_feed(exchange: str, symbols: Iterable[str], **kwargs: object) -> BaseFeed:

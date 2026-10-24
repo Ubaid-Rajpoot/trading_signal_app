@@ -67,8 +67,21 @@ The quality study (`tools/zone_quality.py`, results in
 31 March 2025:
 
 ```
-smc-radar/data/btc90/BTCUSDT-1m-90d.csv          # 129,600 real 1m candles
+smc-radar/study-data/BTCUSDT-1m-90d.csv          # 129,600 real 1m candles
 ```
+
+Round 6 also plays a **futures** file next to the spot one, so the replay runs
+two markets at once:
+
+```
+smc-radar/data/fut/BTC_USDT-1m-2025-01.csv       # the same real candles, under a
+                                                 # contract name - see data/fut/README.md
+```
+
+It is a copy of the spot file: MEXC's contract API is not reachable from the
+build sandbox, and inventing contract prices is not allowed. The file exists to
+prove the split (two sections, two lists, two feeds), not to model a different
+market.
 
 Both files live in a folder that is **git-ignored** (see the root `.gitignore`):
 market data is downloaded, never committed. To rebuild the file, concatenate daily
