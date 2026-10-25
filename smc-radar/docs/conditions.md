@@ -7,6 +7,13 @@ Round 7 answers three things the user said, in order:
 3. *"Give me the most signals **and** the highest accuracy, otherwise I can find
    signals better myself."*
 
+> **Superseded in part by round 8 (`docs/signals.md`).** The findings here still
+> hold — the count of conditions does not rank outcomes, the fee was eating the
+> risk, 1m is the hardest timeframe — but the letter cuts and the exit geometry
+> were re-measured and changed: the exit now skips pools closer than 1 ATR, and
+> A+ / A / B / C mean measured ≥ 90 / 85 / 75 / 60 %. Read this file for the
+> *why*, `docs/signals.md` for the settings that ship.
+
 Every number below comes from one of two commands, on real recorded candles,
 never from a promise.
 

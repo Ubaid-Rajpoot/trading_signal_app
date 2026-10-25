@@ -545,7 +545,7 @@ def test_every_pushed_zone_carries_its_grade_and_live_regime():
     json.dumps(state)
     assert state["active"], "real BTC candles produce zones"
     for zone in state["active"]:
-        assert zone["grade"] in {"A+", "A", "B", "C"}
+        assert zone["grade"] in {"A+", "A", "B", "C", "-"}
         assert isinstance(zone["score"], int)
         assert zone["now_trend"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
         assert isinstance(zone["now_trend"]["ready"], bool)
@@ -695,3 +695,34 @@ def test_the_signals_endpoint_is_ranked_and_filterable():
     assert all(z["market"] == "futures" for z in futures["items"])
     assert all(z["tradable"] for z in ready["items"])
     assert all(z["grade"] == "A+" for z in top["items"])
+
+
+# ------------------------------------------------- round 8: the signal list
+def test_signals_endpoint_returns_only_measured_fee_clearing_plans():
+    """What the page opens on: plans the model has measured at 85%+ *and* whose
+    reward pays the fee. Anything else belongs to the wider views."""
+    rows = load(2500)
+    engine = Engine(symbols=["BTCUSDT", "BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    config = {"symbols": ["BTCUSDT"], "futures_symbols": ["BTC_USDT"], "timeframes": ["5m"], "settings": {}}
+    app = create_app(config, FakeFeed(rows), engine, None)
+
+    async def go():
+        await engine.warmup(FakeFeed(rows))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+            every = (await client.get("/api/signals", params={"limit": 200})).json()
+            only = (await client.get("/api/signals", params={"signal": 1, "limit": 200})).json()
+            model = (await client.get("/api/model")).json()
+            state = (await client.get("/api/state")).json()
+        return every, only, model, state
+
+    every, only, model, state = asyncio.run(go())
+    assert every["items"], "the scan finds zones"
+    assert all(z["signal"] and z["tradable"] for z in only["items"]), "signal=1 is stricter than everything"
+    assert all((z["prob"] or 0) >= DEFAULTS["signal_prob_min"] for z in only["items"]), \
+        "a signal is at the measured bar or better"
+    assert len(only["items"]) <= len(every["items"])
+    assert state["signal_count"] >= len(only["items"]), "the counter never under-reports the list"
+    # the page prints these bands, so they have to carry their own evidence
+    assert model["available"] is True
+    assert model["bands"] and all(b["letter"] and b["n"] >= 0 for b in model["bands"])
+    assert model["command"] and "fit_model.py" in model["command"], "every band says how it was measured"

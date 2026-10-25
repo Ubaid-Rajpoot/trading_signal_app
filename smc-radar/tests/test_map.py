@@ -275,7 +275,9 @@ def test_every_zone_carries_a_grade_and_its_reason():
     assert map_.zones, "the path produces zones"
     for zone in map_.zones:
         payload = zone.as_dict()
-        assert payload["grade"] in {"A+", "A", "B", "C"}
+        # round 8: "-" is a real answer - the model measured this plan below 60%
+        # and the page says so instead of inventing a letter
+        assert payload["grade"] in {"A+", "A", "B", "C", "-"}
         assert 0 <= payload["score"] <= 100
         assert payload["trend"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
         assert payload["block_atr"] is None or payload["block_atr"] > 0
@@ -409,11 +411,13 @@ def test_the_grade_is_the_measured_probability_not_the_condition_count():
     assert prob is not None and 0.0 < prob < 1.0
     cuts = DEFAULTS["prob_cuts"]
     assert m.grade_for(prob, DEFAULTS) == (
-        "A+" if prob >= cuts["a_plus"] else "A" if prob >= cuts["a"] else "B" if prob >= cuts["b"] else "C"
+        "A+" if prob >= cuts["a_plus"] else "A" if prob >= cuts["a"] else "B" if prob >= cuts["b"]
+        else "C" if prob >= cuts.get("c", 0.60) else "-"
     )
     # the letter moves with the probability, not with the count of conditions
     zone.cond_met = 3
     assert m.grade_for(0.99, DEFAULTS) == "A+"
+    assert m.grade_for(0.30, DEFAULTS) == "-"
 
 
 def test_a_plan_smaller_than_the_fee_is_never_marked_tradable():
@@ -438,3 +442,73 @@ def test_a_plan_with_no_target_gets_no_probability_free_pass():
     zone.plan = {"rr": None, "risk_pct": 1.0}
     SignalModel().rate(zone, DEFAULTS)
     assert zone.net_r is None and zone.tradable is False
+
+
+# ------------------------------------------------- round 8: the plan that pays
+def _zones_with_targets(settings: dict) -> list:
+    map_ = run(real_path(strong_high_path() * 3), settings)
+    return [z for z in map_.zones if z.plan and z.plan.get("target") is not None]
+
+
+def test_the_target_is_never_a_pool_inside_the_noise():
+    """A pool half a tick away pays a fraction of the risk - less than the fee.
+
+    Round 8 asks for the *next meaningful* pool: with ``plan_target_atr_min`` the
+    pools closer than that fraction of ATR are skipped, so the reward a signal
+    offers is no longer dwarfed by what it risks.
+    """
+    classic = {**DEFAULTS, "plan_target_atr_min": 0.0}
+    shipped = {**DEFAULTS, "plan_target_atr_min": 1.0}
+    old = _zones_with_targets(classic)
+    new = _zones_with_targets(shipped)
+    assert old and new, "both settings must still produce plans"
+    atr = {id(z): (z.plan["entry"], z.plan["target"]) for z in new}
+    for zone in new:
+        entry, target = atr[id(zone)]
+        assert abs(entry - target) > 0, "a target is never the entry"
+    old_rr = sum((z.plan.get("rr") or 0) for z in old) / len(old)
+    new_rr = sum((z.plan.get("rr") or 0) for z in new) / len(new)
+    assert new_rr > old_rr, f"the shipped plan must pay more per unit of risk ({new_rr:.2f} vs {old_rr:.2f})"
+
+
+def test_the_stop_can_be_placed_beyond_the_red_box():
+    """``plan_stop_mode`` is a measured choice, and the card has to say which one
+    was used - a stop is never an unexplained number."""
+    level = _zones_with_targets({**DEFAULTS, "plan_stop_mode": "level"})
+    block = _zones_with_targets({**DEFAULTS, "plan_stop_mode": "block"})
+    assert level and block
+    for a, b in zip(level, block):
+        assert abs(b.plan["risk"]) >= abs(a.plan["risk"]), "the block stop is never tighter"
+    assert any("beyond the red box" in z.plan["stop_kind"] for z in block)
+    assert all("beyond the level" in z.plan["stop_kind"] for z in level)
+
+
+def test_the_fee_is_the_expected_one_not_the_worst_case():
+    """A winner pays maker on both sides, a loser pays taker on the stop, so the
+    cost that belongs in an expectancy is the weighted one."""
+    from bot.model import SignalModel
+
+    worst = SignalModel.fee_r(0.5)                  # no probability: the taker case
+    likely = SignalModel.fee_r(0.5, prob=0.95)      # a 95% winner
+    assert worst == pytest.approx((2 + 6) / 1e4 / 0.005, rel=1e-6)
+    assert likely < worst, "a mostly-winning plan pays less in fees"
+    assert likely == pytest.approx((0.95 * 4 + 0.05 * 8) / 1e4 / 0.005, rel=1e-6)
+
+
+def test_only_a_high_measured_plan_is_a_signal():
+    """The letters are accuracy bands now: A+ ≥90%, A ≥85%, B ≥75%, C ≥60%, and
+    anything below C is honestly marked '-' instead of being given a letter."""
+    from bot.model import SignalModel
+
+    m = SignalModel()
+    assert m.available, m.problem
+    zone = run(real_path(strong_high_path() * 2)).zones[0]
+    zone.plan = {"rr": 1.0, "risk_pct": 0.5, "target": 1.0, "stop": 2.0, "entry": 1.5}
+    assert m.grade_for(0.95, DEFAULTS) == "A+"
+    assert m.grade_for(0.86, DEFAULTS) == "A"
+    assert m.grade_for(0.78, DEFAULTS) == "B"
+    assert m.grade_for(0.62, DEFAULTS) == "C"
+    assert m.grade_for(0.40, DEFAULTS) == "-"
+    # and the band the card prints is the measured record of that letter
+    band = m.band(0.86)
+    assert band and band["letter"] == "A" and band["n"] >= 1 and 0 < band["win"] <= 1

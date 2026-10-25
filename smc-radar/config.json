@@ -12,7 +12,19 @@
     "LINKUSDT",
     "TONUSDT",
     "SUIUSDT",
-    "PEPEUSDT"
+    "PEPEUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "INJUSDT",
+    "FILUSDT",
+    "ATOMUSDT",
+    "LTCUSDT",
+    "DOTUSDT",
+    "TRXUSDT",
+    "ETCUSDT",
+    "BCHUSDT"
   ],
   "futures_symbols": [
     "BTC_USDT",
@@ -26,7 +38,19 @@
     "LINK_USDT",
     "TON_USDT",
     "SUI_USDT",
-    "PEPE_USDT"
+    "PEPE_USDT",
+    "NEAR_USDT",
+    "APT_USDT",
+    "ARB_USDT",
+    "OP_USDT",
+    "INJ_USDT",
+    "FIL_USDT",
+    "ATOM_USDT",
+    "LTC_USDT",
+    "DOT_USDT",
+    "TRX_USDT",
+    "ETC_USDT",
+    "BCH_USDT"
   ],
   "timeframes": [
     "1m",
@@ -70,13 +94,18 @@
     ],
     "plan_min_risk_pct": 0.0,
     "prob_cuts": {
-      "a_plus": 0.85,
-      "a": 0.7,
-      "b": 0.55
+      "a_plus": 0.9,
+      "a": 0.85,
+      "b": 0.75,
+      "c": 0.6
     },
     "fee_maker_bps": 2.0,
     "fee_taker_bps": 6.0,
-    "fee_max_r": 0.3
+    "fee_max_r": 0.3,
+    "plan_target_atr_min": 1.0,
+    "plan_stop_mode": "level",
+    "plan_stop_atr": 0.1,
+    "signal_prob_min": 0.85
   },
   "server": {
     "host": "0.0.0.0",

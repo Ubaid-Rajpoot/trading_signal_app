@@ -318,8 +318,25 @@ ok(Number(doc.getElementById("kFut").textContent) === st.market_counts.futures.a
    `the futures KPI shows the futures active count (${doc.getElementById("kFut").textContent})`);
 ok(Number(doc.getElementById("kSpot").textContent) === st.market_counts.spot.active,
    `the spot KPI shows the spot active count (${doc.getElementById("kSpot").textContent})`);
-ok(Number(doc.getElementById("kAP").textContent) === (st.grade_counts?.["A+"] ?? -1),
-   `the A+ KPI shows the measured A+ count (${doc.getElementById("kAP").textContent})`);
+// round 8: the "measured hit rate" KPI is the band's out-of-sample record,
+// not a count of letters
+const bands = ev("state.bands") || [];
+const aBand = bands.find((b) => b.letter === "A") || bands[0];
+ok(!!aBand && doc.getElementById("kAP").textContent === Math.round(aBand.win * 100) + "%",
+   `the measured-hit-rate KPI prints the out-of-sample band (${doc.getElementById("kAP").textContent})`);
+ok(!!aBand && aBand.win >= 0.90 && aBand.n >= 100,
+   `that band is 90%+ on a real sample (${aBand ? Math.round(aBand.win * 100) + "% on " + aBand.n : "none"})`);
+ok(Number(doc.getElementById("kReady").textContent) === (st.signal_count ?? -1),
+   `the signals KPI shows the signal count (${doc.getElementById("kReady").textContent})`);
+ok(Number(doc.getElementById("hNow").textContent) >= 0, "the hero strip reports the live signal count");
+ok([...doc.querySelectorAll("#heroList .sigcard")].every((c) => /measured ·/.test(c.textContent)),
+   "every hero card states the measurement it stands on");
+// the signals endpoint and the default filter agree
+const sigOnly = await (await fetch(BASE + "/api/signals?signal=1&limit=50")).json();
+ok(sigOnly.items.every((z) => z.signal && z.tradable), "signal=1 keeps only measured, fee-clearing plans");
+ok(sigOnly.items.every((z) => (z.prob || 0) >= 0.85), "every one of them is at 85% measured or better");
+ok((await (await fetch(BASE + "/api/model")).json()).bands.every((b) => b.cut && b.n >= 0),
+   "the model endpoint serves the bands the page prints");
 ok(/R:R ≥ 1.5/.test(doc.getElementById("helpBody").textContent), "the help drawer explains the plan and the sniper filter");
 
 console.log(fail.length ? `\n${fail.length} FAILED` : "\nALL CHECKS PASSED");

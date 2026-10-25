@@ -86,13 +86,35 @@ DEFAULTS: dict[str, Any] = {
     "plan_min_risk_pct": 0.0,
     "plan_pool_bars": 120,      # how far back the next liquidity pool is looked for
     "plan_pool_age": 600,       # bars a strong level stays a valid target
+    # Where the stop goes. "level" is the tight one the app shipped with (a
+    # tenth of an ATR beyond the exact high/low); "block" puts it beyond the far
+    # side of the red box as well, which is the same rule the book states for the
+    # invalidation and is what the round-8 measurement asked for: on 90d of 1m
+    # BTC it lifts the hit rate from 61% to 74% and triples the number of plans
+    # the fee leaves tradable. Measured in tools/plan_study.py.
+    "plan_stop_mode": "level",  # "level" | "block"
+    # The exit is still the next liquidity level, but a pool half a tick away is
+    # not a target - it pays a fraction of the risk and less than the fee. This
+    # is the minimum distance to a pool, in ATR, that can be called "the next
+    # liquidity"; pools closer than this are skipped and the next one is used.
+    # Round 8: the shipped value is 1.0 ATR. Measured on 90 days of real 1m BTC
+    # (every timeframe, held-out block): with the nearest pool the plan pays a
+    # fifth of its risk and the fee eats the rest (net -0.01 R per trade); with
+    # a pool at least 1 ATR away it pays 0.75 R and the selected signals net
+    # +0.54 R at 97% accuracy. 0 restores the old "nearest pool" behaviour.
+    "plan_target_atr_min": 1.0,
     # --- the checklist behind the grade (round 7) ----------------------------
     "cond_disp_atr": 2.0,       # "aggressive displacement" = this many ATR
     # The letter is the measured probability, not a count: on 90d of 1m BTC the
-    # count of conditions did not rank outcomes (docs/conditions.md), while the
-    # model's top decile won 95% on a held-out 90d block. These cuts are the
-    # bands that report printed (85%+ / 70%+ / 55%+).
-    "prob_cuts": {"a_plus": 0.85, "a": 0.70, "b": 0.55},
+    # count of conditions did not rank outcomes (docs/conditions.md). Round 8
+    # re-cut the bands so that every letter states an accuracy the held-out
+    # block actually delivered (docs/signals.md):
+    #   A+ >= 90% -> measured 97%    A >= 85% -> 97%
+    #   B  >= 75% -> 95%             C >= 60% -> 90%    below C: not a signal
+    "prob_cuts": {"a_plus": 0.90, "a": 0.85, "b": 0.75, "c": 0.60},
+    # What counts as a signal on the page: a plan the model has measured at 85%
+    # or better *and* whose fee the reward can pay for.
+    "signal_prob_min": 0.85,
     # MEXC futures: 0.02% maker, 0.06% taker. The plan is limit-in, limit-out,
     # and a stop crosses the spread - so a plan costs (maker + taker) in R.
     "fee_maker_bps": 2.0,
@@ -222,6 +244,9 @@ class Zone:
     fee_r: float | None = None     # round-trip cost of the plan, in R
     net_r: float | None = None     # expectancy in R after that cost
     tradable: bool = False         # the fee does not swallow the edge
+    # --- round 8: is this one of the signals the user trades ----------------
+    signal: bool = False           # measured at signal_prob_min or better, fee clears
+    measured: dict[str, Any] | None = None   # the band's out-of-sample record
     # the regime at the moment price came back into the block: this is the
     # moment a trade is actually taken, so it gets its own snapshot
     entry_trend: dict[str, Any] | None = None
@@ -296,6 +321,8 @@ class Zone:
             "fee_r": self.fee_r,
             "net_r": self.net_r,
             "tradable": self.tradable,
+            "signal": self.signal,
+            "measured": self.measured,
             "entry_trend": self.entry_trend,
             "entry_state": (self.entry_trend or {}).get("state"),
             "entry_aligned": (self.entry_trend or {}).get("aligned"),
@@ -737,12 +764,15 @@ class MarketMap:
         for a long.
         """
         atr = self.atr_now() or 0.0
+        min_dist = float(self.cfg.get("plan_target_atr_min", 0.0) or 0.0) * atr
         closest: tuple[float, str] | None = None
 
         def offer(price: float | None, label: str) -> None:
             nonlocal closest
             if price is None or not isfinite_p(price):
                 return
+            if min_dist > 0 and abs(price - entry) < min_dist:
+                return      # too close to pay for the risk: not a target
             if side == HIGH:          # a short: the target is below the entry
                 if price >= entry:
                     return
@@ -798,7 +828,11 @@ class MarketMap:
             buffer = max(abs(float(zone.level)) * 1e-4, 1e-9)
         high_side = zone.side == HIGH
         entry = float(zone.bottom) if high_side else float(zone.top)
-        stop = float(zone.level) + buffer if high_side else float(zone.level) - buffer
+        # "block": the invalidation is the whole red box, not just the exact
+        # high/low - a wick through the box is noise, a close beyond it is the
+        # pattern failing. The stop still sits a tenth of an ATR outside it.
+        block = abs(float(zone.top) - float(zone.bottom)) if self.cfg.get("plan_stop_mode") == "block" else 0.0
+        stop = (float(zone.level) + buffer + block) if high_side else (float(zone.level) - buffer - block)
         # a stop tighter than this fraction of price is inside the fee
         floor = float(self.cfg.get("plan_min_risk_pct", 0.0)) / 100.0 * abs(entry)
         distance = abs(stop - entry)
@@ -819,13 +853,19 @@ class MarketMap:
             "reward": round(reward, 8) if reward is not None else None,
             "rr": round(rr, 2) if rr is not None else None,
             "entry_kind": "limit at the block edge",
-            "stop_kind": (
-                f"{self.cfg.get('plan_stop_atr', 0.10)} ATR beyond the level"
-                if not (floor > 0 and distance > 0 and abs(abs(stop - entry) - floor) < 1e-12 and abs(zone.level - stop) < buffer * 1.5 + 1e-12)
-                else f"{self.cfg.get('plan_min_risk_pct')}% of price (fee floor)"
-            ),
+            "stop_kind": self._stop_kind(zone, buffer, block, floor, distance, stop),
             "risk_pct": round(distance / abs(entry) * 100.0, 4) if entry else None,
         }
+
+    def _stop_kind(self, zone: Zone, buffer: float, block: float, floor: float, distance: float,
+                   stop: float) -> str:
+        """A one-line reason for the stop, so a number is never unexplained."""
+        if floor > 0 and distance > 0 and abs(abs(stop - float(zone.level)) - buffer - block) > 1e-12:
+            return f"{self.cfg.get('plan_min_risk_pct')}% of price (fee floor)"
+        atr_part = f"{self.cfg.get('plan_stop_atr', 0.10)} ATR"
+        if block > 0:
+            return f"beyond the red box + {atr_part}"
+        return f"{atr_part} beyond the level"
 
     def evaluate_conditions(self, zone: Zone, regime: dict[str, Any] | None = None) -> Zone:
         """Check the zone against all ten conditions of the book.

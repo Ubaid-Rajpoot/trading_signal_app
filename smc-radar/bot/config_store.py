@@ -71,6 +71,11 @@ def validate_settings(payload: dict[str, Any]) -> dict[str, Any]:
     merged["major_len"] = max(int(merged["pivot_len"]) + 1, int(merged["major_len"]))
     if merged.get("mitigation_mode") not in {"zone", "level"}:
         merged["mitigation_mode"] = "zone"
+    if merged.get("plan_stop_mode") not in {"level", "block"}:
+        merged["plan_stop_mode"] = "level"
+    # the target minimum and the fee ceiling are fractions of a plan, not prices
+    merged["plan_target_atr_min"] = max(0.0, min(10.0, float(merged.get("plan_target_atr_min", 1.0))))
+    merged["signal_prob_min"] = max(0.3, min(0.999, float(merged.get("signal_prob_min", 0.85))))
     merged["induce_count"] = max(1, int(merged["induce_count"]))
     return merged
 

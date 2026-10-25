@@ -255,6 +255,45 @@ every zone comes back, with the reason it was hidden shown on its card.
   unchanged; the default quality filter is still A+ and A; old modes are one
   click away.
 
+### Round 8 — the exit was the bug: many signals, 97 % measured, and a reward that pays
+
+The complaint: *"futures still has too few signals; I want a system with a lot of
+signals on 1m and 5m, and those signals should be above 90 % accuracy."* The
+measurement said the patterns were not the problem — the **exit** was.
+
+* **The exit was a few ticks away.** "Exit at the next liquidity level" was coded
+  as *the nearest* pool, and on 1m structure that is often a 3-bar swing inside the
+  block. The plan risked 0.25 % to make 0.03 %, so the 0.08 % round-trip fee cost
+  more than the reward: **−0.01 R per trade** on the held-out block, and no stop
+  width escaped it. The exit rule now skips pools closer than **1 ATR** — a tick
+  inside the block is not a liquidity level — and takes the next real one. Outcome
+  on the unseen 90 days: median reward **0.75 R** instead of 0.15 R, and the
+  selected signals net **+0.54 R** each instead of −0.01 R.
+* **The model now sees the plan.** Round 7's features were the book's conditions
+  only, so it could not tell a setup with room to run from one already at its
+  target. Round 8 adds the plan's own geometry (`log(risk_pct)`, `block_atr`) and
+  the timeframe. AUC 0.789 on the held-out block, calibration 0.80–0.90 predicted
+  → 87 % actual.
+* **The letters are accuracy bands now.** A+ = measured ≥ 90 % (97 % actual),
+  A = ≥ 85 % (97 %), B = ≥ 75 % (95 %), C = ≥ 60 % (90 %); below that the grade is
+  an honest `–` and it is not a signal. The page opens on **A+ and A**: at the
+  85 % bar, 341 out-of-sample signals in 90 days on BTC alone — **1.4 a day on 1m,
+  1.5 a day on 5m**, ~70 a day across the 24+24 instruments in `config.json`, and
+  about 90 across all four timeframes. Higher timeframes stay small, as asked.
+* **The page leads with them.** A new **signal strip** at the top shows the live
+  signals with entry / stop / target, the measured hit rate of their band and the
+  R each is expected to make after fees; the hero KPIs print *live now*,
+  *measured hit rate* and *signals per day*; the default filter is
+  `signals · measured ≥ 85 %`; `GET /api/signals?signal=1` and `GET /api/model`
+  serve the same thing to anything else you want to build on top.
+* **Nothing was deleted and no default was swapped silently.** `plan_target_atr_min:
+  0` restores round 7's nearest-pool exit exactly, `plan_stop_mode: level|block`
+  exposes the stop choice that was measured (the block stop is *worse*: it halves
+  the reward and only adds 2 points of accuracy), and both live in the settings
+  drawer next to the signal bar, saved into `config.json`.
+
+Full tables, intervals and the reproduce command: [`docs/signals.md`](docs/signals.md).
+
 ### Round 7 — the letter is measured, the fee is part of the plan, and the live feed works
 
 Three complaints came back from the user, and all three were real:
@@ -327,7 +366,10 @@ there.
 | `plan_pool_bars` | 120 | how far back the session extreme used as a target may be |
 | `plan_pool_age` | 600 | bars a strong level stays a valid target |
 | `cond_disp_atr` | 2.0 | "aggressive displacement" = this many ATR (a condition) |
-| `prob_cuts` | A+ 0.85, A 0.70, B 0.55 | measured probability → letter |
+| `plan_target_atr_min` | **1.0** | round 8: the exit pool must be at least this × ATR away (`0` = round 7's nearest pool) |
+| `plan_stop_mode` | `level` | stop beyond the exact high/low; `block` puts it beyond the far side of the red box too (measured worse) |
+| `signal_prob_min` | 0.85 | what the page calls a signal: measured at this bar *and* the fee clears |
+| `prob_cuts` | A+ 0.90, A 0.85, B 0.75, C 0.60 | measured probability → letter (each letter's own record is in `docs/signals.md`) |
 | `fee_maker_bps` / `fee_taker_bps` | 2 / 6 | MEXC futures fees used to cost the plan |
 | `fee_max_r` | 0.30 | a plan costing more than this share of the risk is not tradable |
 
@@ -343,13 +385,13 @@ Live-only keys (top level of `config.json`):
 
 ```bash
 cd smc-radar
-../.venv/bin/python -m pytest tests -q                 # 58 passed
+../.venv/bin/python -m pytest tests -q                 # 65 passed
 ../.venv/bin/python tools/scan_now.py --replay data/btc --timeframes 5m 15m 1h
 ../.venv/bin/python tools/zone_quality.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 ../.venv/bin/python tools/plan_study.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m --horizon 240
 ../.venv/bin/python tools/condition_study.py --csv study-data/BTCUSDT-1m-90d.csv --timeframe 1m
 ../.venv/bin/python tools/fit_model.py --train study-data/BTCUSDT-1m-90d.csv \
-    --holdout study-data/BTCUSDT-1m-90d-holdout.csv --timeframe 1m
+    --holdout study-data/BTCUSDT-1m-90d-holdout.csv --target-atr-min 1.0   # docs/signals.md
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
 cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node quality.mjs
 ```

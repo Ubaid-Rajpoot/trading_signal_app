@@ -199,6 +199,37 @@
   .toast.on { opacity: 1; transform: translateX(-50%); }
 
   /* grade + regime chips (round 5) */
+  /* round 8: the signal strip - the best measured setups, big */
+  .hero { margin: 12px 18px 0; border: 1px solid #1d3550; border-radius: 14px;
+    background: linear-gradient(180deg, rgba(20,32,52,.95), rgba(12,20,33,.95));
+    box-shadow: 0 0 0 1px rgba(46,230,168,.06), 0 18px 40px rgba(0,0,0,.35); overflow: hidden; }
+  .herotop { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid #16283c; }
+  .herotitle b { font-size: 15px; letter-spacing: .26em; color: #eaf3ff; }
+  .herotitle span { display: block; font-size: 10.5px; letter-spacing: .1em; color: var(--muted); text-transform: uppercase; }
+  .herokpis { display: flex; gap: 22px; flex-wrap: wrap; }
+  .herokpis > div { display: flex; flex-direction: column; }
+  .herokpis .hl { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+  .herokpis .hv { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .herokpis .hsub { font-weight: 400; color: #5f7692; letter-spacing: 0; text-transform: none; margin-left: 4px; }
+  .heroList { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; padding: 12px 16px 14px; }
+  .heroNone { color: var(--muted); font-size: 12.5px; padding: 6px 2px; }
+  .sigcard { border: 1px solid #1e3a2c; border-radius: 12px; padding: 10px 12px;
+    background: linear-gradient(180deg, rgba(22,44,36,.55), rgba(14,24,22,.55)); cursor: pointer; }
+  .sigcard.sell { border-color: #3a2130; background: linear-gradient(180deg, rgba(48,22,32,.5), rgba(24,14,18,.55)); }
+  .sigcard:hover { border-color: #2ee6a8; }
+  .sighead { display: flex; align-items: baseline; gap: 8px; }
+  .sighead .sym { font-weight: 800; font-size: 15px; letter-spacing: .02em; }
+  .sighead .dir { font-size: 10px; font-weight: 900; letter-spacing: .12em; padding: 2px 6px; border-radius: 5px; }
+  .sigcard .dir.long { color: #0b1a14; background: #2ee6a8; }
+  .sigcard .dir.short { color: #1a0b10; background: #ff5c7a; }
+  .sighead .acc { margin-left: auto; font-size: 18px; font-weight: 900; color: #7dffc4; font-variant-numeric: tabular-nums; }
+  .sigmeta { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-top: 2px; }
+  .sigrow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+  .sigrow div { background: rgba(8,14,22,.55); border: 1px solid #17293c; border-radius: 8px; padding: 5px 7px; }
+  .sigrow span { display: block; font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  .sigrow b { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .sigfoot { margin-top: 7px; font-size: 10.5px; color: #86a0bd; display: flex; justify-content: space-between; gap: 8px; }
   .grade { font-size: 10.5px; font-weight: 900; letter-spacing: .04em; padding: 2px 6px; border-radius: 6px; border: 1px solid; }
   .grade.ap { color: #ffd479; background: rgba(255,212,121,.1); border-color: #7a5f22; }
   .grade.a  { color: #9fe8c8; background: rgba(46,230,168,.08); border-color: #1d5c47; }
@@ -292,11 +323,24 @@
     <button class="btn ghost" id="btnHelp">?</button>
   </header>
 
+  <section class="hero" id="hero">
+    <div class="herotop">
+      <div class="herotitle"><b>SIGNALS</b><span>measured on real candles, out of sample</span></div>
+      <div class="herokpis">
+        <div><span class="hl">live now</span><span class="hv" id="hNow">0</span></div>
+        <div><span class="hl">measured hit rate</span><span class="hv" id="hWin">–</span></div>
+        <div><span class="hl">R per signal</span><span class="hv" id="hNet">–</span></div>
+        <div><span class="hl">signals / day<span class="hsub" id="hPerDay"></span></span><span class="hv" id="hDaily">–</span></div>
+      </div>
+    </div>
+    <div class="heroList" id="heroList"></div>
+  </section>
+
   <section class="kpis">
     <div class="kpi" style="--accent:#b487ff"><div class="label">Futures</div><div class="value" id="kFut">0</div><div class="sub" id="kFutSub">contracts watched</div></div>
     <div class="kpi" style="--accent:#63a8ff"><div class="label">Spot</div><div class="value" id="kSpot">0</div><div class="sub" id="kSpotSub">pairs watched</div></div>
-    <div class="kpi" style="--accent:#2ee6a8"><div class="label">Trade-ready</div><div class="value" id="kReady">0</div><div class="sub" id="kReadySub">fee clears, edge positive</div></div>
-    <div class="kpi" style="--accent:#2ee6a8"><div class="label">A+ measured</div><div class="value" id="kAP">0</div><div class="sub" id="kAPSub">≥ 85% reached target first</div></div>
+    <div class="kpi" style="--accent:#2ee6a8"><div class="label">Signals now</div><div class="value" id="kReady">0</div><div class="sub" id="kReadySub">measured ≥ 85% and the fee clears</div></div>
+    <div class="kpi" style="--accent:#7dffc4"><div class="label">Measured hit rate</div><div class="value" id="kAP">–</div><div class="sub" id="kAPSub">out of sample, this band</div></div>
     <div class="kpi" style="--accent:#63a8ff"><div class="label">Active zones</div><div class="value" id="kActive">0</div><div class="sub" id="kActiveSub">waiting for mitigation</div></div>
     <div class="kpi" style="--accent:#ff5c7a"><div class="label">Strong high</div><div class="value" id="kSH">0</div><div class="sub">manipulation + break</div></div>
     <div class="kpi" style="--accent:#ff8fb0"><div class="label">Very strong high</div><div class="value" id="kVSH">0</div><div class="sub">+ strong level + inducement</div></div>
@@ -335,9 +379,11 @@
     </div>
     <div class="field"><label>quality</label>
       <select id="quality">
-        <option value="trade" selected>trade-ready · fee clears + edge (default)</option>
-        <option value="prime">A+ and A · measured ≥ 70%</option>
-        <option value="ap">A+ only · measured ≥ 85%</option>
+        <option value="signals" selected>signals · measured ≥ 85% (default)</option>
+        <option value="ninety">every ≥ 90% band (more, smaller)</option>
+        <option value="trade">trade-ready · fee clears + edge</option>
+        <option value="prime">A+ and A · measured ≥ 85%</option>
+        <option value="ap">A+ only · measured ≥ 90%</option>
         <option value="sniper">sniper · R:R ≥ 1.5</option>
         <option value="ready">tradeable now (in trend)</option>
         <option value="conf">on a strong / very strong level</option>
@@ -414,6 +460,10 @@
       <label>equal levels = inducement<input type="number" id="s_induce_count" min="1" max="10" /></label>
       <label>ATR period<input type="number" id="s_atr_period" min="2" max="200" /></label>
       <label>zone expiry (bars)<input type="number" id="s_max_zone_age" min="50" max="20000" /></label>
+      <label>target at least (× ATR)<input type="number" id="s_plan_target_atr_min" step="0.1" min="0" max="10" /></label>
+      <label>signal needs (measured)<input type="number" id="s_signal_prob_min" step="0.01" min="0.3" max="0.999" /></label>
+      <label>stop placed<input type="text" id="s_plan_stop_mode" placeholder="level | block" /></label>
+      <label>max fee share of risk<input type="number" id="s_fee_max_r" step="0.05" min="0" max="5" /></label>
       <label>mitigation
         <select id="s_mitigation_mode">
           <option value="zone">price enters the block</option>
@@ -500,7 +550,8 @@ const TABS = [
 const state = {
   data: null, tab: "all", search: "", tfs: new Set(), sort: "prob",
   showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
-  quality: "prime", hiddenByQuality: 0, market: "all",
+  quality: "signals", hiddenByQuality: 0, market: "all",
+  bands: [],
   historyItems: [], historyAt: 0,
   chartKey: "", lastRender: 0,
 };
@@ -718,7 +769,9 @@ function visibleZones() {
   const gradeRank = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
   const readyOf = (z) => !!(z.now_trend && z.now_trend.ready);
   const before = items.length;
-  if (state.quality === "trade") items = items.filter(isTradeReady);
+  if (state.quality === "signals") items = items.filter((z) => !!z.signal);            // p >= 85% and the fee clears
+  else if (state.quality === "ninety") items = items.filter((z) => (z.prob || 0) >= 0.60);  // the whole >= 90% band
+  else if (state.quality === "trade") items = items.filter(isTradeReady);
   else if (state.quality === "prime") items = items.filter((z) => gradeRank(z) >= 2);   // A+ and A (measured)
   else if (state.quality === "ap") items = items.filter((z) => gradeRank(z) >= 3);      // A+ only
   else if (state.quality === "sniper") items = items.filter(isSniper);
@@ -745,6 +798,85 @@ function visibleZones() {
   return items;
 }
 
+// ---------------------------------------------------------------- signals
+// The strip at the top of the page. It shows only plans whose *measured*
+// accuracy (out of sample, from /api/model) is 90% or better and whose reward
+// pays the exchange fee - the whole point of round 8.
+async function loadBands() {
+  try {
+    const res = await fetch("/api/model", { cache: "no-store" });
+    const data = await res.json();
+    state.bands = data.bands || [];
+    state.modelInfo = data;
+  } catch (e) {
+    state.bands = [];
+  }
+  drawHero();
+}
+
+function heroSignals() {
+  const d = state.data;
+  if (!d) return [];
+  return (d.active || [])
+    .filter((z) => z.signal)
+    .sort((a, b) => (b.prob || 0) - (a.prob || 0));
+}
+
+function drawHero() {
+  const host = $("heroList");
+  if (!host) return;
+  const list = heroSignals();
+  const bands = state.bands || [];
+  const aBand = bands.find((b) => b.letter === "A") || bands[0];
+  $("hNow").textContent = list.length;
+  $("hNow").style.color = list.length ? "#7dffc4" : "#5f7692";
+  $("hWin").textContent = aBand ? Math.round(aBand.win * 100) + "%" : "–";
+  if (aBand) $("hPerDay").textContent = `· ${aBand.n} in 90d`;
+  const best = list[0];
+  $("hNet").textContent = best && best.net_r != null ? `${best.net_r > 0 ? "+" : ""}${best.net_r.toFixed(2)}R` : "–";
+  const perDay = aBand ? (aBand.n / 90).toFixed(1) : null;
+  $("hDaily").textContent = perDay ? perDay : "–";
+  host.innerHTML = "";
+  if (!list.length) {
+    const e = el("div", "heroNone");
+    e.textContent = "No plan has cleared the 85% measured bar right now, so the page shows none. "
+      + "Switch quality to \"every ≥ 90% band\" to see the wider band, or wait for the next candle.";
+    host.appendChild(e);
+    return;
+  }
+  list.slice(0, 4).forEach((z) => host.appendChild(signalCard(z)));
+}
+
+function signalCard(z) {
+  const plan = planOf(z) || {};
+  const short = (plan.side || (z.side === "high" ? "short" : "long")) === "short";
+  const node = el("div", "sigcard" + (short ? " sell" : ""));
+  const head = el("div", "sighead");
+  head.appendChild(el("span", "sym", z.symbol.replace("USDT", "") + "/USDT"));
+  head.appendChild(el("span", "dir " + (short ? "short" : "long"), short ? "SHORT" : "LONG"));
+  head.appendChild(el("span", "acc", probText(z)));
+  node.appendChild(head);
+  node.appendChild(el("div", "sigmeta",
+    `${z.timeframe} · ${(KINDS[z.kind] || {}).label || z.kind} · ${marketOf(z) === "futures" ? "fut" : "spot"}`));
+  const row = el("div", "sigrow");
+  [["entry", plan.entry], ["stop", plan.stop], ["target", plan.target]].forEach(([k, v]) => {
+    const cell = el("div");
+    cell.appendChild(el("span", null, k));
+    cell.appendChild(el("b", null, fmtPx(v)));
+    row.appendChild(cell);
+  });
+  node.appendChild(row);
+  const foot = el("div", "sigfoot");
+  const m = z.measured;
+  foot.appendChild(el("span", null, m
+    ? `${Math.round((m.win || 0) * 100)}% measured · ${Math.round((m.win || 0) * (m.n || 0))}/${m.n} out of sample`
+    : "measurement loading"));
+  foot.appendChild(el("span", null, z.net_r != null ? `${z.net_r > 0 ? "+" : ""}${z.net_r.toFixed(2)}R after fees` : ""));
+  node.appendChild(foot);
+  node.onclick = () => selectZone(z);
+  return node;
+}
+
 function onState() {
   const d = state.data;
   if (!d) return;
@@ -767,10 +899,11 @@ function onState() {
   $("kSpot").textContent = (spot.active || 0);
   $("kSpotSub").textContent = `${spot.symbols || 0} pairs · ${spot.zones || 0} zones`;
   const gc = d.grade_counts || {};
-  $("kReady").textContent = d.tradable_count || 0;
-  $("kReadySub").textContent = "fee clears, edge positive";
-  $("kAP").textContent = gc["A+"] || 0;
-  $("kAPSub").textContent = "≥ 85% reached target first";
+  $("kReady").textContent = d.signal_count || 0;
+  $("kReadySub").textContent = `${d.tradable_count || 0} trade-ready · ${(gc["A+"] || 0) + (gc["A"] || 0)} at A+/A`;
+  const band = (state.bands || []).find((b) => b.letter === "A") || (state.bands || [])[0];
+  $("kAP").textContent = band ? Math.round(band.win * 100) + "%" : "–";
+  $("kAPSub").textContent = band ? `on ${band.n} out-of-sample signals` : "run tools/fit_model.py";
   if (d.model && d.model.available === false) {
     $("kAPSub").textContent = "model missing: " + (d.model.problem || "");
   }
@@ -784,6 +917,7 @@ function onState() {
   $("kActiveSub").textContent = `${ready} tradeable now · ${byKind.strong_low || 0} strong low`;
 
   drawTabs(active);
+  drawHero();
   drawTfChips();
   scheduleCards();
   scheduleHistory();
@@ -846,6 +980,17 @@ function drawTfChips() {
   const host = $("tfChips");
   const tfs = (state.data && state.data.timeframes) || [];
   host.innerHTML = "";
+  // the two timeframes the user actually trades, one click away
+  const scalp = el("button", "chip" + (state.tfs.size === 2 && state.tfs.has("1m") && state.tfs.has("5m") ? " on" : ""), "1m+5m");
+  scalp.title = "show only the 1m and 5m signals (the ones with the most trades)";
+  scalp.onclick = () => {
+    const on = state.tfs.size === 2 && state.tfs.has("1m") && state.tfs.has("5m");
+    state.tfs = on ? new Set() : new Set(["1m", "5m"]);
+    drawTfChips();
+    drawCards();
+    toast(on ? "showing every timeframe" : "showing 1m and 5m only");
+  };
+  host.appendChild(scalp);
   tfs.forEach((tf) => {
     const c = el("button", "chip" + (state.tfs.has(tf) ? " on" : ""), tf);
     c.onclick = () => { state.tfs.has(tf) ? state.tfs.delete(tf) : state.tfs.add(tf); drawTfChips(); drawCards(); };
@@ -1608,7 +1753,9 @@ function openDrawer(id) {
 }
 
 /* settings drawer */
-const SETTING_FIELDS = ["pivot_len", "major_len", "disp_bars", "min_fvg_atr", "induce_tol", "induce_count", "atr_period", "max_zone_age", "mitigation_mode", "lookback"];
+const SETTING_FIELDS = ["pivot_len", "major_len", "disp_bars", "min_fvg_atr", "induce_tol", "induce_count", "atr_period", "max_zone_age", "mitigation_mode", "lookback",
+  // round 8: how far the target must be, and how sure the model must be
+  "plan_target_atr_min", "signal_prob_min", "plan_stop_mode", "fee_max_r"];
 function openSettings() {
   const s = (state.data && state.data.settings) || {};
   SETTING_FIELDS.forEach((k) => { const node = $("s_" + k); if (node && s[k] != null) node.value = s[k]; });
@@ -1626,7 +1773,7 @@ $("btnSaveSettings").onclick = async () => {
   SETTING_FIELDS.forEach((k) => {
     const node = $("s_" + k);
     if (!node) return;
-    payload[k] = k === "mitigation_mode" ? node.value : Number(node.value);
+    payload[k] = (k === "mitigation_mode" || k === "plan_stop_mode") ? node.value : Number(node.value);
   });
   payload.sessions = [
     { name: "Asia", start: Number($("s_asia_start").value), end: Number($("s_asia_end").value) },
@@ -1767,13 +1914,13 @@ $("helpBody").innerHTML = `
   <p>Nothing is deleted: a zone keeps its formation time on this map until the price mitigates it, and the tape keeps the record afterwards.</p>
   <hr style="border:0;border-top:1px solid #222c3f;margin:14px 0" />
   <p><b style="color:#ffd479">The rectangle</b> is the order block, not the pivot body: it starts at the <b>exact high/low</b> the pattern is about and runs to the far side of the <b>last opposite-colour candle with the biggest body</b> — green at a high, red at a low. That candle is outlined in amber and labelled <b>OB</b> on the chart (with <b>◀ OB</b> / <b>OB ▶</b> if it is outside the visible window). A block is never thinner than <b>0.12 × ATR</b>.</p>
-  <p><b>Grade (A+ … C)</b> — a ranking built from features that were measured on 90 days of real 1m BTC: block thickness, displacement size, FVG size and the pattern kind score the most; same-level strong confluence and the trend score a little. Measured on that data: A+ / A zones travel <b>2 × ATR</b> in your favour before the level is closed through in <b>83%</b> of cases, B in 68%, C in 54%. Full table and method: <code>docs/quality-btcusdt-1m.md</code>. The default filter shows A+ and A; "everything" brings the rest back.</p>
+  <p><b>Grade (A+ … C is measured, not counted)</b> — the letter is the probability that this plan reaches its liquidity target <i>before</i> its stop, from a model fitted on 90 days of real 1m BTC at every timeframe and checked on the next 90 days it never saw. <b>A+ = measured ≥ 90%, A ≥ 85%, B ≥ 75%, C ≥ 60%</b>, and anything below 60% is shown as <b>–</b> instead of being given a letter. On the held-out block those bands actually delivered <b>97% / 97% / 95% / 90%</b>, with the sample printed on every card. The card also lists which of the book's ten conditions the setup satisfies — the count alone did <i>not</i> predict the outcome (5 conditions 62%, 8 conditions 59%), which is why the letter is not a count. Full tables: <code>docs/signals.md</code>.</p>
   <p><b>Market regime</b> — Kaufman efficiency ratio (net travel ÷ total travel over 40 bars) plus Wilder's ADX(14). Both must agree before the market is called a trend, which is what stops a wide, choppy range from looking like one. <b>TRADEABLE NOW</b> means the live trend is on this zone's side (the book's HTF-direction rule). It is not a signal to enter.</p>
   <p><b>Futures and spot are separate sections.</b> A futures zone comes from MEXC's contract API under the contract's own name (<code>BTC_USDT</code>), a spot zone from the spot pair (<code>BTCUSDT</code>) — two different order books, two different candles. Use the <b>market</b> filter to see one or both.</p>
   <p><b>Every zone carries a plan.</b> Entry = the near edge of the block (the limit fills as price comes back into it). Stop = <code>0.1 × ATR</code> beyond the exact high/low. Target = the <b>next liquidity pool</b> — the nearest strong level, swing or session extreme in front of the trade. The card shows the R:R and what happened: <b>waiting</b> → <b>filled</b> → <b>target hit</b> / <b>stopped out</b>. "Sniper" keeps only plans with R:R ≥ 1.5, which is the subset measured in <code>docs/quality-btcusdt-1m.md</code>.</p>
-  <p><b style="color:#2ee6a8">A+ / A / B / C is measured, not counted.</b> The letter is the probability that this plan reaches its liquidity target <i>before</i> its stop, taken from a model fitted on 90 days of real 1m BTC and checked on a held-out 90 days: A+ ≥ 85%, A ≥ 70%, B ≥ 55%. On that held-out block the A+ band reached the target 87–95% of the time and the C band 28–46%. The card also lists <b>which of the book's ten conditions</b> the setup satisfies — the count alone did <i>not</i> predict the outcome (5 conditions 62%, 8 conditions 59%), which is why the letter is not simply a count.</p>
-  <p><b style="color:#ffb3c1">Why stops got hit: the fee.</b> The fee is charged on the whole position while your risk is only the stop distance. A 1m stop here is often 0.04–0.1% of price, so a 0.08% round trip costs <b>1–2R</b> — more than the trade can make. That is why a 95% "win rate" still loses money on 1m. Every card now shows <code>risk % of price</code>, the plan's cost in R and its expected R per trade, and <b>TRADE-READY</b> only when the edge survives the fee. On the measured data that happens from 5m upwards, not on 1m.</p>
-  <p><b>More signals, best first.</b> The list is sorted by measured chance by default. The default filter <b>trade-ready</b> is the honest shortlist; below it, "everything" shows every zone the scanner found — widen the symbol list (futures contracts included) to widen the net. Breadth is what buys you more signals; the ranking is what keeps the accuracy.</p>
+  <p><b style="color:#2ee6a8">Where the signals come from.</b> The exit is the trader's own rule — <i>the next liquidity level</i> — but a pool half a tick away inside the block is not a liquidity level, it is noise, and it pays a fraction of the risk. So the plan now <b>skips any pool closer than 1 ATR</b> and takes the next real one. Measured on the held-out 90 days that changed the median reward from <b>0.15R to 0.75R</b> and the selected signals from <b>−0.01R to +0.54R</b> each. The setting is <code>plan_target_atr_min</code>; set it to 0 and you get the old nearest-pool exit back.</p>
+  <p><b style="color:#ffb3c1">Why stops got hit before: the fee.</b> The fee is charged on the whole position while your risk is only the stop distance. A 0.04% stop against a 0.08% round trip costs <b>2R</b> — more than the trade can make, however good the pattern. Every card prints <code>risk % of price</code>, the plan's <b>expected</b> cost in R (maker in / maker out on a winner, taker out on a stop) and its expected R per trade. A plan is a <b>signal</b> only when the model measures it at 85% or better <i>and</i> that cost leaves it positive.</p>
+  <p><b>More signals, best first.</b> The strip at the top always shows the live signals, biggest measured chance first; the list below it is sorted the same way. The default filter is <b>signals · measured ≥ 85%</b>; <b>every ≥ 90% band</b> shows the wider (still 90%+) set, which is about six times more signals per day. To widen the net further, add instruments in <b>Symbols</b> — futures contracts included — the scan ranks all of them and surfaces the best.</p>
   <p><b>Chart</b> — drag to move it in both directions, scroll to zoom, drag the right edge for the price scale, <b>F</b> or ⛶ for full screen, <b>+ / −</b> to zoom, arrows to pan, <b>R</b> to reset.</p>
 `;
 
@@ -1987,6 +2134,7 @@ setInterval(() => { if (state.data && document.visibilityState === "visible") dr
 setInterval(() => {
   if (document.visibilityState === "visible" && chart.zone && Date.now() - chart.fetchedAt > 5000) refreshChart(false);
 }, 4000);
+loadBands();
 connect();
 </script>
 </body>

@@ -648,6 +648,8 @@ class Engine:
                 "plan_result_at", "plan_result_r",
                 # round 7: the measured probability and what it costs to trade
                 "prob", "fee_r", "net_r", "tradable", "cond_met", "cond_total",
+                # round 8: is it a signal, and which measured band does it sit in
+                "signal", "measured",
             )
         }
         out["plan"] = Engine._plan(zone.get("plan"))
@@ -697,7 +699,8 @@ class Engine:
         )
 
     def ranked(
-        self, market: str = "", limit: int = 300, only_tradable: bool = False, status: str = "active"
+        self, market: str = "", limit: int = 300, only_tradable: bool = False, status: str = "active",
+        only_signal: bool = False,
     ) -> list[dict]:
         """Every zone, best first - the list the page's top section is built from."""
         items = list(self.zones.values())
@@ -709,6 +712,8 @@ class Engine:
             items = [z for z in items if market_of(z.get("symbol", "")) == market]
         if only_tradable:
             items = [z for z in items if z.get("tradable")]
+        if only_signal:
+            items = [z for z in items if z.get("signal")]
         items.sort(key=self.rank_key, reverse=True)
         return items[: max(1, int(limit))]
 
@@ -742,9 +747,10 @@ class Engine:
             "counts": dict(self.kinds),
             "grade_counts": {
                 g: sum(1 for z in self.zones.values() if z.get("status") == "active" and z.get("grade") == g)
-                for g in ("A+", "A", "B", "C")
+                for g in ("A+", "A", "B", "C", "-")
             },
             "tradable_count": sum(1 for z in self.zones.values() if z.get("status") == "active" and z.get("tradable")),
+            "signal_count": sum(1 for z in self.zones.values() if z.get("status") == "active" and z.get("signal")),
             "model": {
                 "available": bool(getattr(self, "model_available", False)),
                 "problem": getattr(self, "model_problem", None),

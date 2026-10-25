@@ -31,6 +31,10 @@ from .map import CONDITION_NAMES
 
 MODEL_PATH = Path(__file__).with_name("signal_model.json")
 
+# The timeframes the model was fitted on. A timeframe it has never seen (3m, 1h)
+# is scored as the 1m baseline rather than pretending to know better.
+KNOWN_TIMEFRAMES = ("1m", "5m", "15m", "30m")
+
 
 def _sigmoid(z: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
@@ -61,9 +65,16 @@ class SignalModel:
 
     # ------------------------------------------------------------ scoring
     def vector(self, zone) -> list[float]:
-        """The exact feature vector the study used, in the stored order."""
+        """The exact feature vector the study used, in the stored order.
+
+        Round 8 added the plan's own geometry (``log(risk_pct)``, ``block_atr``)
+        and the timeframe, because the measurement showed the same pattern is a
+        different trade depending on how much room the plan gives it.
+        """
         conds = zone.conds or {}
         family = _family(zone.kind)
+        plan = zone.plan or {}
+        risk_pct = float(plan.get("risk_pct") or 0.0)
         out: list[float] = []
         for name in self.features:
             if name == "bias":
@@ -73,9 +84,15 @@ class SignalModel:
             elif name in CONDITION_NAMES:
                 out.append(1.0 if conds.get(name) else 0.0)
             elif name == "log(1+rr)":
-                out.append(math.log1p(max(float((zone.plan or {}).get("rr") or 0.0), 0.0)))
+                out.append(math.log1p(max(float(plan.get("rr") or 0.0), 0.0)))
+            elif name == "log(risk_pct)":
+                out.append(math.log(max(risk_pct, 1e-6)))
+            elif name == "block_atr":
+                out.append(min(float(zone.block_atr or 0.0), 3.0))
             elif name.startswith("family="):
                 out.append(1.0 if family == name.split("=", 1)[1] else 0.0)
+            elif name.startswith("tf="):
+                out.append(1.0 if getattr(zone, "timeframe", "") == name.split("=", 1)[1] else 0.0)
             else:  # an unknown feature would silently mis-score everything
                 out.append(0.0)
         return out
@@ -88,11 +105,23 @@ class SignalModel:
 
     # ------------------------------------------------------------- costing
     @staticmethod
-    def fee_r(risk_pct: float | None, maker_bps: float = 2.0, taker_bps: float = 6.0) -> float | None:
-        """The plan's round-trip cost in R (entry limit, exit limit, stop crosses)."""
+    def fee_r(risk_pct: float | None, maker_bps: float = 2.0, taker_bps: float = 6.0,
+              prob: float | None = None) -> float | None:
+        """The plan's round-trip cost in R.
+
+        A winner is a limit on both sides (maker in, maker out); a loser crosses
+        the spread on the stop (maker in, taker out). Given a probability, the
+        cost reported is the *expected* one - which is the number that belongs in
+        an expectancy, not the worst case.
+        """
         if not risk_pct or risk_pct <= 0:
             return None
-        return round((maker_bps + taker_bps) / 1e4 / (risk_pct / 100.0), 3)
+        win_bps = maker_bps + maker_bps
+        loss_bps = maker_bps + taker_bps
+        # without a probability, report the worst case (the stop crosses the
+        # spread) - an unknown plan must never be costed optimistically
+        bps = loss_bps if prob is None else prob * win_bps + (1.0 - prob) * loss_bps
+        return round(bps / 1e4 / (risk_pct / 100.0), 3)
 
     def rate(self, zone, cfg: dict[str, Any]) -> None:
         """Attach probability, letter, cost and expectancy to a zone."""
@@ -102,7 +131,7 @@ class SignalModel:
         rr = plan.get("rr")
         risk_pct = plan.get("risk_pct")
         zone.fee_r = self.fee_r(risk_pct, float(cfg.get("fee_maker_bps", 2.0)),
-                                float(cfg.get("fee_taker_bps", 6.0)))
+                                float(cfg.get("fee_taker_bps", 6.0)), prob)
         if prob is not None and rr:
             gross = prob * float(rr) - (1.0 - prob)
             zone.net_r = round(gross - (zone.fee_r or 0.0), 3)
@@ -114,21 +143,46 @@ class SignalModel:
             and zone.fee_r is not None and zone.fee_r <= limit and zone.net_r > 0
         )
         zone.grade = self.grade_for(prob, cfg)
+        # a signal is a *measured* setup the fee also leaves worth taking
+        zone.signal = bool(
+            zone.tradable and prob is not None
+            and prob >= float(cfg.get("signal_prob_min", 0.85))
+        )
+        zone.measured = self.band(prob)
 
     def grade_for(self, prob: float | None, cfg: dict[str, Any]) -> str:
         cuts = cfg.get("prob_cuts") or {}
-        a_plus = float(cuts.get("a_plus", 0.85))
-        a = float(cuts.get("a", 0.70))
-        b = float(cuts.get("b", 0.55))
+        a_plus = float(cuts.get("a_plus", 0.90))
+        a = float(cuts.get("a", 0.85))
+        b = float(cuts.get("b", 0.75))
+        c = float(cuts.get("c", 0.60))
         if prob is None:
-            return "C"
+            return "-"
         if prob >= a_plus:
             return "A+"
         if prob >= a:
             return "A"
         if prob >= b:
             return "B"
-        return "C"
+        if prob >= c:
+            return "C"
+        return "-"
+
+    def band(self, prob: float | None) -> dict[str, Any] | None:
+        """The measured accuracy the letter stands for, from the model file.
+
+        ``{"letter", "cut", "win", "n"}`` - so a card can print "97% (331/341
+        out of sample)" instead of a bare promise. The bands are written by
+        ``tools/fit_model.py`` from the held-out block, not typed in by hand.
+        """
+        if prob is None:
+            return None
+        table = self.meta.get("bands") or []
+        chosen = None
+        for entry in sorted(table, key=lambda e: float(e.get("cut") or 0.0)):
+            if prob >= float(entry.get("cut") or 0.0):
+                chosen = entry
+        return dict(chosen) if chosen else None
 
 
 def _family(kind: str) -> str:

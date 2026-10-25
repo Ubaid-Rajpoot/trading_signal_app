@@ -42,6 +42,12 @@ await wait(1500);
 ev('document.getElementById("showMode").dispatchEvent(new window.Event("change"))');
 await wait(1500);
 
+// this suite is about the drawing and the history, not about which quality band
+// the page opens on (round 8 changed that default to "signals"), so the filter is
+// set explicitly here
+ev('document.getElementById("quality").value = "all"; document.getElementById("quality").dispatchEvent(new window.Event("change"))');
+await wait(600);
+
 // pick the "Algo candle · high" tab
 const tab = [...doc.querySelectorAll("#tabs .tab")].find((t) => t.textContent.trim().startsWith("Algo candle · high"));
 ok(!!tab, "the Algo candle · high tab exists");

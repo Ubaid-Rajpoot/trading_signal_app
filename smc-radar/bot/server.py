@@ -337,6 +337,7 @@ def create_app(
         grade: str = "",
         kind: str = "",
         tradable: int = 0,
+        signal: int = 0,
         status: str = "active",
         limit: int = 200,
         detail: int = 0,
@@ -349,7 +350,8 @@ def create_app(
         the live push uses.
         """
         items = engine.ranked(market=market, limit=max(1, min(int(limit), 2000)),
-                              only_tradable=bool(tradable), status=status)
+                              only_tradable=bool(tradable), status=status,
+                              only_signal=bool(signal))
         if timeframe:
             items = [z for z in items if z.get("timeframe") == timeframe]
         if grade:
@@ -370,10 +372,34 @@ def create_app(
             "count": len(out),
             "total": len(engine.zones),
             "tradable": engine.snapshot(cells=False, with_history=False)["tradable_count"],
-            "model": {"available": scoring.available, "problem": scoring.problem,
-                      "trained_on": scoring.meta.get("trained_on"),
-                      "holdout": (scoring.meta.get("results") or {}).get("holdout")},
+            "model": {
+                "available": scoring.available, "problem": scoring.problem,
+                "trained_on": scoring.meta.get("trained_on"),
+                "bands": scoring.meta.get("bands"),
+                "target": scoring.meta.get("target"),
+                "command": scoring.meta.get("command"),
+                "holdout": (scoring.meta.get("results") or {}).get("holdout"),
+            },
             "items": out,
+        }
+
+    @app.get("/api/model")
+    async def model_card() -> dict[str, Any]:
+        """What the letters mean, straight from the file that was fitted.
+
+        The page prints these numbers next to the grade, so "97%" is always
+        traceable to a held-out measurement and the command that produced it.
+        """
+        meta = scoring.meta or {}
+        return {
+            "available": scoring.available,
+            "problem": scoring.problem,
+            "target": meta.get("target"),
+            "bands": meta.get("bands") or [],
+            "trained_on": meta.get("trained_on"),
+            "validated_on": meta.get("validated_on"),
+            "command": meta.get("command"),
+            "fees_bps": meta.get("fees_bps"),
         }
 
     @app.get("/api/config")
