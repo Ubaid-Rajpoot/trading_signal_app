@@ -22,6 +22,7 @@ from collections import deque
 
 from .buckets import TIMEFRAMES, Rollup
 from .feed import market_of, pretty_symbol
+from .journal import journal
 from .map import CONDITION_NAMES, DEFAULTS, KINDS, TREND_KINDS, MarketMap
 
 ACTIVE_CAP = 200          # zones in one pushed frame (~1.8 KB each)
@@ -67,6 +68,14 @@ class Engine:
         self.events: list[dict] = []              # newest first: formed / mitigated
         self.kinds: dict[str, int] = {}
         self.resolved: dict[str, int] = {"mitigated": 0, "invalidated": 0}
+        # Round 9: every signal is written to a database the moment it exists, so
+        # it can never disappear from the user's screen again. ``_journaled``
+        # stores the last state written per key so a push only writes changes.
+        self.journal_prob_min = 0.60
+        self._journaled: dict[str, tuple] = {}
+        self.journal_seen = 0
+        self._journal_stats: dict[str, Any] = {}
+        self._journal_stats_at = 0.0
         self.candles_seen = 0
         self.ticks_seen = 0
         self.loops_reset = 0
@@ -78,6 +87,7 @@ class Engine:
         self.warm_done = 0
         self.warming = True
         self.warm_errors = 0
+        self.warm_problems: dict[str, str] = {}   # symbol -> why its history failed
         self.last_event_at = time.time()
         self._last_state_at = 0.0
         self._warm_failures = 0
@@ -220,6 +230,7 @@ class Engine:
                 self._warm_failures += 1
                 self.warm_errors += 1
                 self.warm_done += 1
+                self.warm_problems[symbol] = f"{type(exc).__name__}: {str(exc)[:120]}"
                 if self._warm_failures <= 3:
                     await self._log(f"warm-up {symbol} {tf}: {type(exc).__name__}: {exc}", "warn")
                 continue
@@ -256,33 +267,62 @@ class Engine:
         self.rollups[key] = rollup
 
     async def warmup(self, feed, concurrency: int = 4) -> None:
-        """Warm every instrument, a few at a time.
+        """Warm every instrument, a few at a time - and never give up on the rest.
 
-        Start-up used to wait for every symbol before the page was served, which
-        on a dozen instruments meant a minute of staring at nothing. Now the map
-        warms in the background while the page is already open and reporting
-        progress (``warming`` / ``warm_done`` / ``warm_total``).
+        Round 9 fixed a real reason futures looked empty: this loop used to return
+        early for **every remaining symbol** once eight calls in a row had failed.
+        Sixty contracts is three hundred REST calls, the contract API rate-limits,
+        and the first burst of failures therefore switched the whole warm-up off -
+        the scanner then waited for the live stream to fill 240 bars per
+        timeframe, which at 15m is two and a half days. Now a failure costs one
+        instrument, the pass backs off instead of stopping, and short histories are
+        topped up by ``healer()`` later.
         """
         sem = asyncio.Semaphore(max(1, concurrency))
+        backoff = {"sleep": 0.0}
 
         async def one(symbol: str) -> None:
             async with sem:
-                if self._warm_failures >= 8:
-                    return
+                if backoff["sleep"]:
+                    await asyncio.sleep(backoff["sleep"])
                 try:
                     await self.warm_symbol(feed, symbol)
+                    self._warm_failures = 0
+                    backoff["sleep"] = 0.0
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     self.warm_errors += 1
+                    self._warm_failures += 1
+                    if self._warm_failures >= 4:
+                        # the exchange is pushing back: slow down, do not stop
+                        backoff["sleep"] = min(15.0, 0.5 * self._warm_failures)
+                        self._warm_failures = 0
 
         try:
             await asyncio.gather(*(one(symbol) for symbol in list(self.symbols)))
         finally:
             self.warming = False
-            if self._warm_failures >= 8:
-                await self._log("warm-up stopped: the exchange is not answering - live candles will fill the map", "error")
+        short = self.thin_symbols()
+        if short:
+            await self._log(
+                f"warm-up: {len(short)} of {len(self.symbols)} instruments still short of history - "
+                "the healer re-requests them in the background", "warn")
         await self._emit_state(force=True)
+
+    def thin_symbols(self, need: int = 200) -> list[str]:
+        """Instruments with too little history for the 240-bar lookback.
+
+        These are the ones that silently produce no signals. The diagnostics
+        endpoint prints the same number, so "why is this contract empty" has an
+        answer on screen instead of a guess.
+        """
+        out: list[str] = []
+        for symbol in self.symbols:
+            bars = [len(self.history.get((symbol, tf), ())) for tf in self.timeframes]
+            if not bars or min(bars) < need:
+                out.append(symbol)
+        return out
 
     async def backfill(self, feed, symbol: str) -> None:
         """Top up a symbol that arrived through the live stream with no history."""
@@ -318,6 +358,7 @@ class Engine:
                 self.zones[zone["key"]] = zone
                 self.kinds[zone["kind"]] = self.kinds.get(zone["kind"], 0) + 1
                 self.events.insert(0, {"type": "formed", "zone": zone})
+                self._journal_write(zone)
         if events.get("resolved"):
             for item in events["resolved"]:
                 status = item["status"]
@@ -330,12 +371,119 @@ class Engine:
                             break
                 if status in self.resolved:
                     self.resolved[status] += 1
+                if current is not None:
+                    self._journal_close(item["key"], status, current)
                 self.events.insert(0, {"type": status, "key": item["key"], "zone": current})
         del self.events[400:]
         self._prune_zones()
         if events.get("zones") or events.get("resolved"):
             self.last_event_at = time.time()
         return events
+
+    # ------------------------------------------------------------- journal
+    def _journal_write(self, zone: dict) -> None:
+        """Store a zone the first time it becomes worth storing.
+
+        The bar is ``journal_prob_min`` (default 60%, i.e. the C band and above)
+        *or* anything the model called a signal - so the archive always contains
+        every signal the page ever showed, plus the near misses, and never the
+        noise.
+        """
+        store = journal()
+        if not store.enabled:
+            return
+        if not (zone.get("signal") or (zone.get("prob") or 0) >= self.journal_prob_min):
+            return
+        if store.record(zone, int(zone.get("time") or time.time() * 1000)):
+            self.journal_seen += 1
+            self._journaled[zone.get("key")] = (zone.get("status"), zone.get("plan_state"))
+
+    def _journal_close(self, key: str, status: str, zone: dict) -> None:
+        store = journal()
+        if not store.enabled:
+            return
+        result = {"plan_target": "target", "plan_stopped": "stopped",
+                  "mitigated": "mitigated", "invalidated": "invalidated"}.get(status)
+        store.close_signal(
+            key,
+            status="active" if status.startswith("plan_") else status,
+            at=int(zone.get("plan_result_at") or zone.get("mitigated_at")
+                   or zone.get("invalidated_at") or time.time() * 1000),
+            result=result,
+            result_r=zone.get("plan_result_r"),
+        )
+        self._journaled[key] = (zone.get("status"), status)
+
+    def journal_stats(self, max_age: float = 5.0) -> dict[str, Any]:
+        """The archive's counters, cached - a push every 0.35 s must not count rows."""
+        now = time.time()
+        if self._journal_stats and now - self._journal_stats_at < max_age:
+            return self._journal_stats
+        try:
+            self._journal_stats = journal().stats()
+            self._journal_stats_at = now
+        except Exception:
+            pass
+        return self._journal_stats
+
+    def diagnostics(self) -> list[dict[str, Any]]:
+        """One row per instrument: what the scanner actually has for it.
+
+        "Futures gives no signals" is almost never the pattern engine - it is a
+        contract whose history never arrived, or arrived too short to reach the
+        lookback. This is the table that says which, for every contract, so the
+        question stops being a guess.
+        """
+        rows: list[dict[str, Any]] = []
+        for symbol in self.symbols:
+            cells: dict[str, dict[str, Any]] = {}
+            zones = signals = 0
+            for tf in self.timeframes:
+                key = (symbol, tf)
+                map_ = self.maps.get(key)
+                bars = len(self.history.get(key, ()))
+                active = len(map_.active()) if map_ is not None else 0
+                zones += active
+                signals += sum(1 for z in (map_.active() if map_ is not None else []) if getattr(z, "signal", False))
+                cells[tf] = {
+                    "bars": bars,
+                    "zones": active,
+                    "atr": round(map_.atr_now(), 8) if (map_ is not None and map_.atr_now()) else None,
+                    "ready": bool(bars >= int(self.settings.get("lookback", 240))),
+                }
+            rows.append({
+                "symbol": symbol,
+                "market": self.markets.get(symbol, market_of(symbol)),
+                "price": self.price_of(symbol),
+                "cells": cells,
+                "zones": zones,
+                "signals": signals,
+                "problem": self.warm_problems.get(symbol),
+            })
+        rows.sort(key=lambda r: (-r["signals"], -r["zones"], r["symbol"]))
+        return rows
+
+    def sync_journal(self) -> int:
+        """Write the changed state of every stored zone (cheap: only changes).
+
+        A plan goes waiting -> filled -> target/stopped while the zone itself stays
+        active. Without this the archive would keep saying "waiting" forever.
+        """
+        store = journal()
+        if not store.enabled:
+            return 0
+        written = 0
+        for zone in self.zones.values():
+            key = zone.get("key")
+            if not key or (zone.get("prob") or 0) < self.journal_prob_min:
+                continue
+            state = (zone.get("status"), zone.get("plan_state"))
+            if self._journaled.get(key) == state:
+                continue
+            if store.record(zone):
+                self._journaled[key] = state
+                written += 1
+        return written
 
     def _prune_zones(self) -> None:
         """Keep the store bounded: resolved zones go first, oldest first."""
@@ -520,6 +668,12 @@ class Engine:
             return
         self._last_state_at = now
         self.seq += 1
+        # a plan moves while its zone is still active, so the archive is brought
+        # up to date here - once per push, and only for the rows that changed
+        try:
+            self.sync_journal()
+        except Exception:
+            pass
         # the resolved zones are fetched on demand (/api/zones), not pushed
         await self._broadcast({"type": "state", **self.snapshot(cells=False, with_history=False)})
 
@@ -756,6 +910,11 @@ class Engine:
                 "problem": getattr(self, "model_problem", None),
             },
             "resolved": dict(self.resolved),
+            # round 9: the archive - signals are in a database, not only in a push
+            "journal": {
+                **(self.journal_stats() or {}),
+                "seen": self.journal_seen,
+            },
             "active": [self.slim(z, lean) for z in active[: ACTIVE_CAP]],
             "history": [self.slim(z, lean) for z in history[:60]] if with_history else [],
             "events": [

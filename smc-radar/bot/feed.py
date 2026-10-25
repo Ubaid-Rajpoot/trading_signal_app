@@ -62,6 +62,27 @@ MEXC_CONTRACT_REST = "https://contract.mexc.com"
 MEXC_CONTRACT_WS_HOSTS = ["wss://contract.mexc.com/edge"]
 MEXC_FUTURE_TFS = {"1m": "Min1", "3m": None, "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60"}
 FUTURE_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+# The contract kline endpoint speaks ``Min5``, the engine speaks ``5m``. The two
+# used to be mixed up when history() was called with the exchange's own name,
+# which made every higher timeframe ask for a 1-minute-long window: 15m got ~66
+# candles instead of 1000, never reached the 240-bar lookback, and produced (almost)
+# no zones. That is the mechanical reason futures looked empty next to spot.
+FUTURE_INTERVAL_SECONDS = {"Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800, "Min60": 3600}
+
+
+def future_interval(interval: str) -> str | None:
+    """``1m`` / ``Min1`` -> ``Min1``. ``None`` when MEXC has no such interval."""
+    raw = str(interval or "").strip()
+    if raw in MEXC_FUTURE_TFS:
+        return MEXC_FUTURE_TFS[raw]
+    if raw in FUTURE_INTERVAL_SECONDS:
+        return raw
+    return None
+
+
+def future_seconds(interval: str) -> int:
+    mapped = future_interval(interval) or interval
+    return FUTURE_INTERVAL_SECONDS.get(mapped, 60)
 
 
 def is_futures(symbol: str) -> bool:
@@ -597,11 +618,13 @@ class MexcFuturesFeed(BaseFeed):
         self, symbol: str, interval: str, limit: int = 500, include_open: bool = False
     ) -> list[dict]:
         symbol = to_futures(symbol)
-        mapped = MEXC_FUTURE_TFS.get(interval, interval)
+        mapped = future_interval(interval)
         if not mapped:
             raise FeedError(f"MEXC futures has no {interval} interval - aggregate 1m instead")
-        seconds = FUTURE_SECONDS.get(interval, 60)
+        seconds = future_seconds(mapped)
         now = int(time.time())
+        # the endpoint returns at most 2000 points per call, and the window has to
+        # match the *interval's* length, not 1m
         start = now - min(max(1, int(limit)), 2000) * seconds - seconds
         params = {"interval": mapped, "start": start, "end": now}
         payload = await self._get_json(f"{MEXC_CONTRACT_REST}/api/v1/contract/kline/{symbol}", params)
@@ -1129,7 +1152,12 @@ def make_market_feed(
     existing entry point (and every test) keeps working unchanged.
     """
     key = (exchange or "binance").lower()
-    futures_symbols = [s for s in (futures_symbols or []) if str(s).strip()]
+    futures_symbols = [to_futures(s) for s in (futures_symbols or []) if str(s).strip()]
+    spot_symbols = [s for s in spot_symbols if str(s).strip() and not is_futures(s)]
+    if key == "mexc" and futures_symbols and not spot_symbols:
+        # Round 9: this app is a futures scanner. With no spot symbols configured
+        # there is no spot socket, no spot universe and no spot candles at all.
+        return MexcFuturesFeed(futures_symbols, **kwargs)
     if key == "mexc" and futures_symbols:
         return CompositeFeed(
             {

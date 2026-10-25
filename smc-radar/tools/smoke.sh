@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test of the running app, no extra dependencies.
 #
-#   tools/smoke.sh                 # replay the recorded candles on port 8891
+#   tools/smoke.sh                 # replay the recorded futures candles on port 8891
 #   PORT=9000 tools/smoke.sh
 #   DATA=/path/to/csv/folder tools/smoke.sh
 #
@@ -12,12 +12,13 @@
 #   4. the incremental refresh works,
 #   5. server-sent events actually push,
 #   6. the websocket actually pushes,
+#   7. every signal is in the database and stays there,
 # and shuts everything down again.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
 PORT="${PORT:-8891}"
-DATA="${DATA:-data/btc}"
+DATA="${DATA:-data/fut}"
 PY="${PY:-../.venv/bin/python}"
 [ -x "$PY" ] || PY="python3"
 URL="http://127.0.0.1:$PORT"
@@ -58,11 +59,11 @@ sleep 6
 B=$(curl -sf "$URL/api/state" | json "d['seq']")
 [ "${A:-0}" -lt "${B:-0}" ] && pass "state advances by itself (seq $A -> $B)" || fail "state advances by itself (seq $A -> $B)"
 
-CANDLES=$(curl -sf "$URL/api/candles?symbol=BTCUSDT&timeframe=5m&limit=1000" | json "len(d['bars'])")
+CANDLES=$(curl -sf "$URL/api/candles?symbol=BTC_USDT&timeframe=5m&limit=1000" | json "len(d['bars'])")
 [ "${CANDLES:-0}" -ge 200 ] && pass "candles served: $CANDLES" || fail "candles served: $CANDLES"
 
-SINCE=$(curl -sf "$URL/api/candles?symbol=BTCUSDT&timeframe=5m&limit=1000" | json "d['bars'][-2]['open_time']")
-INC=$(curl -sf "$URL/api/candles?symbol=BTCUSDT&timeframe=5m&limit=1000&since=$SINCE" | json "len(d['bars'])")
+SINCE=$(curl -sf "$URL/api/candles?symbol=BTC_USDT&timeframe=5m&limit=1000" | json "d['bars'][-2]['open_time']")
+INC=$(curl -sf "$URL/api/candles?symbol=BTC_USDT&timeframe=5m&limit=1000&since=$SINCE" | json "len(d['bars'])")
 [ "${INC:-0}" -ge 1 ] && [ "${INC:-0}" -lt "${CANDLES:-0}" ] && pass "incremental refresh returns only the new bars ($INC)" || fail "incremental refresh ($INC of $CANDLES)"
 
 SSE=$(timeout 8 curl -sN "$URL/api/stream" | grep -c "data: ")
@@ -83,6 +84,17 @@ async def main(url: str) -> int:
 sys.exit(asyncio.run(main(sys.argv[1])))
 EOF
 then pass "websocket pushes"; else fail "websocket pushes"; fi
+
+RECORDED=$(curl -sf "$URL/api/journal/stats" | json "d['recorded']")
+[ "${RECORDED:-0}" -ge 1 ] && pass "signals are stored in the database ($RECORDED rows)" || fail "signals are stored in the database ($RECORDED rows)"
+ROWS=$(curl -sf "$URL/api/journal?limit=5" | json "len(d['items'])")
+[ "${ROWS:-0}" -ge 1 ] && pass "the stored signals can be read back ($ROWS)" || fail "the stored signals can be read back"
+curl -sf "$URL/api/journal?limit=200&signals_only=1" | json "all(r.get('symbol') and r.get('entry') is not None for r in d['items']) and 1 or 0" >/dev/null \
+  && pass "every stored signal keeps its symbol and its levels" || fail "stored signals keep their levels"
+CSVLINES=$(curl -sf "$URL/api/journal.csv" | wc -l)
+[ "${CSVLINES:-0}" -ge 2 ] && pass "the archive exports to CSV ($CSVLINES lines)" || fail "the archive exports to CSV ($CSVLINES lines)"
+FAILED_ROW=$(curl -sf "$URL/api/diagnostics")
+echo "$FAILED_ROW" | grep -q '\"symbol\"' && pass "diagnostics list every instrument" || fail "diagnostics list every instrument"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILED FAILED"; fi

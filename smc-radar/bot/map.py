@@ -92,7 +92,15 @@ DEFAULTS: dict[str, Any] = {
     # invalidation and is what the round-8 measurement asked for: on 90d of 1m
     # BTC it lifts the hit rate from 61% to 74% and triples the number of plans
     # the fee leaves tradable. Measured in tools/plan_study.py.
-    "plan_stop_mode": "level",  # "level" | "block"
+    # Round 9: "block" is the shipped stop - the user's own rule ("stop beyond the
+    # structure / the red box"), and it is also what makes futures pay. Measured
+    # on a 36-day replay of the recorded 1m BTC futures candles, same model, same
+    # fee gate, only the stop changed:
+    #   level (0.10 ATR beyond the exact high/low):  4.1 signals/day, 42% hit, -0.25 R
+    #   block (beyond the whole order block):       14.8 signals/day, 65% hit, -0.08 R
+    # The tight stop is inside one candle's noise, so it is taken before the trade
+    # can breathe. "level" is still available in the settings.
+    "plan_stop_mode": "block",  # "level" | "block"
     # The exit is still the next liquidity level, but a pool half a tick away is
     # not a target - it pays a fraction of the risk and less than the fee. This
     # is the minimum distance to a pool, in ATR, that can be called "the next

@@ -25,7 +25,7 @@ from bot.map import DEFAULTS  # noqa: E402
 from bot.server import create_app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-CSV = ROOT / "data" / "btc" / "BTCUSDT-1m-2025-01.csv"
+CSV = ROOT / "data" / "fut" / "BTC_USDT-1m-2025-01.csv"
 pytestmark = pytest.mark.skipif(not CSV.exists(), reason=f"real replay data missing: {CSV}")
 
 
@@ -726,3 +726,91 @@ def test_signals_endpoint_returns_only_measured_fee_clearing_plans():
     assert model["available"] is True
     assert model["bands"] and all(b["letter"] and b["n"] >= 0 for b in model["bands"])
     assert model["command"] and "fit_model.py" in model["command"], "every band says how it was measured"
+
+
+# ------------------------------------------ round 9: no give-up, archive, futures
+def test_one_broken_instrument_does_not_switch_the_warmup_off():
+    """The real reason futures looked empty.
+
+    ``warmup`` used to return early for *every remaining symbol* after eight
+    consecutive failures. Sixty contracts is three hundred REST calls, the contract
+    API rate-limits, and the first burst switched the whole scan off. A failure may
+    cost one instrument; it may never cost the rest.
+    """
+    rows = load(600)
+    symbols = [f"S{i}_USDT" for i in range(12)]
+    engine = Engine(symbols=symbols, timeframes=["5m"], settings=dict(DEFAULTS))
+
+    class FlakyFeed:
+        source = "live"
+
+        def exchange_interval(self, timeframe: str) -> str:
+            return "5m"
+
+        async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+            if symbol != "S11_USDT":
+                raise RuntimeError("rate limited")
+            return [dict(r, symbol=symbol) for r in rows[-400:]]
+
+    asyncio.run(engine.warmup(FlakyFeed(), concurrency=2))
+    # eleven failed, and the twelfth still warmed: the tail of the list is not lost
+    assert engine.history[("S11_USDT", "5m")], "the last instrument must still be tried"
+    assert engine.warm_problems, "the failure is recorded, not hidden"
+    assert "rate limited" in engine.warm_problems["S0_USDT"]
+    assert "S11_USDT" not in engine.thin_symbols(), "the warmed one is not re-requested"
+
+
+def test_diagnostics_say_why_an_instrument_has_no_signals():
+    rows = load(600)
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    engine.warm_problems["BTCUSDT"] = "FeedError: no kline"
+    asyncio.run(engine.warmup(FakeFeed(rows)))
+    row = engine.diagnostics()[0]
+    assert row["symbol"] == "BTCUSDT"
+    assert row["cells"]["5m"]["bars"] > 0 and row["cells"]["5m"]["ready"] in (True, False)
+    assert row["problem"] == "FeedError: no kline"
+
+
+def test_signals_are_written_to_the_journal_and_never_removed(tmp_path):
+    """End to end: the engine writes, the API reads, a resolved signal stays."""
+    from bot.journal import journal, open_journal
+
+    store = open_journal(tmp_path / "journal.sqlite3")
+    try:
+        rows = load(2500)
+        engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+        engine.journal_prob_min = 0.0          # archive everything the model graded
+        config = {"symbols": [], "futures_symbols": ["BTC_USDT"], "timeframes": ["5m"],
+                  "settings": {}, "markets": ["futures"]}
+        app = create_app(config, FakeFeed(rows), engine, None)
+
+        async def go():
+            await engine.warmup(FakeFeed(rows))
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+                listing = (await client.get("/api/journal", params={"limit": 50})).json()
+                stats = (await client.get("/api/journal/stats")).json()
+                diag = (await client.get("/api/diagnostics")).json()
+                page = (await client.get("/api/state")).json()
+            return listing, stats, diag, page
+
+        listing, stats, diag, page = asyncio.run(go())
+        assert stats["enabled"] is True and stats["recorded"] > 0, "the scanner wrote its signals"
+        assert listing["items"], "and they come back out"
+        first = listing["items"][0]
+        for field in ("symbol", "timeframe", "grade", "prob", "entry", "stop", "target", "formed_at"):
+            assert first.get(field) is not None, f"{field} is part of the record"
+        assert page["journal"]["recorded"] == stats["recorded"], "the push reports the archive"
+        assert diag["items"][0]["symbol"] == "BTC_USDT"
+        # a resolved signal keeps its row
+        key = first["key"]
+        engine._journal_close(key, "mitigated", {"mitigated_at": 1700000000000})  # noqa: SLF001
+        after = asyncio.run(_journal_list())
+        assert any(r["key"] == key for r in after), "nothing is deleted when a signal resolves"
+    finally:
+        journal().close()
+        open_journal(None)
+
+
+async def _journal_list() -> list[dict]:
+    from bot.journal import journal as get_journal
+    return get_journal().list(limit=200)

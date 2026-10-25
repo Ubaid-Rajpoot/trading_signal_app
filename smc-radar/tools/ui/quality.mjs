@@ -189,23 +189,25 @@ ok(ev("chart.hover && chart.hover.inside"), "the crosshair still tracks the curs
 // ---------------------------------------------------------------- round 6 --
 // futures and spot are separate sections, every zone carries a trade plan, and
 // the sniper filter really keeps only plans with a measured R:R >= 1.5.
-ev("state.showMode='active'; state.quality='all'; state.market='all'; drawCards()");
+// round 9: spot was removed - this is a futures scanner, one section, and the
+// market filter offers futures only
+ev("state.showMode='active'; state.quality='all'; drawCards()");
 await wait(400);
 const secs = [...doc.querySelectorAll("#cards .mktsec")];
-ok(secs.length === 2, `the list is split into two market sections (${secs.length})`);
-ok(secs.some((s) => s.classList.contains("futures")) && secs.some((s) => s.classList.contains("spot")),
-   "one section is futures and one is spot");
+ok(secs.length === 1 && secs[0].classList.contains("futures"),
+   `the list has exactly one section and it is futures (${secs.length})`);
+const marketOpts = [...doc.querySelectorAll("#market option")].map((o) => o.value);
+ok(marketOpts.length === 1 && marketOpts[0] === "futures", "the market filter offers futures only: " + marketOpts);
 const secHead = secs.map((s) => s.querySelector("header h3")?.textContent + " " + s.querySelector("header .n")?.textContent);
-ok(secHead.length === 2 && /Futures \d+/.test(secHead[0]) && /Spot \d+/.test(secHead[1]),
-   "each section says how many zones it holds: " + secHead.join(" / "));
+ok(secHead.length === 1 && /Futures/.test(secHead[0]) && /\d+/.test(secHead[0]),
+   "the section says how many zones it holds: " + secHead.join(" / "));
 
 const futCards = [...doc.querySelectorAll("#cards .mktsec.futures .zone")];
-const spotCards = [...doc.querySelectorAll("#cards .mktsec.spot .zone")];
-ok(futCards.every((c) => /FUT/.test(c.textContent)) && spotCards.every((c) => /SPOT/.test(c.textContent)),
-   "every card carries the market it belongs to (FUT / SPOT)");
+ok(futCards.length > 0 && futCards.every((c) => /FUT/.test(c.textContent)),
+   "every card carries the market it belongs to (FUT)");
 
 const withPlan = [...doc.querySelectorAll("#cards .plan")];
-ok(withPlan.length > 0, `cards show the trade plan (${withPlan.length} of ${futCards.length + spotCards.length})`);
+ok(withPlan.length > 0, `cards show the trade plan (${withPlan.length} of ${futCards.length})`);
 const planText = withPlan.map((p) => p.textContent);
 ok(planText.every((t) => /(buy|sell) limit/.test(t) && /stop/.test(t) && /target/.test(t)),
    "a plan states the limit entry, the stop and the target");
@@ -300,24 +302,16 @@ doc.getElementById("market").value = "futures";
 doc.getElementById("market").dispatchEvent(new window.Event("change"));
 await wait(400);
 const onlyFut = [...doc.querySelectorAll("#cards .mktsec")];
-ok(onlyFut.length === 1 && onlyFut[0].classList.contains("futures"), "filtering to futures shows only the futures section");
+ok(onlyFut.length === 1 && onlyFut[0].classList.contains("futures"), "the futures view is the only view");
 ok([...doc.querySelectorAll("#cards .zone")].every((c) => /FUT/.test(c.textContent)), "no spot card leaks into the futures view");
-doc.getElementById("market").value = "spot";
-doc.getElementById("market").dispatchEvent(new window.Event("change"));
-await wait(400);
-const onlySpot = [...doc.querySelectorAll("#cards .mktsec")];
-ok(onlySpot.length === 1 && onlySpot[0].classList.contains("spot"), "filtering to spot shows only the spot section");
-doc.getElementById("market").value = "all";
-doc.getElementById("market").dispatchEvent(new window.Event("change"));
-await wait(300);
 
 // the KPI cards count what the server counts - compared with the frame the page
 // is actually holding, because a replay keeps advancing underneath the test
 const st = ev("state.data");
 ok(Number(doc.getElementById("kFut").textContent) === st.market_counts.futures.active,
    `the futures KPI shows the futures active count (${doc.getElementById("kFut").textContent})`);
-ok(Number(doc.getElementById("kSpot").textContent) === st.market_counts.spot.active,
-   `the spot KPI shows the spot active count (${doc.getElementById("kSpot").textContent})`);
+ok(Number(doc.getElementById("kSpot").textContent) === (st.journal && st.journal.signals != null ? st.journal.signals : -1),
+   `the archive KPI shows the stored signal count (${doc.getElementById("kSpot").textContent})`);
 // round 8: the "measured hit rate" KPI is the band's out-of-sample record,
 // not a count of letters
 const bands = ev("state.bands") || [];

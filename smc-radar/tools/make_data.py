@@ -8,9 +8,10 @@ carry extra columns, so they are normalised here once instead of at every read.
 
 It writes:
 
-* ``data/btc/BTCUSDT-1m-<year>-<month>.csv``   - one file per month, for replay
-* ``data/fut/BTC_USDT-1m-<year>-<month>.csv``  - the same candles under a
-  contract name, so the futures code path can be exercised in replay
+* ``data/fut/BTC_USDT-1m-<year>-<month>.csv``  - one file per month, named like
+  the futures contract the app trades (round 9: futures only)
+* ``data/btc/BTCUSDT-1m-<year>-<month>.csv``   - the same candles as the spot
+  pair, kept only for the studies that were written before the split
 * ``study-data/BTCUSDT-1m-90d.csv``            - Jan-Mar (training block)
 * ``study-data/BTCUSDT-1m-90d-holdout.csv``    - Apr-Jun (held-out block)
 
@@ -62,16 +63,13 @@ def main() -> int:
         month_files.setdefault(month, []).append(path)
 
     for month, paths in sorted(month_files.items()):
-        out = root / "data" / "btc" / f"BTCUSDT-1m-{month}.csv"
         fut = root / "data" / "fut" / f"BTC_USDT-1m-{month}.csv"
-        out.parent.mkdir(parents=True, exist_ok=True)
         fut.parent.mkdir(parents=True, exist_ok=True)
-        with out.open("w", newline="") as handle:
+        with fut.open("w", newline="") as handle:
             writer = csv.writer(handle)
             for path in paths:
                 writer.writerows(rows(path))
-        fut.write_bytes(out.read_bytes())
-        print(f"{month}: {out} ({out.stat().st_size // 1024} KB)")
+        print(f"{month}: {fut} ({fut.stat().st_size // 1024} KB)")
 
     (root / "study-data").mkdir(parents=True, exist_ok=True)
     for label, wanted in (("90d", True), ("90d-holdout", False)):

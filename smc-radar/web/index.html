@@ -195,6 +195,20 @@
   .symlist { display: grid; gap: 6px; max-height: 280px; overflow-y: auto; }
   .symrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 9px; padding: 6px 9px; font-size: 12.5px; }
   .symrow .n { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+  /* round 9: the journal - one row per stored signal */
+  .jrow { align-items: flex-start; cursor: pointer; }
+  .jrow:hover { border-color: #2ee6a8; }
+  .jleft { display: grid; gap: 2px; min-width: 0; }
+  .jhead { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .jhead .dir { font-size: 9px; font-weight: 900; letter-spacing: .1em; padding: 1px 5px; border-radius: 4px; }
+  .jhead .dir.long { color: #0b1a14; background: #2ee6a8; }
+  .jhead .dir.short { color: #1a0b10; background: #ff5c7a; }
+  .jtf { font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+  .jgrade { font-size: 10.5px; color: #ffd479; font-weight: 700; }
+  .jmeta { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .jstate { margin-left: auto; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+  .jstate.win { color: #2ee6a8; font-weight: 800; }
+  .jstate.loss { color: #ff5c7a; font-weight: 800; }
   .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: #16203300; border: 1px solid var(--line-2); background-color: #131b28; color: var(--text); padding: 10px 16px; border-radius: 11px; font-size: 12.5px; opacity: 0; transition: .2s; z-index: 60; max-width: 90vw; }
   .toast.on { opacity: 1; transform: translateX(-50%); }
 
@@ -318,6 +332,7 @@
       <span><b id="mCandles">0</b> candles</span>
       <span>updated <b id="mUpdated">–</b></span>
     </div>
+    <button class="btn ghost" id="btnJournal">Journal</button>
     <button class="btn ghost" id="btnSymbols">Symbols</button>
     <button class="btn ghost" id="btnSettings">Settings</button>
     <button class="btn ghost" id="btnHelp">?</button>
@@ -338,7 +353,7 @@
 
   <section class="kpis">
     <div class="kpi" style="--accent:#b487ff"><div class="label">Futures</div><div class="value" id="kFut">0</div><div class="sub" id="kFutSub">contracts watched</div></div>
-    <div class="kpi" style="--accent:#63a8ff"><div class="label">Spot</div><div class="value" id="kSpot">0</div><div class="sub" id="kSpotSub">pairs watched</div></div>
+    <div class="kpi" style="--accent:#ffd479"><div class="label">Archived signals</div><div class="value" id="kSpot">0</div><div class="sub" id="kSpotSub">kept in the database</div></div>
     <div class="kpi" style="--accent:#2ee6a8"><div class="label">Signals now</div><div class="value" id="kReady">0</div><div class="sub" id="kReadySub">measured ≥ 85% and the fee clears</div></div>
     <div class="kpi" style="--accent:#7dffc4"><div class="label">Measured hit rate</div><div class="value" id="kAP">–</div><div class="sub" id="kAPSub">out of sample, this band</div></div>
     <div class="kpi" style="--accent:#63a8ff"><div class="label">Active zones</div><div class="value" id="kActive">0</div><div class="sub" id="kActiveSub">waiting for mitigation</div></div>
@@ -372,9 +387,7 @@
     </div>
     <div class="field"><label>market</label>
       <select id="market">
-        <option value="all" selected>futures + spot</option>
-        <option value="futures">futures only</option>
-        <option value="spot">spot only</option>
+        <option value="futures" selected>futures (MEXC perps)</option>
       </select>
     </div>
     <div class="field"><label>quality</label>
@@ -493,8 +506,7 @@
   <div class="body">
     <p class="note" id="symNote">Every instrument listed on the exchange can be added; the list is stored in <code>config.json</code> and streamed live.</p>
     <div class="chips" style="margin-bottom:2px">
-      <button class="chip on" data-uni-market="spot">spot</button>
-      <button class="chip" data-uni-market="futures">futures</button>
+      <button class="chip on" data-uni-market="futures">futures contracts</button>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn primary" id="btnAdd50">Add top 50 by turnover</button>
@@ -505,6 +517,32 @@
     <div class="symlist" id="uniList"></div>
     <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:6px 0 0">Streaming now</h3>
     <div class="symlist" id="activeList"></div>
+  </div>
+</aside>
+
+<aside class="drawer" id="drawerJournal">
+  <header><h3>Signal journal</h3><div class="spacer"></div>
+    <button class="btn ghost" id="btnJournalExport">CSV</button>
+    <button class="btn ghost" data-close>Close</button></header>
+  <div class="body">
+    <p class="note" id="journalNote">Every signal is written to a database the moment it is found, and its record is
+      updated as price fills the plan, reaches the target or takes the stop. Nothing here is ever deleted — a signal
+      that has left the live list is still here, with the details it had when it formed.</p>
+    <div class="grid2" style="margin-bottom:8px">
+      <label>symbol<input type="search" id="jSymbol" placeholder="btc, eth…" /></label>
+      <label>grade
+        <select id="jGrade"><option value="">every letter</option><option value="A+">A+</option>
+          <option value="A">A</option><option value="B">B</option><option value="C">C</option></select></label>
+      <label>state
+        <select id="jStatus"><option value="">any</option><option value="open">open (waiting / filled)</option>
+          <option value="target">target hit</option><option value="stopped">stopped</option>
+          <option value="mitigated">mitigated</option><option value="invalidated">invalidated</option></select></label>
+      <label>window
+        <select id="jWindow"><option value="0">everything</option><option value="1440">last 24 h</option>
+          <option value="10080">last 7 days</option><option value="43200">last 30 days</option></select></label>
+    </div>
+    <div class="chips" id="journalStats" style="margin-bottom:6px"></div>
+    <div class="symlist" id="journalList"></div>
   </div>
 </aside>
 
@@ -550,7 +588,7 @@ const TABS = [
 const state = {
   data: null, tab: "all", search: "", tfs: new Set(), sort: "prob",
   showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
-  quality: "signals", hiddenByQuality: 0, market: "all",
+  quality: "signals", hiddenByQuality: 0, market: "futures",
   bands: [],
   historyItems: [], historyAt: 0,
   chartKey: "", lastRender: 0,
@@ -765,7 +803,7 @@ function visibleZones() {
     items = items.filter((z) => z.symbol.includes(q));
   }
   if (state.market === "futures") items = items.filter((z) => marketOf(z) === "futures");
-  else if (state.market === "spot") items = items.filter((z) => marketOf(z) === "spot");
+  else if (state.market === "spot") items = items.filter((z) => marketOf(z) === "spot");   // kept for API parity, never selected
   const gradeRank = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
   const readyOf = (z) => !!(z.now_trend && z.now_trend.ready);
   const before = items.length;
@@ -896,8 +934,11 @@ function onState() {
   const spot = mc.spot || {};
   $("kFut").textContent = (fut.active || 0);
   $("kFutSub").textContent = `${fut.symbols || 0} contracts · ${fut.zones || 0} zones`;
-  $("kSpot").textContent = (spot.active || 0);
-  $("kSpotSub").textContent = `${spot.symbols || 0} pairs · ${spot.zones || 0} zones`;
+  const jstats = (d.journal && d.journal.recorded != null) ? d.journal : (state.journalStats || {});
+  $("kSpot").textContent = jstats.signals != null ? jstats.signals : 0;
+  $("kSpotSub").textContent = jstats.recorded
+    ? `${jstats.recorded} rows · ${jstats.signals_last_24h || 0} in the last 24 h`
+    : "stored the moment a signal forms";
   const gc = d.grade_counts || {};
   $("kReady").textContent = d.signal_count || 0;
   $("kReadySub").textContent = `${d.tradable_count || 0} trade-ready · ${(gc["A+"] || 0) + (gc["A"] || 0)} at A+/A`;
@@ -1030,10 +1071,8 @@ function drawCards() {
     host.appendChild(e);
     return;
   }
-  const groups = state.market === "all"
-    ? [["futures", "Futures", items.filter((z) => marketOf(z) === "futures")],
-       ["spot", "Spot", items.filter((z) => marketOf(z) === "spot")]]
-    : [[state.market, state.market === "futures" ? "Futures" : "Spot", items]];
+  // round 9: this is a futures scanner - one section, always
+  const groups = [["futures", "Futures · MEXC perpetuals", items]];
   groups.forEach(([key, label, list]) => {
     const section = el("section", "mktsec " + key);
     const head = el("header");
@@ -1044,9 +1083,7 @@ function drawCards() {
     head.appendChild(el("span", "hint", `${activeIn} active · ${sniperIn} with a measured R:R ≥ ${RR_MIN}`));
     section.appendChild(head);
     if (!list.length) {
-      section.appendChild(el("div", "none", key === "futures"
-        ? "no futures zone passes the current filters"
-        : "no spot zone passes the current filters"));
+      section.appendChild(el("div", "none", "no futures zone passes the current filters"));
     } else {
       const grid = el("div", "grid");
       list.slice(0, 300).forEach((z) => grid.appendChild(card(z, price[z.symbol])));
@@ -1804,9 +1841,9 @@ async function loadUniverse(force) {
     const partial = Object.entries(errs).map(([m, e]) => `${m}: ${e}`).join(" · ");
     note.textContent = res.error
       ? `the exchange list is not reachable: ${res.error}`
-      : `${sp} spot pairs and ${f} futures contracts listed, biggest turnover first.`
+      : `${f} futures contracts listed, biggest turnover first.`
         + (partial ? ` One market failed: ${partial}` : "")
-        + " Spot and futures are added to their own lists and both are saved to config.json.";
+        + " Everything you add is saved to config.json and streamed live.";
   } catch (err) {
     state.uniError = String(err);
     note.textContent = "could not load the exchange list: " + err;
@@ -1818,7 +1855,7 @@ function drawUniverse() {
   const q = ($("uniSearch").value || "").trim().toUpperCase();
   const known = new Set((state.data && state.data.symbols) || []);
   host.innerHTML = "";
-  const uniMarket = state.uniMarket || "spot";
+  const uniMarket = state.uniMarket || "futures";
   const items = state.universe
     .filter((it) => (it.market || (String(it.symbol).includes("_") ? "futures" : "spot")) === uniMarket)
     .filter((it) => !q || it.symbol.includes(q))
@@ -1889,7 +1926,7 @@ $("btnRefreshUniverse").onclick = () => loadUniverse(true);
 async function addPreset(preset) {
   let res = null;
   try {
-    const r = await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset, market: state.uniMarket || "spot" }) });
+    const r = await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset, market: state.uniMarket || "futures" }) });
     try { res = await r.json(); } catch (e) { res = null; }
     if (!r.ok || !res) return toast(`could not read the exchange list (HTTP ${r.status}) - try "Refresh list" again`);
   } catch (e) {
@@ -2134,6 +2171,114 @@ setInterval(() => { if (state.data && document.visibilityState === "visible") dr
 setInterval(() => {
   if (document.visibilityState === "visible" && chart.zone && Date.now() - chart.fetchedAt > 5000) refreshChart(false);
 }, 4000);
+// ---------------------------------------------------------------- journal
+// Every signal is in the database, so the page can always show it again - even
+// after it has left the live list. This drawer is the user's record book.
+const journal = { rows: [], stats: {}, at: 0, busy: false };
+
+async function loadJournal() {
+  if (journal.busy) return;
+  journal.busy = true;
+  const params = new URLSearchParams({ limit: "300", signals_only: "1" });
+  const sym = ($("jSymbol").value || "").trim();
+  if (sym) params.set("symbol", sym);
+  if ($("jGrade").value) params.set("grade", $("jGrade").value);
+  if ($("jStatus").value) params.set("status", $("jStatus").value);
+  const mins = Number($("jWindow").value || 0);
+  if (mins) params.set("since", String(Date.now() - mins * 60000));
+  try {
+    const res = await fetch("/api/journal?" + params.toString(), { cache: "no-store" });
+    const data = await res.json();
+    journal.rows = data.items || [];
+    journal.stats = data.stats || {};
+    state.journalStats = journal.stats;
+    journal.at = Date.now();
+    drawJournal();
+    onState();
+  } catch (err) {
+    $("journalNote").textContent = "could not read the archive: " + err;
+  } finally {
+    journal.busy = false;
+  }
+}
+
+function drawJournal() {
+  const st = journal.stats || {};
+  const chips = $("journalStats");
+  chips.innerHTML = "";
+  const stat = (label, value, accent) => {
+    const c = el("span", "chip on", `${label} ${value}`);
+    if (accent) c.style.color = accent;
+    chips.appendChild(c);
+  };
+  stat("in the database", st.recorded || 0);
+  stat("signals", st.signals || 0);
+  stat("open now", st.open || 0);
+  // the scoreboard of what the page actually called a signal - the C band is
+  // archived too, so "every graded row" answers a different question
+  if (st.signal_decided) {
+    stat("signal hit rate", Math.round((st.signal_hit_rate || 0) * 100) + `% of ${st.signal_decided}`,
+         (st.signal_hit_rate || 0) >= 0.9 ? "#7dffc4" : "#ffd479");
+  }
+  if (st.signal_avg_r != null) {
+    stat("signal avg R", (st.signal_avg_r > 0 ? "+" : "") + Number(st.signal_avg_r).toFixed(2),
+         st.signal_avg_r > 0 ? "#7dffc4" : "#ffb3c1");
+  }
+  if (st.decided) stat("all graded rows", Math.round((st.hit_rate || 0) * 100) + `% of ${st.decided}`);
+  if (st.avg_r != null) stat("all rows avg R", (st.avg_r > 0 ? "+" : "") + Number(st.avg_r).toFixed(2));
+  stat("last 24 h of data", st.signals_last_24h || 0, "#7dffc4");
+
+  const host = $("journalList");
+  host.innerHTML = "";
+  if (!journal.rows.length) {
+    const e = el("div", "none", "nothing in the archive for this filter yet — a signal is stored the moment it forms");
+    host.appendChild(e);
+    return;
+  }
+  journal.rows.forEach((row) => {
+    const node = el("div", "symrow jrow");
+    const left = el("div", "jleft");
+    const head = el("div", "jhead");
+    const dir = row.direction || (row.side === "high" ? "SHORT" : "LONG");
+    head.appendChild(el("b", null, row.symbol.replace("_", "").replace("USDT", "") + "/USDT"));
+    head.appendChild(el("span", "dir " + (dir === "SHORT" ? "short" : "long"), dir));
+    head.appendChild(el("span", "jtf", row.timeframe));
+    head.appendChild(el("span", "jgrade", `${row.grade || "–"} · ${row.prob != null ? Math.round(row.prob * 100) + "%" : "–"}`));
+    left.appendChild(head);
+    left.appendChild(el("div", "jmeta",
+      `${(KINDS[row.kind] || {}).label || row.kind} · formed ${fmtTime(row.formed_at)}`
+      + ` · ${row.cond_met}/${row.cond_total} conditions`));
+    const plan = `entry ${fmtPx(row.entry)} · stop ${fmtPx(row.stop)} · target ${fmtPx(row.target)}`
+      + (row.rr != null ? ` · ${row.rr}R` : "") + (row.fee_r != null ? ` · fee ${row.fee_r}R` : "");
+    left.appendChild(el("div", "jmeta", plan));
+    node.appendChild(left);
+    const state_ = row.result === "target" ? "TARGET ✅" : row.result === "stopped" ? "STOPPED"
+      : row.plan_state === "filled" ? "filled" : row.status === "active" ? "waiting" : row.status;
+    const tag = el("span", "jstate " + (row.result === "target" ? "win" : row.result === "stopped" ? "loss" : ""), state_);
+    node.appendChild(tag);
+    node.onclick = () => {
+      const live = [...(state.data && state.data.active || []), ...(state.data && state.data.history || [])]
+        .find((z) => z.key === row.key);
+      if (live) { closeDrawers(); selectZone(live); }
+      else toast(`${row.symbol} ${row.timeframe} · ${row.kind} · ${row.grade || "–"} — archived, this zone is no longer on the live map`);
+    };
+    host.appendChild(node);
+  });
+}
+
+$("btnJournal").onclick = () => { openDrawer("drawerJournal"); loadJournal(); };
+$("btnJournalExport").onclick = () => {
+  const params = new URLSearchParams({ limit: "5000", signals_only: "1" });
+  if ($("jGrade").value) params.set("grade", $("jGrade").value);
+  window.open("/api/journal.csv?" + params.toString(), "_blank");
+};
+["jSymbol", "jGrade", "jStatus", "jWindow"].forEach((id) => {
+  $(id).oninput = () => { clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 250); };
+  $(id).onchange = () => { clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 120); };
+});
+setInterval(() => { if (document.getElementById("drawerJournal").classList.contains("on")) loadJournal(); }, 20000);
+
+loadJournal();
 loadBands();
 connect();
 </script>

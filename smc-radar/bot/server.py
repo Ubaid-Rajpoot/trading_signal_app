@@ -23,6 +23,7 @@ from . import config_store
 from .engine import Engine
 from .model import model as signal_model
 from .feed import is_futures, market_of, to_futures
+from .journal import journal, open_journal
 from .poller import RestPoller
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
@@ -74,11 +75,19 @@ def create_app(
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "mexc")
     max_symbols = int(config.get("max_symbols", 2000))
+    # which markets this instance scans (round 9: futures only by default)
+    markets = [m for m in (config.get("markets") or []) if m in ("spot", "futures")]
+    if not markets:
+        markets = ["futures"] if config.get("futures_symbols") else ["spot"]
     scoring = signal_model()
     engine.model_available = scoring.available
     engine.model_problem = scoring.problem
     engine.max_active_zones = int(config.get("max_active_zones", 200))
     engine.max_zones = int(config.get("max_zones", 20000))
+    # Round 9: signals go into a database, not just into a push.
+    journal_path = config.get("journal_path") or str(WEB_DIR.parent / "data" / "journal.sqlite3")
+    store = open_journal(None if config.get("journal") is False else journal_path)
+    engine.journal_prob_min = float(config.get("journal_prob_min", 0.60))
     poller = RestPoller(
         feed,
         engine,
@@ -152,17 +161,73 @@ def create_app(
             except Exception:
                 pass
 
+    async def auto_expand_futures() -> None:
+        """Add the biggest contracts by turnover at start-up.
+
+        A scanner that only looks at the twelve names in a config file is not a
+        scanner. In live mode this asks the exchange for every contract, keeps the
+        ``auto_futures`` most traded ones that are not already configured, and
+        warms them in the background - which is where "more futures signals" has
+        to come from. Replay has no exchange list, so it is a no-op there.
+        """
+        count = int(config.get("auto_futures", 0) or 0)
+        if count <= 0 or engine.source == "replay":
+            return
+        await asyncio.sleep(1.5)
+        try:
+            items = await feed.universe()
+        except Exception as exc:
+            await hub.send_all({"type": "log", "level": "warn",
+                                "message": f"could not read the contract list: {type(exc).__name__}: {exc}"})
+            return
+        futures = [i for i in items if (i.get("market") or market_of(i["symbol"])) == "futures"]
+        futures.sort(key=lambda i: -(i.get("turnover") or 0))
+        wanted = [i["symbol"] for i in futures[:count] if i["symbol"] not in engine.symbols]
+        room = max_symbols - len(engine.symbols)
+        wanted = wanted[: max(0, room)]
+        if not wanted:
+            return
+        added = engine.add_symbols(wanted)
+        if added:
+            feed.add_symbols(added)
+            queue_warm(added)
+            await hub.send_all({"type": "log", "message":
+                                f"auto-added the {len(added)} most traded contracts - they warm in the background"})
+
     async def warm_background() -> None:
         try:
-            await engine.warmup(feed)
+            await engine.warmup(feed, concurrency=int(config.get("warm_concurrency", 4)))
         finally:
             app_state["warmed"] = True
+
+    async def healer() -> None:
+        """Keep retrying the instruments whose history is still short.
+
+        The contract API rate-limits a burst of 300 calls, and a symbol that lost
+        its warm-up produces no signals at all. Every couple of minutes the
+        instruments that are still below the lookback are queued again, slowly -
+        so the scan fills up instead of staying half empty.
+        """
+        if engine.source == "replay":
+            return
+        while True:
+            await asyncio.sleep(120)
+            try:
+                short = engine.thin_symbols()
+                if short:
+                    queue_warm(short[:60])
+                    await hub.send_all({"type": "log", "message":
+                                        f"re-requesting history for {min(len(short), 60)} thin instruments"})
+            except Exception:
+                pass
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # The page must open at once. Warming a dozen instruments over REST takes
         # a while, so it runs next to the server, never in front of it.
         tasks.append(asyncio.create_task(warm_background()))
+        tasks.append(asyncio.create_task(auto_expand_futures()))
+        tasks.append(asyncio.create_task(healer()))
         tasks.append(asyncio.create_task(pump()))
         for _ in range(warm_workers):
             tasks.append(asyncio.create_task(warmer()))
@@ -177,6 +242,7 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             tasks.clear()
+            journal().close()
 
     app = FastAPI(title="SMC radar - strong highs, algo candles, rejection blocks", lifespan=lifespan)
 
@@ -381,6 +447,70 @@ def create_app(
                 "holdout": (scoring.meta.get("results") or {}).get("holdout"),
             },
             "items": out,
+        }
+
+    # -------------------------------------------------------------- journal
+    @app.get("/api/journal")
+    async def journal_list(
+        limit: int = 200,
+        symbol: str = "",
+        timeframe: str = "",
+        grade: str = "",
+        status: str = "",
+        min_prob: float = 0.0,
+        signals_only: int = 1,
+        since: int = 0,
+        order: str = "formed",
+    ) -> dict[str, Any]:
+        """Every signal ever produced, straight from the database.
+
+        This is the answer to "signals come and then vanish": the page can show
+        the whole history, with the details each signal had when it formed and
+        what happened to it afterwards. Nothing in this table is ever deleted.
+        """
+        rows = journal().list(
+            limit=limit, symbol=symbol, timeframe=timeframe, grade=grade,
+            status=status, min_prob=min_prob, signals_only=bool(signals_only),
+            since=since, order=order,
+        )
+        return {"count": len(rows), "items": rows, "stats": journal().stats()}
+
+    @app.get("/api/journal/stats")
+    async def journal_stats() -> dict[str, Any]:
+        return journal().stats()
+
+    @app.get("/api/journal.csv")
+    async def journal_csv(limit: int = 5000, grade: str = "", signals_only: int = 1) -> Any:
+        body = journal().csv(limit=limit, grade=grade, signals_only=bool(signals_only))
+        return StreamingResponse(
+            iter([body]),
+            media_type="text/csv",
+            headers={"content-disposition": 'attachment; filename="signals.csv"'},
+        )
+
+    @app.get("/api/journal/{key:path}")
+    async def journal_one(key: str) -> Any:
+        row = journal().get(key)
+        if row is None:
+            return JSONResponse({"error": "no such signal in the archive"}, status_code=404)
+        return row
+
+    @app.get("/api/diagnostics")
+    async def diagnostics() -> dict[str, Any]:
+        """Per contract: bars per timeframe, zones, signals, and any warm-up error.
+
+        This is the honest answer to "why does this contract have no signals".
+        """
+        rows = engine.diagnostics()
+        return {
+            "count": len(rows),
+            "markets": markets,
+            "timeframes": engine.timeframes,
+            "lookback": int(engine.settings.get("lookback", 240)),
+            "warming": {"done": engine.warm_done, "total": max(1, engine.warm_total),
+                        "errors": engine.warm_errors, "active": engine.warming},
+            "journal": journal().stats(),
+            "items": rows,
         }
 
     @app.get("/api/model")

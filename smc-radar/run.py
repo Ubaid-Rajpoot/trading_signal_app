@@ -48,10 +48,23 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         raise SystemExit(f"{path} is not valid JSON: {exc}")
 
 
+def markets_of(config: dict) -> list[str]:
+    """Which markets this configuration scans. Round 9: futures only."""
+    wanted = [m for m in (config.get("markets") or []) if m in ("spot", "futures")]
+    if wanted:
+        return wanted
+    # no explicit choice: infer it from the symbols, futures-first
+    if config.get("futures_symbols"):
+        return ["futures"]
+    return ["spot"] if config.get("symbols") else ["futures"]
+
+
 def market_symbols(config: dict) -> list[str]:
-    """Spot pairs and futures contracts in one list, without duplicates."""
-    spot = [str(s) for s in (config.get("symbols") or [])]
-    futures = [to_futures(s) for s in (config.get("futures_symbols") or [])]
+    """The instruments the engine scans, filtered to the enabled markets."""
+    markets = markets_of(config)
+    spot = [str(s) for s in (config.get("symbols") or [])] if "spot" in markets else []
+    futures = [to_futures(s) for s in (config.get("futures_symbols") or [])] if "futures" in markets else []
+    spot = [s for s in spot if not is_futures(s)]
     return list(dict.fromkeys(spot + futures))
 
 
@@ -65,7 +78,8 @@ def make_engine(config: dict) -> Engine:
 
 
 async def check(config: dict, exchange: str) -> int:
-    if exchange == "mexc" and (config.get("futures_symbols") or []):
+    markets = markets_of(config)
+    if exchange == "mexc" and "futures" in markets and (config.get("futures_symbols") or []):
         spot = [s for s in (config.get("symbols") or []) if not is_futures(s)]
         futures = [to_futures(s) for s in (config.get("futures_symbols") or [])]
         print("0) MEXC futures REST ...")
@@ -75,16 +89,18 @@ async def check(config: dict, exchange: str) -> int:
             print(f"   OK  {len(bars)} futures candles, last close {bars[-1]['close']} ({feed.symbols[0]})")
         except Exception as exc:
             print(f"   FAIL  {type(exc).__name__}: {exc}")
-            print("   -> futures REST is not reachable; spot can still work.")
-        config = {**config, "symbols": spot or config["symbols"]}
+            print("   -> futures REST is not reachable; this app needs it to scan anything")
+        config = {**config, "symbols": spot}
     # the universe on both markets: this is what the "add instruments" panel uses
     if exchange == "mexc":
-        print("0b) MEXC instrument list, spot and futures ...")
+        print(f"0b) MEXC instrument list ({', '.join(markets)}) ...")
         try:
             lookup = make_market_feed(
                 "mexc",
-                [s for s in (config.get("symbols") or []) if not is_futures(s)][:1] or ["BTCUSDT"],
-                [to_futures(s) for s in (config.get("futures_symbols") or [])][:1] or ["BTC_USDT"],
+                [] if "spot" not in markets else
+                ([s for s in (config.get("symbols") or []) if not is_futures(s)][:1] or ["BTCUSDT"]),
+                ([to_futures(s) for s in (config.get("futures_symbols") or [])][:1] or ["BTC_USDT"])
+                if "futures" in markets else [],
             )
             items = await lookup.universe()
             per_market = {}
@@ -99,9 +115,11 @@ async def check(config: dict, exchange: str) -> int:
         except Exception as exc:
             print(f"   FAIL  {type(exc).__name__}: {exc}")
 
-    symbol = config["symbols"][0] if config.get("symbols") else "BTCUSDT"
+    symbol = (config["symbols"][0] if config.get("symbols") else "BTCUSDT") if "spot" in markets else (
+        (config.get("futures_symbols") or ["BTC_USDT"])[0])
     print(f"1) {exchange} REST history for {symbol} ...")
-    feed = make_feed(exchange, [symbol])
+    feed = make_market_feed(exchange, [] if "spot" not in markets else [symbol],
+                            [to_futures(symbol)] if "futures" in markets else [])
     try:
         candles = await feed.history(symbol, "1m", 10)
         last = candles[-1]
@@ -204,8 +222,10 @@ def main() -> int:
     config = load_config(config_path)
     if args.symbols:
         config["symbols"] = [s for s in config_store.clean_symbols(args.symbols.split(",")) if not is_futures(s)]
+        config["markets"] = ["spot"] if not config.get("futures_symbols") else ["spot", "futures"]
     if args.futures:
         config["futures_symbols"] = [to_futures(s) for s in config_store.clean_symbols(args.futures.split(","))]
+        config["markets"] = ["futures"] if not config.get("symbols") else ["spot", "futures"]
     if args.exchange:
         config["exchange"] = args.exchange
     exchange = str(config.get("exchange", "mexc")).lower()
@@ -214,14 +234,15 @@ def main() -> int:
         return asyncio.run(check(config, exchange))
 
     if args.command == "universe":
-        return asyncio.run(universe(exchange, args.top, args.market or "spot"))
+        return asyncio.run(universe(exchange, args.top, args.market or ("futures" if "futures" in markets_of(config) else "spot")))
 
     if args.command == "serve":
         try:
+            markets = markets_of(config)
             feed = make_market_feed(
                 exchange,
-                [s for s in config["symbols"] if not is_futures(s)],
-                [to_futures(s) for s in (config.get("futures_symbols") or [])],
+                [s for s in config.get("symbols", []) if not is_futures(s)] if "spot" in markets else [],
+                [to_futures(s) for s in (config.get("futures_symbols") or [])] if "futures" in markets else [],
             )
         except FeedError as exc:
             print(f"feed error: {exc}")

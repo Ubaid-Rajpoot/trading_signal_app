@@ -18,7 +18,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from bot.feed import CompositeFeed, FeedError, is_futures, market_of, to_futures, to_spot  # noqa: E402
+from bot.feed import (  # noqa: E402
+    CompositeFeed,
+    FeedError,
+    MexcFuturesFeed,
+    is_futures,
+    market_of,
+    to_futures,
+    to_spot,
+)
 
 
 class FakeFeed:
@@ -179,3 +187,30 @@ def test_removing_a_symbol_takes_it_out_of_every_market():
     assert spot.symbols == ["BTCUSDT"] and futures.symbols == []
     assert comp.symbols == ["BTCUSDT"]
 
+
+
+# ------------------------------------------------- round 9: futures, on its own
+def test_futures_only_builds_no_spot_feed_at_all():
+    """The app is a futures scanner now: with no spot symbols there is no spot
+    socket, no spot candles and nothing to warm."""
+    from bot.feed import make_market_feed
+
+    feed = make_market_feed("mexc", [], ["BTC_USDT", "ETH_USDT"])
+    assert isinstance(feed, MexcFuturesFeed), type(feed).__name__
+    assert feed.symbols == ["BTC_USDT", "ETH_USDT"]
+
+
+def test_the_contract_interval_is_a_minute_window_not_always_one_minute():
+    """The warm-up used to ask the contract API for ``Min15`` while computing the
+    window with 60-second candles: 15m got ~66 bars instead of 1000, never reached
+    the 240-bar lookback, and produced (almost) no zones. That is why futures
+    looked empty next to spot."""
+    from bot.feed import future_interval, future_seconds
+
+    assert future_interval("5m") == "Min5"
+    assert future_interval("15m") == "Min15"
+    assert future_interval("1h") == "Min60"
+    assert future_interval("Min5") == "Min5", "the exchange's own name is accepted too"
+    assert future_interval("3m") is None, "MEXC has no 3m contract interval"
+    assert future_seconds("Min5") == 300 and future_seconds("5m") == 300
+    assert future_seconds("Min15") == 900 and future_seconds("Min1") == 60

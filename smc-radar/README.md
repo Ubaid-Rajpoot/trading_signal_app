@@ -255,6 +255,57 @@ every zone comes back, with the reason it was hidden shown on its card.
   unchanged; the default quality filter is still A+ and A; old modes are one
   click away.
 
+### Round 9 — futures only, and a signal you cannot lose
+
+Three demands: *remove the spot side completely*, *futures must produce a lot of
+signals*, and *a signal that has been shown must be stored with its details so it can
+never be lost*. The first two turned out to share one root cause, and the third turned
+up two bugs of its own.
+
+* **Spot is gone.** `config.json` is `markets: ["futures"]` with 40 contracts and
+  `auto_futures: 60` (the top contracts by turnover are added when a live scan
+  starts); `make_market_feed()` returns a bare `MexcFuturesFeed`; `run.py` has no spot
+  path; the page has one market section, and the spot KPI became **Archived signals**.
+  `data/btc/` is deleted, `data/fut/` is the only candle folder.
+* **"Futures gives no signals" was two bugs.** (1) The contract kline window was
+  computed with 60-second candles whatever the timeframe, so `Min15` got ~66 bars
+  instead of ~1000, never reached the 240-bar lookback, and produced nothing. (2)
+  `warmup()` gave up on **every remaining instrument** after eight consecutive
+  failures — and 60 contracts is 300 rate-limited REST calls, so the first burst
+  switched the scan off and it then waited for the live stream to fill 15m history
+  (two and a half days). Now one failure costs one instrument: the pass backs off and
+  a `healer()` re-requests whatever is still thin. `GET /api/diagnostics` prints
+  bars / zones / ATR / lookback / warm-up error **per contract and timeframe**, so an
+  empty contract has a visible reason.
+* **The stop moved to the rule.** The shipped stop was 0.10 ATR beyond the exact
+  high/low — inside one candle's noise. The block stop (beyond the whole order block,
+  which is what "stop beyond the red box" says) on the same 36-day replay, same model,
+  same fee gate: **4.1 → 14.8 signals per day**, hit rate **41.7 % → 64.7 %**, average
+  **−0.25 R → −0.08 R** (before fees). Round 8's *study* had found the block stop
+  worse; the app's own bookkeeping disagrees, so the app now follows the measurement
+  it can reproduce, `plan_stop_mode: level` is still in the settings drawer, and the
+  conflict is written down rather than hidden. **Neither stop setting is profitable
+  yet** — the block plan pays only ~0.55 R per 1 R risked, so 64.7 % is break-even
+  before fees — and the page no longer prints the study's 97 % as if it were live.
+* **Every signal is in SQLite.** `bot/journal.py` (stdlib, WAL) writes a row the moment
+  a zone reaches `journal_prob_min` (0.60) or becomes a signal, with symbol, market,
+  timeframe, kind, side, grade, probability, the measured band, conditions, level,
+  **entry / stop / target**, R:R, risk %, fee in R, net R, trade-ready, status, plan
+  state and timestamps — plus the entire zone as JSON. The row is updated through its
+  life and **never deleted**; `result` / `result_r` / `closed_at` are write-once,
+  because a plain update from the live zone was erasing them (the actual "my signal
+  lost its details" bug). Two hit rates are reported — the signals only, and every
+  archived row — and the drawer prints the signal scoreboard first.
+* **The page shows it.** A **Journal** drawer with symbol / grade / status / window
+  filters, a CSV export (`/api/journal.csv`) and the archive KPI in the top strip;
+  `/api/journal`, `/api/journal/stats`, `/api/journal/{key}`, `/api/diagnostics`.
+  A replay of the recorded futures candles stores ~2500 graded setups and 150+ signals
+  in 30 days on a single contract, and every one of them is still readable after it is
+  mitigated, invalidated or stopped.
+
+Full tables, the exact replay command and what could not be verified offline:
+[`docs/round-9-futures-and-journal.md`](docs/round-9-futures-and-journal.md).
+
 ### Round 8 — the exit was the bug: many signals, 97 % measured, and a reward that pays
 
 The complaint: *"futures still has too few signals; I want a system with a lot of
@@ -366,8 +417,8 @@ there.
 | `plan_pool_bars` | 120 | how far back the session extreme used as a target may be |
 | `plan_pool_age` | 600 | bars a strong level stays a valid target |
 | `cond_disp_atr` | 2.0 | "aggressive displacement" = this many ATR (a condition) |
+| `plan_stop_mode` | **block** | round 9: stop beyond the whole order block (the rule) instead of 0.10 ATR beyond the extreme — measured 3.6× the signals and +23 points of hit rate on the replay |
 | `plan_target_atr_min` | **1.0** | round 8: the exit pool must be at least this × ATR away (`0` = round 7's nearest pool) |
-| `plan_stop_mode` | `level` | stop beyond the exact high/low; `block` puts it beyond the far side of the red box too (measured worse) |
 | `signal_prob_min` | 0.85 | what the page calls a signal: measured at this bar *and* the fee clears |
 | `prob_cuts` | A+ 0.90, A 0.85, B 0.75, C 0.60 | measured probability → letter (each letter's own record is in `docs/signals.md`) |
 | `fee_maker_bps` / `fee_taker_bps` | 2 / 6 | MEXC futures fees used to cost the plan |
