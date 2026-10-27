@@ -895,7 +895,10 @@ class MarketMap:
         A weak level is never a signal, whatever the market is doing.
         """
         st = structure or self.structure()
-        htf = context or {}
+        # `context` is the structure of the timeframe above, pushed in by the engine
+        # on every bar; fall back to it so a zone can never be graded without it
+        htf = self.context if context is None else context
+        htf = htf or {}
         why: list[str] = []
         want = "trend_down" if zone.side == HIGH else "trend_up"
         side_name = "short" if zone.side == HIGH else "long"
@@ -908,8 +911,11 @@ class MarketMap:
         elif st.get("state") != want:
             why.append(f"{self.timeframe} structure is {st['state']} - a {side_name} needs {want}")
 
-        loc = st.get("location")
         mid = st.get("mid")
+        # where the *block* sits in the dealing range - not where price is right now
+        block_loc = None
+        if mid is not None:
+            block_loc = "premium" if zone.level > mid else "discount" if zone.level < mid else "middle"
         atr = st.get("atr") or 0.0
         edge = float(self.cfg.get("gate_premium_atr", 0.25)) * atr
         if zone.side == HIGH:
@@ -935,7 +941,8 @@ class MarketMap:
             "structure_why": st.get("why"),
             "htf": htf_state,
             "htf_timeframe": htf_tf or None,
-            "location": loc,
+            "location": block_loc,
+            "price_location": st.get("location"),
             "side": side_name,
             "mid": mid,
         }

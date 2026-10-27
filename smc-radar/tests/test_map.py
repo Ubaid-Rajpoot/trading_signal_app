@@ -586,7 +586,9 @@ def test_a_setup_inside_a_range_is_not_a_signal():
     ok = up.trade_gate(_zone(side="low", level=105.0, kind="strong_low"),
                        context={"state": "trend_up", "timeframe": "15m"})
     assert ok["ok"] is True, ok
-    assert ok["htf"] == "trend_up" and ok["location"] == "premium"
+    assert ok["htf"] == "trend_up"
+    assert ok["location"] == "discount", "the buy block (105) is below the middle (110)"
+    assert ok["price_location"] == "premium"
 
 
 def test_a_trade_against_the_higher_timeframe_is_not_a_signal():
@@ -635,3 +637,28 @@ def test_the_structure_gate_can_be_turned_off_in_the_settings(monkeypatch):
     assert zone.signal is True, "with the rule switched off the measured setup is a signal again"
     SignalModel().rate(zone, DEFAULTS)
     assert zone.signal is False, "and on by default it is not"
+
+
+def test_a_zone_is_graded_with_the_timeframe_above_it():
+    """The parent structure must reach the gate without being passed by hand.
+
+    Round 13 shipped this half-wired: the engine pushed the higher timeframe into
+    ``map.context``, but ``_add_zone`` graded the zone with an empty context, so the
+    "the bigger trend must agree" test silently did nothing on the live app.
+    """
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=119)
+    map_.context = {"state": "trend_down", "timeframe": "15m"}
+    zone = _zone(side="low", level=105.0, kind="strong_low")
+    gate = map_.trade_gate(zone)
+    assert gate["htf"] == "trend_down" and gate["htf_timeframe"] == "15m"
+    assert gate["ok"] is False and any("fights the bigger trend" in r for r in gate["why"])
+
+
+def test_the_gate_reports_where_the_block_sits_not_where_price_is():
+    """A card must not say "premium" next to a long that passed the discount test."""
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=119)
+    gate = map_.trade_gate(_zone(side="low", level=105.0, kind="strong_low"),
+                           context={"state": "trend_up", "timeframe": "15m"})
+    assert gate["ok"] is True
+    assert gate["location"] == "discount", "the block (105) is below the middle (110)"
+    assert gate["price_location"] == "premium", "price (119) is above it - both are printed"

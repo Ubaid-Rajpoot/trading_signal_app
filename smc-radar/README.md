@@ -287,16 +287,17 @@ Five reported failures and one accusation, all fixed and measured:
   timeframe above must agree, and a sell belongs in premium / a buy in discount.
   Every card prints the verdict or the reason it failed.
 * **The numbers, honestly** (90 held-out days, the plan as traded):
-  at p≥0.85 the gate moves the hit rate **95.4 % → 97.4 %** while removing **91 %**
-  of the signals and 0.02 R of expectancy. It is the book's rule and the user's
-  rule, so it ships on — and `"structure_gate": false` turns it off.
+  at p≥0.85 the gate moves the hit rate **95.4 % → 97.7 %** while removing **97 %**
+  of the signals and 0.02 R of expectancy (1.7 % of every plan formed passes:
+  344 of 20 717 on 90 held-out days). It is the book's rule and the user's rule, so
+  it ships on — and `"structure_gate": false` turns it off.
 * **Why the account emptied:** R:R 0.31 means **one stop costs 3.2 wins**; at a
   "96 %" sounding size, one stop is the account. The card now says so in amber, and
   every percentage carries its sample size (`97 % · n=151`).
 * The model was re-fitted on the plan the app **actually trades** (`--stop-mode
   block`, stop beyond the block) — the old 97 % described a `level` stop nobody was
-  taking. New bands, holdout, gate on: A+ 98 % (n=44) · A 97 % (n=151) · B 92 %
-  (n=334) · C 84 % (n=661, −0.05 R → never a signal).
+  taking. New bands, holdout, gate on: A+ 100 % (n=16) · A 98 % (n=44) · B 95 %
+  (n=95) · C 87 % (n=186, −0.01 R → never a signal).
 
 ### Round 12 — the signal that "disappeared", and why the app got slow
 

@@ -72,7 +72,11 @@ ok(cards.every((c) => /formed/.test(c.textContent)), "every card says when it fo
 ev('document.getElementById("recentWindow").value = "1440"; document.getElementById("recentWindow").dispatchEvent(new window.Event("change"))');
 await wait(1500);
 const wideCards = [...doc.querySelectorAll("#cards .zone")];
-ok(wideCards.length > cards.length, `the window widens the list (${cards.length} -> ${wideCards.length} cards)`);
+// Round 13: a live scan forms and resolves zones between the two reads, so counting
+// cards twice is a race. What the window is *for* is admitting older zones - that is
+// what is checked, on the page's own filtered list.
+ok(ev("visibleZones().some((z) => Date.now() - z.time > 3600e3)"),
+   `the window admits zones older than an hour (${cards.length} -> ${wideCards.length} cards)`);
 const withMitigation = wideCards.filter((c) => /mitigated/.test(c.textContent));
 console.log("of which show their mitigation:", withMitigation.length);
 ok(withMitigation.length > 0, "mitigated zones keep their card with the time and price (" + withMitigation.length + ")");

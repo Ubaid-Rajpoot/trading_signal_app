@@ -179,16 +179,30 @@ block), fee ≤ 0.30 R:
 | group | plans | /day | hit rate | 95 % CI | R:R | net R/plan |
 | --- | --- | --- | --- | --- | --- | --- |
 | p≥0.85, gate **off** | 1691 | 18.8 | 95.4 % | 94–96 % | 0.35 | +0.16 |
-| p≥0.85, gate **on** | 151 | 1.7 | **97.4 %** | 93–99 % | 0.31 | +0.14 |
+| p≥0.85, gate **on** | 44 | 0.49 | **97.7 %** | 88–100 % | 0.29 | +0.14 |
 | p≥0.90, gate off | 426 | 4.7 | 97 % | 95–99 % | 0.35 | +0.16 |
-| p≥0.90, gate on | 44 | 0.5 | 98 % | 88–100 % | 0.34 | +0.15 |
+| p≥0.90, gate on | 16 | 0.18 | 100 % | 81–100 % | 0.28 | +0.15 |
+| p≥0.75, gate off | 3885 | 43.2 | 91 % | 91–92 % | 0.33 | +0.11 |
+| p≥0.75, gate on | 95 | 1.06 | 95 % | 88–98 % | 0.30 | +0.10 |
+
+Only **1.7 %** of every plan the map forms (346 of 20 717 on the holdout) passes the
+full gate — the own-timeframe structure *and* the higher timeframe *and* the
+premium/discount location. On one instrument that is 0.5–1 signal a day at the
+shipped cut; across sixty contracts it is a live list, not a trickle.
 
 So, straight: **the ranging-market signals were not, on this sample, the disaster
 the complaint assumes.** They hit their (small) target 95.4 % of the time; the
-gated ones 97.4 %. The gate removes **91 % of the signals** for **+2 points of hit
+gated ones 97.7 %. The gate removes **97 % of the signals** for **+2 points of hit
 rate and −0.02 R of expectancy**. It is applied because it is *the rule the user
 stated and the book states*, not because it is more profitable — and it can be
 switched off with `"structure_gate": false` in the settings.
+
+(A first pass of this measurement was wrong for a wiring reason worth recording:
+the engine pushed the higher timeframe into `map.context`, but `_add_zone` graded
+the zone with an empty context, so the "bigger trend must agree" test silently did
+nothing while every unit test passed, because they passed the context by hand. The
+live app showed `htf: null` on every card, which is how it was caught.
+`test_a_zone_is_graded_with_the_timeframe_above_it` pins it now.)
 
 ### 6d. So why did the account empty? The arithmetic, not the range
 
@@ -236,14 +250,16 @@ validated on 90 more, and the bands are measured **with the structure gate on**:
 
 | band | cut | measured hit rate (holdout) | n | 95 % CI | net R |
 | --- | --- | --- | --- | --- | --- |
-| A+ | ≥ 0.90 | 98 % | 44 | 88–100 % | +0.15 |
-| A | ≥ 0.85 | 97 % | 151 | 93–99 % | +0.14 |
-| B | ≥ 0.75 | 92 % | 334 | 89–95 % | +0.09 |
-| C | ≥ 0.60 | 84 % | 661 | 81–86 % | −0.05 |
+| A+ | ≥ 0.90 | 100 % | 16 | 81–100 % | +0.15 |
+| A | ≥ 0.85 | 98 % | 44 | 88–100 % | +0.14 |
+| B | ≥ 0.75 | 95 % | 95 | 88–98 % | +0.10 |
+| C | ≥ 0.60 | 87 % | 186 | 82–91 % | −0.01 |
 
 Calibration on the holdout is honest (predicted 91 % → actual 94 % in the top
 bucket, 85 % → 86 % in the next), and every plan that is *not* in these bands has
-a negative or near-zero expectancy.
+a negative or near-zero expectancy. Note the **sample sizes**: A is 44 signals over
+90 days, so its 95 % interval runs from 88 % to 100 %. That is what a number like
+this honestly is — not the flat "97 %" the old page printed.
 
 Reproduce (~3 min):
 
