@@ -34,6 +34,12 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+# What "open" means, in one place (round 13): a plan that has not been decided by
+# its own target or stop. Entering the block fills the plan - the trade is *live*
+# from that moment - so ``mitigated`` with a filled plan is open, not closed.
+OPEN_SQL = ("plan_state IN ('waiting','filled') AND COALESCE(result,'') NOT IN ('target','stopped') "
+            "AND status <> 'interrupted'")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
     key         TEXT PRIMARY KEY,
@@ -67,6 +73,7 @@ CREATE TABLE IF NOT EXISTS signals (
     first_seen  INTEGER,
     last_seen   INTEGER,
     closed_at   INTEGER,
+    note        TEXT,
     snapshot    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signals_formed ON signals(formed_at DESC);
@@ -80,8 +87,12 @@ FIELDS = (
     "prob", "band_win", "band_n", "cond_met", "cond_total", "level", "entry",
     "stop", "target", "rr", "risk_pct", "fee_r", "net_r", "tradable", "signal",
     "status", "plan_state", "result", "result_r", "formed_at", "first_seen",
-    "last_seen", "closed_at",
+    "last_seen", "closed_at", "note",
 )
+
+# A database written by an older build is upgraded in place - the archive is the
+# one thing in this app that must never be thrown away to add a column.
+MIGRATIONS = (("note", "ALTER TABLE signals ADD COLUMN note TEXT"),)
 
 
 # facts that are settled once and must never be blanked by a later update
@@ -134,6 +145,7 @@ def _row(zone: dict, now: int) -> dict[str, Any]:
         "first_seen": now,
         "last_seen": now,
         "closed_at": int(zone.get("mitigated_at") or zone.get("invalidated_at") or 0) or None,
+        "note": zone.get("note"),
         "snapshot": json.dumps(zone, default=str)[:20000],
     }
 
@@ -158,11 +170,20 @@ class SignalJournal:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
         except Exception as exc:  # a broken disk must never stop the scanner
             self.problem = f"{type(exc).__name__}: {exc}"
             self._db = None
             self.enabled = False
+
+    def _migrate(self) -> None:
+        """Add the columns a newer build needs, without touching a single row."""
+        assert self._db is not None
+        have = {row[1] for row in self._db.execute("PRAGMA table_info(signals)")}
+        for name, ddl in MIGRATIONS:
+            if name not in have:
+                self._db.execute(ddl)
 
     # ------------------------------------------------------------ writing
     def record(self, zone: dict, now: int | None = None) -> bool:
@@ -208,7 +229,7 @@ class SignalJournal:
 
     def close_signal(self, key: str, status: str, at: int | None = None,
                      price: float | None = None, result: str | None = None,
-                     result_r: float | None = None) -> bool:
+                     result_r: float | None = None, note: str | None = None) -> bool:
         """Mark a signal finished. It stays in the database forever."""
         if not self.enabled:
             return False
@@ -217,10 +238,18 @@ class SignalJournal:
             try:
                 self._db.execute(
                     "UPDATE signals SET status = ?, closed_at = COALESCE(?, closed_at),"
-                    " result = COALESCE(?, result), result_r = COALESCE(?, result_r),"
-                    " plan_state = CASE WHEN ? IN ('target','stopped') THEN ? ELSE plan_state END"
+                    # A *decided* outcome is final: a later run that replays the same
+                    # zone, or a second event for the same key, must not rewrite
+                    # "target +1.6 R" into "stopped -1 R". Before a decision, the
+                    # row still follows the trade (mitigated -> target is normal).
+                    " result = CASE WHEN result IN ('target','stopped') THEN result"
+                    "               ELSE COALESCE(?, result) END,"
+                    " result_r = CASE WHEN result IN ('target','stopped') THEN result_r"
+                    "                 ELSE COALESCE(?, result_r) END,"
+                    " plan_state = CASE WHEN ? IN ('target','stopped') THEN ? ELSE plan_state END,"
+                    " note = COALESCE(?, note)"
                     " WHERE key = ?",
-                    (status, at, result, result_r, result, result, key),
+                    (status, at, result, result_r, result, result, note, key),
                 )
                 self._db.commit()
                 self.updated += 1
@@ -228,6 +257,35 @@ class SignalJournal:
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return False
+
+    def reap(self, now: int | None = None, max_age_hours: float = 6.0) -> int:
+        """Close the plans a *previous* run left open - and keep every one of them.
+
+        A live restart throws the in-memory map away: the positions the scanner was
+        following no longer exist, but their rows still said "active", so the page's
+        "open now" grew by a dozen every restart and the drawer filled with signals
+        that were never going to resolve. Reaping marks exactly those rows
+        ``interrupted`` with a note, and never deletes them. Rows that are still
+        being updated (``last_seen`` inside the window) are untouched.
+        """
+        if not self.enabled:
+            return 0
+        now = int(now if now is not None else time.time() * 1000)
+        cutoff = now - int(max(0.0, float(max_age_hours)) * 3_600_000)
+        with self._lock:
+            assert self._db is not None
+            try:
+                cursor = self._db.execute(
+                    "UPDATE signals SET status = 'interrupted',"
+                    " note = COALESCE(note, 'the scanner restarted while this plan was open')"
+                    " WHERE status = 'active' AND COALESCE(last_seen, formed_at, 0) < ?",
+                    (cutoff,),
+                )
+                self._db.commit()
+                return int(cursor.rowcount or 0)
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return 0
 
     # ------------------------------------------------------------ reading
     def list(
@@ -241,6 +299,7 @@ class SignalJournal:
         signals_only: bool = False,
         since: int = 0,
         order: str = "formed",
+        offset: int = 0,
     ) -> list[dict]:
         if not self.enabled:
             return []
@@ -257,9 +316,9 @@ class SignalJournal:
             params += wanted
         if status:
             if status == "open":
-                where.append("status = 'active' AND plan_state IN ('waiting','filled')")
+                where.append(OPEN_SQL)
             elif status == "closed":
-                where.append("status <> 'active' OR plan_state IN ('target','stopped')")
+                where.append(f"NOT ({OPEN_SQL})")
             else:
                 where.append("status = ?")
                 params.append(status)
@@ -271,12 +330,13 @@ class SignalJournal:
         if since:
             where.append("formed_at >= ?")
             params.append(int(since))
-        column = "closed_at" if order == "closed" else "formed_at"
+        column = {"closed": "closed_at", "seen": "last_seen"}.get(order, "formed_at")
         sql = (
             f"SELECT {', '.join(FIELDS)} FROM signals WHERE {' AND '.join(where)}"
-            f" ORDER BY {column} DESC, prob DESC LIMIT ?"
+            f" ORDER BY {column} DESC, prob DESC LIMIT ? OFFSET ?"
         )
         params.append(max(1, min(int(limit), 5000)))
+        params.append(max(0, int(offset)))
         with self._lock:
             assert self._db is not None
             try:
@@ -284,6 +344,82 @@ class SignalJournal:
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return []
+
+    def open_snapshots(self, hours: float = 26.0, limit: int = 400) -> list[dict]:
+        """The plans that were still open when the scanner stopped - to adopt them.
+
+        Round 13: a restart used to *interrupt* every open plan (kept in the table,
+        but no longer followed), so the page came back with an empty live list even
+        though the trades were still live on the exchange. This returns the stored
+        zone snapshots for the rows that are still open, so the scanner can put
+        them back on its map and go on following them.
+        """
+        if not self.enabled:
+            return []
+        since = int((time.time() - max(0.0, hours) * 3600.0) * 1000)
+        sql = (
+            f"SELECT snapshot FROM signals WHERE {OPEN_SQL} "
+            "AND COALESCE(last_seen, formed_at) >= ? "
+            "ORDER BY formed_at DESC LIMIT ?"
+        )
+        out: list[dict] = []
+        with self._lock:
+            assert self._db is not None
+            try:
+                for row in self._db.execute(sql, (since, max(1, int(limit)))).fetchall():
+                    try:
+                        item = json.loads(row["snapshot"] or "{}")
+                    except Exception:
+                        continue
+                    if isinstance(item, dict) and item.get("key"):
+                        out.append(item)
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+        return out
+
+    def count(self, **kwargs: Any) -> int:
+        """How many rows the same filters match - a page needs to know its size."""
+        kwargs.pop("limit", None)
+        kwargs.pop("offset", None)
+        kwargs.pop("order", None)
+        if not self.enabled:
+            return 0
+        where, params = ["1=1"], []
+        symbol = str(kwargs.get("symbol") or "")
+        if symbol:
+            where.append("symbol LIKE ?")
+            params.append(f"%{symbol.upper()}%")
+        timeframe = str(kwargs.get("timeframe") or "")
+        if timeframe:
+            where.append("timeframe = ?")
+            params.append(timeframe)
+        status = str(kwargs.get("status") or "")
+        if status:
+            # Round 13: "open" and "closed" were silently ignored here, so the total
+            # printed next to an "open now" list was the size of the whole archive.
+            if status == "open":
+                where.append(OPEN_SQL)
+            elif status == "closed":
+                where.append(f"NOT ({OPEN_SQL})")
+            else:
+                where.append("status = ?")
+                params.append(status)
+        if kwargs.get("signals_only"):
+            where.append("signal = 1")
+        grade = str(kwargs.get("grade") or "")
+        if grade:
+            wanted = [g.strip().upper() for g in grade.split(",") if g.strip()]
+            where.append("grade IN (%s)" % ",".join("?" for _ in wanted))
+            params += wanted
+        with self._lock:
+            assert self._db is not None
+            try:
+                return int(self._db.execute(
+                    f"SELECT COUNT(*) FROM signals WHERE {' AND '.join(where)}", params
+                ).fetchone()[0])
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return 0
 
     def get(self, key: str) -> dict | None:
         if not self.enabled:
@@ -346,6 +482,9 @@ class SignalJournal:
                 recent = self._db.execute(
                     "SELECT COUNT(*) FROM signals WHERE signal = 1 AND formed_at >= ?", (day,)
                 ).fetchone()[0]
+                interrupted = self._db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE status = 'interrupted'"
+                ).fetchone()[0]
                 by_grade = {
                     str(row[0]): int(row[1])
                     for row in self._db.execute(
@@ -370,6 +509,7 @@ class SignalJournal:
                 "signal_avg_r": avg_s,
                 "last_formed_at": last,
                 "signals_last_24h": int(recent),
+                "interrupted": int(interrupted),
                 "by_grade": by_grade,
             }
         )

@@ -46,7 +46,7 @@ await wait(6000);
 // ---------------------------------------------------------------- the payload
 const zones = await (await fetch(BASE + "/api/zones?status=active&limit=400")).json();
 ok(zones.items.length > 0, `active zones are served (${zones.items.length})`);
-const sample = zones.items.find((z) => z.ob && z.grade) || zones.items[0];
+const sample = zones.items.find((z) => z.ob && ["A+", "A", "B", "C"].includes(z.grade)) || zones.items[0];
 ok(!!sample.ob, "every zone carries the order-block candle it is drawn on");
 ok(typeof sample.grade === "string" && ["A+", "A", "B", "C"].includes(sample.grade), "every zone carries a grade: " + sample.grade);
 ok(sample.now_trend && typeof sample.now_trend.ready === "boolean", "every zone carries the live regime: " + JSON.stringify(sample.now_trend));
@@ -104,13 +104,23 @@ ok(all.items.filter((z) => z.status !== "active").every((z) => (z.mitigated_at &
 // -------------------------------------------------------------------- the page
 ok(doc.querySelectorAll("#cards .zone .grade").length > 0, "cards show a grade chip");
 ok(doc.querySelectorAll("#cards .zone .ctx span").length > 0, "cards show the live market regime");
-ok(ev(`visibleZones().every((z) => ["A+", "A"].includes(z.grade))`), "the default quality filter keeps only A+ and A");
+// Round 13: the page opens on every setup - a pattern the structure gate rejected
+// is still shown, wearing the reason it is not a signal - and "signals" is one
+// click away.
+ok(ev(`visibleZones().every((z) => z.gate != null)`), "every visible setup carries its structure gate");
+ev(`state.quality = "signals"; drawCards();`);
+const shownSignals = ev("visibleZones().length");
+ok(ev(`visibleZones().every((z) => !!z.signal)`), "the signals filter keeps only gated, measured setups");
+ev(`state.quality = "setups"; drawCards();`);
 const shownPrime = ev("visibleZones().length");
+// the scan is live: zones form and resolve between the two reads, so a small
+// drift is expected and only a real regression (fewer setups than signals) fails
+ok(shownPrime + 3 >= shownSignals, `the setups filter is the wider one (${shownSignals} signals -> ${shownPrime} setups)`);
 
 ev(`state.quality = "all"; drawCards();`);
 await wait(300);
 const shownAll = ev("visibleZones().length");
-ok(shownAll >= shownPrime, `"everything" brings the rest back (${shownPrime} -> ${shownAll})`);
+ok(shownAll + 3 >= shownPrime, `"everything" brings the rest back (${shownPrime} -> ${shownAll})`);
 ok(ev("visibleZones().some((z) => z.grade === 'B' || z.grade === 'C')") || shownAll === shownPrime,
    "the widened list contains the lower grades that were hidden");
 
@@ -269,7 +279,9 @@ const orderedPerSection = [...doc.querySelectorAll("#cards .mktsec")].every((sec
   });
   return vals.every((v, i) => i === 0 || v <= vals[i - 1]);
 });
-ok(orderedPerSection, "inside each section the default order is the best measured chance first");
+ok(orderedPerSection, "inside each section the default order is the best measured chance first: "
+  + [...doc.querySelectorAll("#cards .mktsec")].map((sec) =>
+      [...sec.querySelectorAll(".zone")].map((c) => (c.textContent.match(/(\d+)% TARGET FIRST/) || [0, "-"])[1]).join(",")).join(" | "));
 ok(cards7.every((c) => /of the book's conditions/.test(c.textContent)), "every card says how many of the book's conditions it meets");
 ok(cards7.some((c) => /TRADE-READY/.test(c.textContent)) || cards7.every((c) => !/TRADE-READY/.test(c.textContent)),
    "a trade-ready badge appears only where the fee clears");

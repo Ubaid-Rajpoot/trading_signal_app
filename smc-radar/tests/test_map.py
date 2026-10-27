@@ -420,9 +420,13 @@ def test_the_grade_is_the_measured_probability_not_the_condition_count():
     assert m.grade_for(0.30, DEFAULTS) == "-"
 
 
-def test_a_plan_smaller_than_the_fee_is_never_marked_tradable():
+def test_a_plan_smaller_than_the_fee_is_never_marked_tradable(monkeypatch):
     from bot.model import SignalModel
 
+    # this test is about the fee arithmetic, not about what the model thinks of one
+    # fixture candle (round 13 re-fitted the model on the plan the app really trades,
+    # so its probability for any single zone moved): pin the probability.
+    monkeypatch.setattr(SignalModel, "probability", lambda self, zone: 0.95)
     zone = run(real_path(strong_high_path() * 2)).zones[0]
     zone.plan = {"rr": 2.0, "risk_pct": 0.02}      # 0.02% stop vs a 0.08% round trip
     SignalModel().rate(zone, DEFAULTS)
@@ -512,3 +516,122 @@ def test_only_a_high_measured_plan_is_a_signal():
     # and the band the card prints is the measured record of that letter
     band = m.band(0.86)
     assert band and band["letter"] == "A" and band["n"] >= 1 and 0 < band["win"] <= 1
+
+
+# -------------------------------- round 13: the structure gate (trend vs range)
+def _structure_map(highs, lows, price, timeframe="5m"):
+    """A map with the given confirmed swing highs/lows and one ATR of 1.0."""
+    from collections import deque
+
+    from bot.map import HIGH, LOW, Pivot, MarketMap
+
+    map_ = MarketMap("X_USDT", timeframe, dict(DEFAULTS))
+    map_.atr = deque([1.0])
+    map_.major = deque(
+        [Pivot(side=HIGH, price=h, index=i * 10, time=1_700_000_000_000 + i * 600_000)
+         for i, h in enumerate(highs)]
+        + [Pivot(side=LOW, price=low, index=i * 10 + 5, time=1_700_000_300_000 + i * 600_000)
+           for i, low in enumerate(lows)]
+    )
+    map_.bars = deque(
+        {"open_time": i, "close_time": i, "open": price, "high": price + 0.5,
+         "low": price - 0.5, "close": price, "volume": 1.0}
+        for i in range(40)
+    )
+    map_.count = 40
+    return map_
+
+
+def test_structure_reads_a_trend_from_higher_highs_and_higher_lows():
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=118)
+    st = map_.structure()
+    assert st["state"] == "trend_up", st
+    assert st["hh"] and st["hl"] and st["mid"] == 110.0
+    assert st["location"] == "premium"
+
+    down = _structure_map(highs=[120, 110], lows=[105, 100], price=102)
+    assert down.structure()["state"] == "trend_down"
+
+
+def test_equal_highs_are_a_range_not_a_trend():
+    """p.42/p.58: equal highs are liquidity being built, whatever else is true."""
+    map_ = _structure_map(highs=[120.0, 120.05], lows=[100, 105], price=118)
+    st = map_.structure()
+    assert st["state"] == "range"
+    assert "equal highs" in st["why"]
+
+
+def test_a_deep_retracement_is_not_structure():
+    """p.38: price broke up and gave the whole leg back - that is not an HL."""
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=101)
+    st = map_.structure()
+    assert st["state"] == "range" and "deep retracement" in st["why"]
+
+
+def _zone(side="high", level=120.0, kind="strong_high"):
+    from bot.map import HIGH, LOW, Zone
+
+    return Zone(kind=kind, side=HIGH if side == "high" else LOW, symbol="X_USDT",
+                timeframe="5m", top=level + 1, bottom=level - 1, level=level, index=1, time=1)
+
+
+def test_a_setup_inside_a_range_is_not_a_signal():
+    map_ = _structure_map(highs=[120.0, 120.05], lows=[100, 105], price=118)
+    gate = map_.trade_gate(_zone())
+    assert gate["ok"] is False
+    assert any("not a trend" in reason for reason in gate["why"])
+    st = map_.structure()
+    # ... and with the same block in a trending market, on the right side, it passes
+    up = _structure_map(highs=[110, 120], lows=[100, 105], price=119)
+    ok = up.trade_gate(_zone(side="low", level=105.0, kind="strong_low"),
+                       context={"state": "trend_up", "timeframe": "15m"})
+    assert ok["ok"] is True, ok
+    assert ok["htf"] == "trend_up" and ok["location"] == "premium"
+
+
+def test_a_trade_against_the_higher_timeframe_is_not_a_signal():
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=119)
+    gate = map_.trade_gate(_zone(side="low", level=105.0, kind="strong_low"),
+                           context={"state": "trend_down", "timeframe": "15m"})
+    assert gate["ok"] is False
+    assert any("fights the bigger trend" in r for r in gate["why"])
+
+
+def test_a_short_in_discount_is_not_a_signal():
+    """p.42/p.110: a sell belongs in premium - above the middle of the dealing range."""
+    map_ = _structure_map(highs=[110, 120], lows=[100, 105], price=106)
+    gate = map_.trade_gate(_zone(side="high", level=106.0),
+                           context={"state": "trend_down", "timeframe": "15m"})
+    assert gate["ok"] is False
+    assert any("discount" in r for r in gate["why"])
+
+
+def test_the_model_only_calls_it_a_signal_when_the_gate_agrees(monkeypatch):
+    from bot.model import SignalModel
+
+    monkeypatch.setattr(SignalModel, "probability", lambda self, zone: 0.95)
+    model = SignalModel()
+    zone = _zone()
+    zone.plan = {"rr": 2.0, "risk_pct": 0.6, "entry": 120, "stop": 121, "target": 118}
+    zone.gate = {"ok": False, "why": ["5m structure is not a trend (equal highs)"]}
+    model.rate(zone, DEFAULTS)
+    assert zone.tradable is True, "the plan itself is fine and pays for its fee"
+    assert zone.signal is False, "but a range is not a market to trade it in"
+
+    zone.gate = {"ok": True, "why": []}
+    model.rate(zone, DEFAULTS)
+    assert zone.signal is True
+
+
+def test_the_structure_gate_can_be_turned_off_in_the_settings(monkeypatch):
+    """It is a rule, not a hidden profit switch: the trader may switch it off."""
+    from bot.model import SignalModel
+
+    monkeypatch.setattr(SignalModel, "probability", lambda self, zone: 0.95)
+    zone = _zone()
+    zone.plan = {"rr": 2.0, "risk_pct": 0.6, "entry": 120, "stop": 121, "target": 118}
+    zone.gate = {"ok": False, "why": ["5m structure is not a trend"]}
+    SignalModel().rate(zone, {**DEFAULTS, "structure_gate": False})
+    assert zone.signal is True, "with the rule switched off the measured setup is a signal again"
+    SignalModel().rate(zone, DEFAULTS)
+    assert zone.signal is False, "and on by default it is not"

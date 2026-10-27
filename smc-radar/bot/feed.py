@@ -40,6 +40,88 @@ except Exception:  # pragma: no cover
     websockets = None  # type: ignore
 
 
+# ------------------------------------------------------------------- transport
+# Round 13: **the transport never decodes a body.** Adding an instrument failed
+# with
+#
+#     could not read the contract list:
+#     DecodingError: brotli: decoder process called with data when
+#     'can_accept_more_data()' is False
+#
+# That message comes from a decompressor, not from the exchange: a `br` body can
+# be mislabelled (MEXC sometimes serves plain JSON under `content-encoding: br`,
+# or a proxy has already decoded it), and a decoder that has finished its stream
+# raises exactly that when handed more bytes. No amount of asking nicely for
+# gzip fixes a server that answers `br` anyway.
+#
+# So the exchange's bytes are read **raw** (``aiter_raw``), the encoding is
+# decided from the magic bytes / header here, and a body that is already JSON is
+# simply accepted. There is no stateful decoder left that can get stuck half way.
+HTTP_HEADERS = {
+    "accept": "application/json",
+    # gzip is asked for; whatever comes back is handled either way
+    "accept-encoding": "gzip",
+    "user-agent": "smc-radar/1.1 (MEXC scanner; python-httpx)",
+    "connection": "close",
+}
+
+
+def http_client(**kwargs) -> httpx.AsyncClient:
+    """The one place an HTTP client is built (tests wrap this).
+
+    The read timeout is deliberately generous: ``/api/v1/contract/ticker`` is a
+    few megabytes, and a 25 s cap on a slow link is what produced the "timeout"
+    toasts. A connect timeout stays short so a dead host still fails fast.
+    """
+    options = {
+        "timeout": httpx.Timeout(float(kwargs.pop("read_timeout", 45.0)), connect=10.0),
+        "follow_redirects": True,
+        # a machine-level proxy variable must not silently reroute an exchange
+        "trust_env": False,
+    }
+    options.update(kwargs)
+    return httpx.AsyncClient(**options)
+
+
+def decode_body(raw: bytes, encoding: str = "") -> bytes:
+    """Turn whatever the exchange sent into plain bytes - or say why it cannot.
+
+    Order of business: a body that already starts with ``{`` or ``[`` is JSON and
+    is never touched, whatever the header claims (that mislabelled body is the
+    brotli crash in the report). Otherwise gzip is recognised by its magic
+    number, brotli (which has none) and deflate are tried, and the first decoder
+    that produces something is used. A body none of them can open is reported
+    with its first bytes, so the next report names the exchange's behaviour
+    instead of a third-party decoder.
+    """
+    if not raw:
+        return raw
+    if raw.lstrip()[:1] in (b"{", b"["):
+        return raw
+    enc = (encoding or "").lower()
+    if raw[:2] == b"\x1f\x8b":
+        import gzip
+
+        return gzip.decompress(raw)
+    if raw[:1] == b"\x78":
+        import zlib
+
+        return zlib.decompress(raw)
+    try:  # brotli is optional; the app must not depend on it
+        import brotli  # type: ignore
+
+        return brotli.decompress(raw)
+    except ImportError:
+        pass
+    except Exception:
+        # a body we cannot open: fall through to the error below
+        pass
+    raise ValueError(
+        f"cannot decode the body (content-encoding={enc or 'none'}, "
+        f"{len(raw)} bytes, starts {raw[:4].hex()})"
+    )
+
+
 BINANCE_REST = "https://api.binance.com"
 BINANCE_HOSTS = [BINANCE_REST, "https://data-api.binance.vision"]
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
@@ -196,12 +278,61 @@ class BaseFeed:
         """Closed candles, or also the one still forming when ``include_open``."""
         raise NotImplementedError
 
-    async def _get_json(self, url: str, params: dict | None = None) -> object:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(url, params=params)
-        if resp.status_code != 200:
-            raise FeedError(f"{url} -> HTTP {resp.status_code} {resp.text[:120]}")
-        return resp.json()
+    async def _get_json(self, url: str, params: dict | None = None, attempts: int = 2) -> object:
+        """GET a JSON body - and never let a transport hiccup look like a dead button.
+
+        Round 10: adding an instrument failed with
+
+            DecodingError: brotli: decoder process called with data when
+            'can_accept_more_data()' is False
+
+        The scanner had no business asking for brotli in the first place: the
+        body is a few hundred kilobytes of JSON, gzip costs a third of the CPU and
+        has no state machine that can get stuck half-way. The request now asks for
+        ``gzip, deflate`` and never advertises ``br``, a decode/transport failure is
+        retried once (with ``identity`` on the retry), and a body that still cannot
+        be read becomes a ``FeedError`` that names the URL - not an opaque
+        exception bubbling out of a third-party decoder.
+        """
+        problem: Exception | None = None
+        for attempt in range(max(1, attempts)):
+            retryable = True
+            try:
+                headers = dict(HTTP_HEADERS)
+                if attempt:
+                    # the second attempt asks for no compression at all
+                    headers["accept-encoding"] = "identity"
+                async with http_client(headers=headers) as client:
+                    async with client.stream("GET", url, params=params) as resp:
+                        # raw bytes: httpx never decodes, so no decoder can be
+                        # left half-way through a stream (the brotli crash)
+                        raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+                        status = resp.status_code
+                        encoding = resp.headers.get("content-encoding", "")
+                if status != 200:
+                    # a 4xx is the exchange saying "no": repeating it only burns
+                    # the rate limit. 429 and 5xx are worth one more try.
+                    retryable = status == 429 or status >= 500
+                    snippet = raw[:160].decode("utf-8", "replace")
+                    raise FeedError(f"{url} -> HTTP {status} {snippet}")
+                try:
+                    return json.loads(decode_body(raw, encoding).decode("utf-8", "replace").lstrip("\ufeff"))
+                except Exception as exc:  # an unopenable body lands here
+                    problem = FeedError(
+                        f"{url}: the exchange body could not be read "
+                        f"({type(exc).__name__}: {str(exc)[:120]})"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except FeedError as exc:
+                problem = exc
+                if not retryable:
+                    raise
+            except Exception as exc:  # connect / timeout / read
+                problem = FeedError(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
+            if attempt + 1 < max(1, attempts):
+                await asyncio.sleep(0.4 * (attempt + 1))
+        raise problem or FeedError(f"{url}: no answer")
 
     # -------------------------------------------------------------- stream
     async def stream(self, symbols: list[str]) -> AsyncIterator[dict]:  # pragma: no cover

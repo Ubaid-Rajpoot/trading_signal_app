@@ -83,11 +83,32 @@ def create_app(
     engine.model_available = scoring.available
     engine.model_problem = scoring.problem
     engine.max_active_zones = int(config.get("max_active_zones", 200))
+    engine.push_active = int(config.get("push_active_zones", 200))
     engine.max_zones = int(config.get("max_zones", 20000))
     # Round 9: signals go into a database, not just into a push.
     journal_path = config.get("journal_path") or str(WEB_DIR.parent / "data" / "journal.sqlite3")
     store = open_journal(None if config.get("journal") is False else journal_path)
     engine.journal_prob_min = float(config.get("journal_prob_min", 0.60))
+    # A restart throws the in-memory map away, so the plans it was following can
+    # never resolve. Mark them ``interrupted`` (they are kept, never deleted) so
+    # the drawer's "open now" describes this run and not a graveyard.
+    # Round 13: the open plans are put back on the map instead of being written off
+    # as "interrupted" - and they are adopted *before* the reaper runs, because the
+    # reaper is what used to erase them. A restart (or a page refresh, which is what
+    # the user saw) therefore still shows the trades that are live, and keeps
+    # following them.
+    engine.restored_signals = 0
+    try:
+        # read them now, adopt them once the history is in place (see below): an
+        # adopted plan must be followed against *current* candles, not replayed
+        # against the pre-roll and expired on the way in
+        restore_snapshots = store.open_snapshots(
+            hours=float(config.get("restore_hours", 12)),
+            limit=int(config.get("restore_max", 150)),
+        )
+    except Exception:
+        restore_snapshots = []
+    engine.journal_reaped = store.reap(max_age_hours=float(config.get("journal_reap_hours", 6)))
     poller = RestPoller(
         feed,
         engine,
@@ -174,11 +195,24 @@ def create_app(
         if count <= 0 or engine.source == "replay":
             return
         await asyncio.sleep(1.5)
-        try:
-            items = await feed.universe()
-        except Exception as exc:
-            await hub.send_all({"type": "log", "level": "warn",
-                                "message": f"could not read the contract list: {type(exc).__name__}: {exc}"})
+        items: list[dict[str, Any]] = []
+        # Round 13: this used to give up for the whole session on the first
+        # failure (the brotli body), which is why "add symbols" sometimes had no
+        # list at all. A failed list is retried on a backoff, and the message
+        # says what will happen next instead of just printing an exception.
+        delay = 20.0
+        for attempt in range(6):
+            try:
+                items = await feed.universe()
+                break
+            except Exception as exc:
+                await hub.send_all({"type": "log", "level": "warn", "message":
+                    f"the exchange contract list did not load ({type(exc).__name__}: {str(exc)[:120]}) - "
+                    f"the scan keeps running on the symbols it already has and will try again in "
+                    f"{int(delay)}s"})
+                await asyncio.sleep(delay)
+                delay = min(300.0, delay * 2)
+        if not items:
             return
         futures = [i for i in items if (i.get("market") or market_of(i["symbol"])) == "futures"]
         futures.sort(key=lambda i: -(i.get("turnover") or 0))
@@ -199,6 +233,20 @@ def create_app(
             await engine.warmup(feed, concurrency=int(config.get("warm_concurrency", 4)))
         finally:
             app_state["warmed"] = True
+            # Round 13: the plans that were open when the last run stopped are put
+            # back on the map here - after the history is loaded, so they are
+            # followed against the candles that arrive from now on.
+            if restore_snapshots:
+                try:
+                    engine.restored_signals = engine.restore_open(restore_snapshots)
+                    if engine.restored_signals:
+                        await hub.send_all({"type": "log", "message":
+                            f"{engine.restored_signals} plans that were still open in the database "
+                            "are being followed again (a restart no longer loses them)"})
+                except Exception as exc:
+                    await hub.send_all({"type": "log", "level": "warn", "message":
+                                        f"could not re-adopt the open plans: {type(exc).__name__}: {exc}"})
+                await engine._emit_state(force=True)  # noqa: SLF001
 
     async def healer() -> None:
         """Keep retrying the instruments whose history is still short.
@@ -210,14 +258,24 @@ def create_app(
         """
         if engine.source == "replay":
             return
+        spoken: set[str] = set()
         while True:
             await asyncio.sleep(120)
             try:
                 short = engine.thin_symbols()
+                signature = set(short)
                 if short:
                     queue_warm(short[:60])
-                    await hub.send_all({"type": "log", "message":
-                                        f"re-requesting history for {min(len(short), 60)} thin instruments"})
+                    # Round 13: this used to repeat the same toast every two
+                    # minutes for the whole session. It now speaks only when the
+                    # set of instruments actually changes.
+                    if signature != spoken:
+                        spoken = signature
+                        await hub.send_all({"type": "log", "message":
+                                            f"re-requesting history for {min(len(short), 60)} thin instruments - "
+                                            f"they get another warm-up in the background; Diagnose lists each reason"})
+                else:
+                    spoken = set()
             except Exception:
                 pass
 
@@ -266,6 +324,8 @@ def create_app(
             "seq": engine.seq,
             "last_tick_age": round(time.time() - engine.last_tick_at, 1),
             "zones": len(engine.zones),
+            # round 13: how many plans from the previous run were adopted
+            "restored": getattr(engine, "restored_signals", 0),
             "symbols": len(engine.symbols),
             "timeframes": engine.timeframes,
             "uptime": round(time.time() - app_state["started_at"], 1),
@@ -335,7 +395,11 @@ def create_app(
         if status == "all":
             items = list(engine.zones.values())
         elif status == "resolved":
-            items = [z for z in engine.zones.values() if z.get("status") != "active"]
+            items = [z for z in engine.zones.values() if not engine.is_live(z)]
+        elif status in ("active", "live"):
+            # "live" is the plan's life, not the block's: a filled trade stays on
+            # the list until its target or stop is hit (round 13)
+            items = [z for z in engine.zones.values() if engine.is_live(z)]
         else:
             items = [z for z in engine.zones.values() if z.get("status") == status]
         if market in ("spot", "futures"):
@@ -354,6 +418,20 @@ def create_app(
         items.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or z.get("time") or 0))
         limit = max(1, min(4000, int(limit)))
         return {"count": len(items), "items": items[:limit]}
+
+    @app.get("/api/zones/{key:path}")
+    async def zone_one(key: str) -> Any:
+        """One zone in full: the evidence, the order-block candle, the confluence.
+
+        The pushed frame carries only what a card prints (a row is ~0.6 KB instead
+        of ~1.3 KB, which is what made the page fast again). Everything that is a
+        sentence is fetched here, for the one zone someone actually opened.
+        """
+        zone = engine.zones.get(key)
+        if zone is None:
+            return JSONResponse({"error": "no such zone (it may have been pruned)"}, status_code=404)
+        engine.enrich(zone, engine._strong_levels())
+        return {"zone": zone}
 
     @app.get("/api/candles")
     async def candles(symbol: str, timeframe: str = "5m", limit: int = 800, since: int = 0) -> dict[str, Any]:
@@ -461,6 +539,7 @@ def create_app(
         signals_only: int = 1,
         since: int = 0,
         order: str = "formed",
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Every signal ever produced, straight from the database.
 
@@ -471,9 +550,18 @@ def create_app(
         rows = journal().list(
             limit=limit, symbol=symbol, timeframe=timeframe, grade=grade,
             status=status, min_prob=min_prob, signals_only=bool(signals_only),
-            since=since, order=order,
+            since=since, order=order, offset=offset,
         )
-        return {"count": len(rows), "items": rows, "stats": journal().stats()}
+        return {
+            "count": len(rows),
+            "items": rows,
+            "offset": offset,
+            "total": journal().count(
+                symbol=symbol, timeframe=timeframe, grade=grade, status=status,
+                signals_only=bool(signals_only),
+            ),
+            "stats": journal().stats(),
+        }
 
     @app.get("/api/journal/stats")
     async def journal_stats() -> dict[str, Any]:
@@ -509,7 +597,7 @@ def create_app(
             "lookback": int(engine.settings.get("lookback", 240)),
             "warming": {"done": engine.warm_done, "total": max(1, engine.warm_total),
                         "errors": engine.warm_errors, "active": engine.warming},
-            "journal": journal().stats(),
+            "journal": {**journal().stats(), "reaped": getattr(engine, "journal_reaped", 0)},
             "items": rows,
         }
 
@@ -639,7 +727,10 @@ def create_app(
                 {"items": items, "at": now, "error": None, "errors": errors}
             )
         except Exception as exc:
-            universe_cache["error"] = f"{type(exc).__name__}: {exc}"
+            # The last good list is still a good list: keep it, and say how old
+            # it is, instead of showing an empty picker.
+            universe_cache["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            universe_cache["stale"] = bool(universe_cache["items"])
         return universe_cache
 
     @app.get("/api/universe")
@@ -656,6 +747,8 @@ def create_app(
             "futures": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "futures"]),
             "spot": len([i for i in data["items"] if (i.get("market") or market_of(i["symbol"])) == "spot"]),
             "fetched_at": data["at"],
+            "age_seconds": round(max(0.0, time.time() - float(data["at"] or 0)), 1) if data["at"] else None,
+            "stale": bool(data.get("stale")),
             "items": items[:4000],
         }
 

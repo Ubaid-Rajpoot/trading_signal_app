@@ -144,9 +144,18 @@ class SignalModel:
         )
         zone.grade = self.grade_for(prob, cfg)
         # a signal is a *measured* setup the fee also leaves worth taking
+        # Round 13: the measured probability says how likely the plan is to pay; the
+        # structure gate says whether this is a market the plan should be taken in at
+        # all. Both have to agree - "a 96 % pattern in a range" is exactly the trade
+        # that took the user's account, because a range is where the book says the
+        # algorithm is building liquidity, not delivering it (p.58).
+        # the rule can be switched off in the settings (``structure_gate: false``),
+        # because it costs signals - the measurement is in docs/round-13
+        gate_ok = not bool(cfg.get("structure_gate", True)) or bool((zone.gate or {}).get("ok", False))
         zone.signal = bool(
             zone.tradable and prob is not None
             and prob >= float(cfg.get("signal_prob_min", 0.85))
+            and gate_ok
         )
         zone.measured = self.band(prob)
 

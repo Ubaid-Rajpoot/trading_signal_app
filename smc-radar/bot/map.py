@@ -73,6 +73,21 @@ DEFAULTS: dict[str, Any] = {
     "trend_lookback": 40,       # bars behind the efficiency ratio
     "trend_er_min": 0.25,       # Kaufman efficiency ratio: at/above this the market trends
     "trend_adx_min": 18.0,      # and the ADX has to agree
+    # --- round 13: the book's own structure test, and the range gate -------------
+    # "RANGES account for 80% of a price's swings" (p.58). A setup inside a range is
+    # the trap the book spends its first thirty pages on, so a zone is only allowed
+    # to become a *signal* when the structure is a trend - on its own timeframe AND
+    # on the one above it - and when a sell sits in premium / a buy in discount
+    # (p.42, p.110). Tolerances are in ATR so they scale with the instrument.
+    "structure_equal_atr": 0.15,   # two highs/lows this close are "equal" = liquidity, not structure
+    "structure_deep_retrace": 0.79,  # a pullback deeper than this of the last leg = no structure
+    "structure_min_bars": 30,      # not enough bars for two swing highs and two lows yet
+    "gate_premium_atr": 0.25,      # distance from the dealing range's middle, in ATR
+    # The gate is a *rule* (the book's, and the user's), not a profit switch: on the
+    # held-out 90 days it lifts the A band from 95.4 % to 97.4 % hit but cuts the
+    # signal count by 91 % and the expectancy from +0.16 R to +0.14 R. It is on by
+    # default; `false` shows every measured setup as a signal again.
+    "structure_gate": True,
     "confluence_tol_atr": 0.5,  # "the same level" means within this fraction of ATR
     "confluence_age": 400,      # bars a strong level stays relevant for confluence
     # --- the execution plan that goes with every zone ------------------------
@@ -263,6 +278,9 @@ class Zone:
     disp_atr: float | None = None
     block_atr: float | None = None
     swept_major: bool = False
+    # --- round 13: is the market trending, and is this the right side of it -----
+    gate: dict[str, Any] | None = None     # {"ok", "why", "structure", "htf", "location"}
+    restored: bool = False                  # adopted from the journal after a restart
     # entry / stop / target, from the book's own exit rule (next liquidity)
     plan: dict[str, Any] | None = None
     # and what happened to it: waiting -> filled -> target | stopped
@@ -331,6 +349,8 @@ class Zone:
             "tradable": self.tradable,
             "signal": self.signal,
             "measured": self.measured,
+            "gate": self.gate,
+            "restored": self.restored,
             "entry_trend": self.entry_trend,
             "entry_state": (self.entry_trend or {}).get("state"),
             "entry_aligned": (self.entry_trend or {}).get("aligned"),
@@ -682,6 +702,10 @@ class MarketMap:
         # after its pivot has fallen out of the 240-bar window, and the block must
         # still be drawn on the candle that really made the high - so keep it.
         self.pivot_ctx: dict[int, list[dict]] = {}
+        # Round 13: the structure of the timeframe ABOVE this one, pushed in by the
+        # engine on every bar. A setup is only a signal when the bigger picture is a
+        # trend in the same direction - the book's "top down analysis" (p.104).
+        self.context: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ util
     @property
@@ -735,6 +759,185 @@ class MarketMap:
             "adx": round(adx, 2) if adx is not None else None,
             "dir": direction,
             "lookback": n,
+        }
+
+    # ------------------------------------------------------------- structure
+    def structure(self) -> dict[str, Any]:
+        """Trend or range, read the way the book reads it - from swing structure.
+
+        The book's definitions, in order (all from confirmed pivots only, so
+        nothing here can see the future):
+
+        * **strong high / strong low** - a high or low that grabbed liquidity and
+          then broke structure (p.42, p.45). ``self.major`` holds the ones that
+          broke something; ``external_trend`` is the side of the last major break.
+        * **a trend is HH + HL** (up) or **LH + LL** (down) - p.52: "external
+          liquidity is the leg's highest point"; a trend that keeps failing to
+          make a new high or a new higher low is not a trend.
+        * **a range is equal highs or equal lows** - p.58: "RANGES account for 80%
+          of a price's swings", and equal highs/lows are *liquidity being built*,
+          not structure (p.42: "for every strong low there is a weak high").
+        * **a deep retracement is not structure** - p.38: if price breaks structure
+          and fails to deliver to a new premium/discount, that swing was just
+          liquidity, so it does not count as an HL or LH.
+
+        Returns a dict the page prints verbatim, so a card can say *why* a market
+        was called a range instead of asserting it.
+        """
+        atr = self.atr_now() or 0.0
+        highs = [p for p in self.major if p.side == HIGH]
+        lows = [p for p in self.major if p.side == LOW]
+        out: dict[str, Any] = {
+            "state": "unknown",
+            "why": "not enough confirmed swing highs and lows yet",
+            "highs": [round(p.price, 8) for p in highs[-3:]],
+            "lows": [round(p.price, 8) for p in lows[-3:]],
+            "bos": self.external_trend,
+            "bars": self.count,
+        }
+        if len(self.bars) < int(self.cfg.get("structure_min_bars", 30)) or not atr:
+            return out
+        if len(highs) < 2 or len(lows) < 2:
+            out["why"] = "needs two confirmed swing highs and two swing lows"
+            return out
+
+        eq = float(self.cfg.get("structure_equal_atr", 0.15)) * atr
+        (h2, h1) = highs[-2].price, highs[-1].price            # older, newer
+        (l2, l1) = lows[-2].price, lows[-1].price
+        hh = h1 > h2 + eq
+        lh = h1 < h2 - eq
+        hl = l1 > l2 + eq
+        ll = l1 < l2 - eq
+        out.update(
+            {
+                "hh": hh, "hl": hl, "lh": lh, "ll": ll,
+                "last_high": round(h1, 8), "prev_high": round(h2, 8),
+                "last_low": round(l1, 8), "prev_low": round(l2, 8),
+                # the dealing range a discount/premium decision is made in
+                "range_high": round(max(p.price for p in highs[-3:]), 8),
+                "range_low": round(min(p.price for p in lows[-3:]), 8),
+                "atr": round(atr, 8),
+            }
+        )
+        mid = (out["range_high"] + out["range_low"]) / 2.0
+        out["mid"] = round(mid, 8)
+        price = self.last_price
+        out["price"] = round(price, 8) if price is not None else None
+        out["location"] = (
+            "premium" if price is not None and price > mid
+            else "discount" if price is not None and price < mid
+            else "middle"
+        )
+
+        if hh and hl:
+            state = "trend_up"
+        elif lh and ll:
+            state = "trend_down"
+        elif not (hh or lh) or not (hl or ll):
+            # equal highs or equal lows: the book's "price builds liquidity"
+            state = "range"
+            out["why"] = ("equal highs" if not (hh or lh) else "equal lows") +                          " - liquidity being built, not structure (p.42, p.58)"
+        else:
+            state = "range"
+            out["why"] = "mixed structure: no clean HH+HL or LH+LL"
+
+        # p.38: a pullback that takes back almost the whole leg is not structure
+        if state == "trend_up":
+            leg = out["last_high"] - out["prev_low"] if "prev_low" in out else 0.0
+            if leg > 0 and price is not None and price < out["last_high"] - 0.0001:
+                giveback = (out["last_high"] - price) / leg
+                if giveback > float(self.cfg.get("structure_deep_retrace", 0.79)):
+                    state = "range"
+                    pct = min(giveback, 1.0) * 100
+                    out["why"] = (f"price gave back {pct:.0f}% of the last up-leg - "
+                                  "a deep retracement, not structure (p.38)")
+        elif state == "trend_down":
+            leg = out["prev_high"] - out["last_low"]
+            if leg > 0 and price is not None and price > out["last_low"] + 0.0001:
+                giveback = (price - out["last_low"]) / leg
+                if giveback > float(self.cfg.get("structure_deep_retrace", 0.79)):
+                    state = "range"
+                    pct = min(giveback, 1.0) * 100
+                    out["why"] = (f"price retraced {pct:.0f}% of the last down-leg - "
+                                  "a deep retracement, not structure (p.38)")
+
+        # the last major break has to agree with the swings, or it is a failed one
+        if state in ("trend_up", "trend_down") and self.external_trend is not None:
+            agree = (state == "trend_up" and self.external_trend > 0) or                     (state == "trend_down" and self.external_trend < 0)
+            if not agree:
+                out["why"] = "the last major break points the other way"
+                state = "range"
+
+        out["state"] = state
+        if state != "range":
+            # the earlier "why" described a reading that did not become the answer
+            out["why"] = ("higher highs and higher lows (p.52)" if state == "trend_up"
+                          else "lower highs and lower lows (p.52)")
+        return out
+
+    def trade_gate(self, zone: Zone, structure: dict[str, Any] | None = None,
+                   context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """May this block be a *signal* - or is the market the wrong kind of market?
+
+        This is the filter the user asked for in plain words: "even when the market
+        is ranging you still give signals". It has three parts, each traceable to
+        the book, and it returns the reasons in the negative so the page can print
+        *why* a pattern was not promoted:
+
+        1. **this timeframe must not be a range** - p.58;
+        2. **the timeframe above it must not be a range either**, and the trade must
+           be with it: long only in an up-structure, short only in a down-structure
+           (p.39, p.52 - "go to the HTF and use the cycle to see where you are from
+           the HTF structure");
+        3. **premium / discount** - p.42 and p.110: a sell belongs above the middle
+           of the dealing range (premium), a buy below it (discount).
+
+        A weak level is never a signal, whatever the market is doing.
+        """
+        st = structure or self.structure()
+        htf = context or {}
+        why: list[str] = []
+        want = "trend_down" if zone.side == HIGH else "trend_up"
+        side_name = "short" if zone.side == HIGH else "long"
+
+        if zone.kind in ("weak_high", "weak_low"):
+            why.append("a weak level is context (build-up), not a setup")
+        if st.get("state") in ("range", "unknown"):
+            detail = st.get("why") or st.get("state")
+            why.append(f"{self.timeframe} structure is not a trend ({detail})")
+        elif st.get("state") != want:
+            why.append(f"{self.timeframe} structure is {st['state']} - a {side_name} needs {want}")
+
+        loc = st.get("location")
+        mid = st.get("mid")
+        atr = st.get("atr") or 0.0
+        edge = float(self.cfg.get("gate_premium_atr", 0.25)) * atr
+        if zone.side == HIGH:
+            if mid is not None and zone.level < mid + edge:
+                why.append("the block sits in discount - a sell belongs in premium (p.42)")
+        else:
+            if mid is not None and zone.level > mid - edge:
+                why.append("the block sits in premium - a buy belongs in discount (p.42)")
+
+        htf_state = htf.get("state")
+        htf_tf = htf.get("timeframe") or ""
+        if htf:
+            if htf_state in ("range", "unknown") or not htf_state:
+                why.append(f"{htf_tf or 'the timeframe above'} structure is not a trend "
+                           f"({htf.get('why') or htf_state or 'unknown'})")
+            elif htf_state != want:
+                why.append(f"{htf_tf} is {htf_state} - a {side_name} fights the bigger trend")
+
+        return {
+            "ok": not why,
+            "why": why,
+            "structure": st.get("state"),
+            "structure_why": st.get("why"),
+            "htf": htf_state,
+            "htf_timeframe": htf_tf or None,
+            "location": loc,
+            "side": side_name,
+            "mid": mid,
         }
 
     def confluence_at(self, side: str, level: float) -> list[str]:
@@ -983,6 +1186,48 @@ class MarketMap:
         }
         return zone
 
+    def adopt(self, data: dict[str, Any]) -> Zone | None:
+        """Put a stored plan back on the map, so a restart does not lose the trade.
+
+        Only the fields the plan needs are taken from the snapshot - the block, the
+        side, the entry/stop/target and how far the plan had got. Its ``index``
+        starts at "now" so the age limit cannot expire a zone the moment the server
+        comes back; the key (which includes the formation time) is kept, so if the
+        map later re-forms the same block it is recognised instead of duplicated.
+        """
+        key = data.get("key")
+        if not key or key in self.seen:
+            return None
+        try:
+            zone = Zone(
+                kind=str(data["kind"]), side=str(data["side"]), symbol=self.symbol,
+                timeframe=self.timeframe, top=float(data["top"]), bottom=float(data["bottom"]),
+                level=float(data["level"]), index=self.count, time=int(data["time"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        zone.status = "active"
+        zone.created_index = self.count
+        zone.plan = data.get("plan")
+        zone.plan_state = str(data.get("plan_state") or "waiting")
+        zone.plan_filled_at = data.get("plan_filled_at")
+        zone.plan_filled_price = data.get("plan_filled_price")
+        zone.grade = str(data.get("grade") or zone.grade)
+        zone.prob = data.get("prob")
+        zone.net_r = data.get("net_r")
+        zone.fee_r = data.get("fee_r")
+        zone.tradable = bool(data.get("tradable"))
+        zone.signal = bool(data.get("signal"))
+        zone.measured = data.get("measured")
+        zone.gate = data.get("gate")
+        zone.conds = dict(data.get("conds") or {})
+        zone.cond_met = int(data.get("cond_met") or 0)
+        zone.cond_total = int(data.get("cond_total") or len(CONDITION_NAMES))
+        zone.restored = True
+        self.seen.add(key)
+        self.zones.append(zone)
+        return zone
+
     def _add_zone(self, zone: Zone) -> Zone | None:
         if zone.key in self.seen:
             return None
@@ -1002,6 +1247,10 @@ class MarketMap:
                 )
         zone.confluence = self.confluence_at(zone.side, zone.level)
         self.score_zone(zone)
+        # round 13: is the market trending, on this timeframe and the one above, and
+        # is the block on the right side of the dealing range? Computed here, at
+        # formation, from closed candles only - the same inputs a trader has.
+        zone.gate = self.trade_gate(zone)
         if zone.kind not in ("weak_high", "weak_low"):
             zone.plan = self.plan_for(zone)
             from .model import model as _model
@@ -1485,6 +1734,11 @@ class MarketMap:
 
     def _fill_plan(self, zone: Zone, index: int, at: float) -> None:
         """Price came back into the block: the plan's limit order is filled."""
+        if not zone.plan:
+            # a weak high/low is context, not a setup: price revisiting it fills
+            # nothing. (This used to mark it "filled", which - once liveness is
+            # the plan - would have kept a planless zone on the live list for ever.)
+            return
         if zone.plan_state != "waiting":
             return
         zone.plan_state = "filled"

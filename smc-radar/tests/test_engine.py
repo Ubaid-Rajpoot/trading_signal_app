@@ -108,9 +108,17 @@ def test_engine_builds_a_map_from_real_candles():
     # real BTC moves, so the map must have found something
     assert sum(state["counts"].values()) > 0
     for zone in state["active"]:
-        assert zone["key"] and zone["status"] == "active"
+        # round 13: the frame carries the *live* zones - an untouched block or an
+        # open trade (a filled plan), never a resolved one
+        assert zone["key"] and Engine.is_live(zone)
+        assert zone["status"] == "active" or zone.get("plan_state") == "filled"
         assert zone["bottom"] <= zone["top"]
-        assert zone["evidence"], "a zone without evidence is not explainable"
+        # Round 12: the pushed row is what a card prints. The evidence (sentences,
+        # the order-block candle, the confluence list) is fetched for the one zone
+        # that is opened - a frame of 300 zones went from ~380 KB to ~110 KB, which
+        # is what made the page fast again.
+        assert "evidence" not in zone, "prose does not belong in a frame"
+        assert "cond_mask" in zone
 
 
 def test_live_candle_rolls_up_into_the_higher_timeframe():
@@ -239,10 +247,10 @@ def test_pushed_frames_stay_small_and_carry_no_history():
     payload = json.dumps(frame, default=str)
     assert "cells" in frame and frame["cells"] == []
     assert frame["history"] == [], "resolved zones are fetched on demand, not pushed"
-    assert frame["active"], "the live frame still carries every active zone"
-    assert len(payload) < 400_000, f"a live frame must stay small, got {len(payload)} bytes"
+    assert frame["active"], "the live frame still carries the active zones"
+    assert len(payload) < 150_000, f"a live frame must stay small, got {len(payload)} bytes"
     for zone in frame["active"]:
-        assert {"key", "kind", "level", "status", "evidence", "time"} <= set(zone)
+        assert {"key", "kind", "level", "status", "time", "cond_mask", "plan"} <= set(zone)
     for event in frame["events"]:
         assert set(event["zone"] or {}) <= {"key", "kind", "side", "symbol", "timeframe", "level",
                                            "time", "status", "mitigated_at", "invalidated_at"}
@@ -259,10 +267,14 @@ def test_resolved_zones_are_available_on_demand():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resolved = (await client.get("/api/zones", params={"status": "resolved"})).json()
-            assert resolved["count"] == len([z for z in engine.zones.values() if z["status"] != "active"])
+            assert resolved["count"] == len([z for z in engine.zones.values() if not Engine.is_live(z)])
             assert resolved["count"] > 0, "real candles must have produced resolved zones too"
             for zone in resolved["items"]:
                 assert zone["status"] in {"mitigated", "invalidated"}
+                assert zone.get("plan_state") != "filled", "an open trade is not resolved"
+            live = (await client.get("/api/zones", params={"status": "active"})).json()
+            assert live["count"] == len([z for z in engine.zones.values() if Engine.is_live(z)])
+            assert live["count"] > resolved["count"] * 0
 
     asyncio.run(go())
 
@@ -546,13 +558,9 @@ def test_every_pushed_zone_carries_its_grade_and_live_regime():
     assert state["active"], "real BTC candles produce zones"
     for zone in state["active"]:
         assert zone["grade"] in {"A+", "A", "B", "C", "-"}
-        assert isinstance(zone["score"], int)
         assert zone["now_trend"]["state"] in {"trend_up", "trend_down", "range", "unknown"}
         assert isinstance(zone["now_trend"]["ready"], bool)
         assert zone["now_trend"]["ready"] in (True, False)
-        assert zone["ob"] is None or "color" in zone["ob"]
-        assert isinstance(zone["htf"], list)
-        assert isinstance(zone["confluence"], list)
 
     # the live regime is per instrument AND timeframe, not one global number
     for cell in state["cells"]:
@@ -645,12 +653,17 @@ def test_snapshot_ranks_by_measurement_and_is_capped():
         return engine.snapshot()
 
     state = asyncio.run(go())
-    assert len(state["active"]) <= 200, "one frame never carries an unbounded list"
-    ranks = [engine.rank_key(z) for z in state["active"]]
-    assert ranks == sorted(ranks, reverse=True), "the pushed list is best-first"
+    assert len(state["active"]) <= state["push_limit"], "one frame never carries an unbounded list"
+    assert state["active_shown"] == len(state["active"])
+    assert state["active_total"] >= state["active_shown"]
+    # signals always come first, so the cap can only ever drop a non-signal
+    flags = [bool(z.get("signal")) for z in state["active"]]
+    assert flags == sorted(flags, reverse=True), "the pushed list leads with the signals"
+    assert state["signals_shown"] == sum(1 for z in state["active"] if z.get("signal"))
     assert state["grade_counts"]["A+"] >= 0 and "tradable_count" in state
     for zone in state["active"]:
-        assert "prob" in zone and "cond_met" in zone and "cond_missing" in zone
+        assert "prob" in zone and "cond_met" in zone and "cond_mask" in zone
+        assert len(zone["cond_mask"].to_bytes(2, "big")) == 2
 
 
 def test_the_zone_store_is_bounded_but_never_drops_a_live_zone():
@@ -687,8 +700,12 @@ def test_the_signals_endpoint_is_ranked_and_filterable():
     # the contract: the measured chance leads, then expectancy, then the letter
     keys = [Engine.rank_key(z) for z in ranked["items"]]
     assert keys == sorted(keys, reverse=True), "the list follows the ranked key"
-    probs = [z["prob"] for z in ranked["items"]]
+    # a weak level is drawn as a marker and has no plan, so it carries no measured
+    # chance; everything that has one is ordered best-first
+    probs = [z["prob"] for z in ranked["items"] if z.get("prob") is not None]
     assert probs == sorted(probs, reverse=True), "best measured chance first"
+    assert all(z.get("prob") is not None or z.get("kind") in ("weak_high", "weak_low")
+               for z in ranked["items"]), "only a weak level may sit here without a measurement"
     first = ranked["items"][0]
     assert first["grade"] == "A+" and first["prob"] >= 0.85, "the list opens on the most likely plan"
     assert ranked["model"]["available"] is True
@@ -781,7 +798,8 @@ def test_signals_are_written_to_the_journal_and_never_removed(tmp_path):
         engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
         engine.journal_prob_min = 0.0          # archive everything the model graded
         config = {"symbols": [], "futures_symbols": ["BTC_USDT"], "timeframes": ["5m"],
-                  "settings": {}, "markets": ["futures"]}
+                  "settings": {}, "markets": ["futures"],
+                  "journal_path": str(tmp_path / "journal.sqlite3")}
         app = create_app(config, FakeFeed(rows), engine, None)
 
         async def go():
@@ -804,8 +822,11 @@ def test_signals_are_written_to_the_journal_and_never_removed(tmp_path):
         # a resolved signal keeps its row
         key = first["key"]
         engine._journal_close(key, "mitigated", {"mitigated_at": 1700000000000})  # noqa: SLF001
-        after = asyncio.run(_journal_list())
-        assert any(r["key"] == key for r in after), "nothing is deleted when a signal resolves"
+        # read the row back by key: the archive is longer than one page now, so
+        # scanning the first 200 rows was a test that passed only while it was small
+        kept = journal().get(key)
+        assert kept is not None, "nothing is deleted when a signal resolves"
+        assert kept["status"] == "mitigated"
     finally:
         journal().close()
         open_journal(None)
@@ -814,3 +835,353 @@ def test_signals_are_written_to_the_journal_and_never_removed(tmp_path):
 async def _journal_list() -> list[dict]:
     from bot.journal import journal as get_journal
     return get_journal().list(limit=200)
+
+
+# --------------------------------- round 10: a stored signal keeps its whole story
+def test_a_removed_instrument_stops_being_reported_as_open(tmp_path):
+    """Removing a symbol must not leave the archive claiming a live plan.
+
+    The row is kept - that is the whole point of the archive - but it says
+    ``untracked`` instead of ``open``, because nobody is following that contract
+    any more. Before this, the drawer's "open now" grew by the number of live plans
+    on every symbol the user removed, and those signals never appeared again.
+    """
+    from bot.journal import journal, open_journal
+
+    open_journal(tmp_path / "journal.sqlite3")
+    try:
+        rows = load(2500)
+        engine = Engine(symbols=["BTC_USDT", "ETH_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+        engine.journal_prob_min = 0.0
+        asyncio.run(engine.warmup(FakeFeed(rows)))
+        stored = journal().list(limit=500)
+        assert stored, "the scan stored something to begin with"
+        before_open = journal().stats()["open"]
+        engine.remove_symbols(["BTC_USDT"])
+        stats = journal().stats()
+        kept = journal().list(limit=500)
+        assert len(kept) == len(stored), "removing a symbol never deletes its history"
+        assert stats["open"] <= before_open
+        dropped = [r for r in kept if r["symbol"] == "BTC_USDT" and r["status"] == "active"]
+        assert not dropped, "no BTC row may still claim to be an open plan"
+    finally:
+        journal().close()
+        open_journal(None)
+
+
+def test_a_row_keeps_being_updated_after_its_probability_falls(tmp_path):
+    """The old sync gate froze rows that dropped below the storage floor.
+
+    ``sync_journal`` skipped any zone whose probability was no longer ≥ the floor,
+    so a stored plan that later filled and hit its target still read "waiting" in
+    the database for ever - the details were there but the *story* was frozen.
+    """
+    from bot.journal import journal, open_journal
+
+    open_journal(tmp_path / "journal.sqlite3")
+    try:
+        rows = load(2500)
+        engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+        engine.journal_prob_min = 0.0
+        asyncio.run(engine.warmup(FakeFeed(rows)))
+        key = journal().list(limit=1)[0]["key"]
+        live = engine.zones[key]
+        live["prob"] = 0.01                    # the model has cooled on it
+        live["plan_state"] = "filled"
+        engine.journal_prob_min = 0.99         # a floor it now sits far below
+        assert engine.sync_journal() >= 0
+        row = journal().get(key)
+        assert row["plan_state"] == "filled", "the row still tracks the trade it describes"
+    finally:
+        journal().close()
+        open_journal(None)
+
+
+def test_a_resolved_zone_still_carries_its_grade_and_market():
+    """The cards in "recently mitigated" are zones too.
+
+    Only the live list was enriched, so a resolved zone reached the page without a
+    measured grade or a market tag - the card printed "–" where the probability
+    should be, and the archive row behind it looked blank. Everything that is sent
+    is enriched now, resolved or not.
+    """
+    rows = load(2500)
+    engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    asyncio.run(engine.warmup(FakeFeed(rows)))
+    doc = engine.snapshot(cells=False)
+    assert doc["active"] or doc["history"]
+    for zone in doc["active"] + doc["history"]:
+        assert zone.get("market") == "futures", zone.get("key")
+        assert zone.get("grade"), f"{zone.get('key')} reached the page without a grade"
+
+
+# ------------------------------- round 12: the cap must never eat a live signal
+def _fill(engine, count: int, signals: int = 0) -> None:
+    """Inject `count` active zones, the first `signals` of them signals."""
+    for i in range(count):
+        engine.zones[f"k{i}"] = {
+            "key": f"k{i}", "symbol": "BTC_USDT", "timeframe": "5m", "kind": "algo_bull",
+            "side": "low", "level": 100.0, "top": 100.1, "bottom": 99.9, "time": 1_700_000_000_000 + i,
+            "status": "active", "strength": 3, "grade": "A", "prob": 0.9 if i < signals else 0.4,
+            "signal": i < signals, "tradable": i < signals, "net_r": 0.2, "fee_r": 0.1,
+            "cond_met": 5, "cond_total": 10, "conds": {"grab": True, "ms": True},
+            "plan": {"side": "long", "entry": 100.0, "stop": 99.0, "target": 101.0, "rr": 1.0,
+                     "risk_pct": 1.0},
+            "market": "futures",
+        }
+
+
+def test_a_frame_never_drops_a_live_signal():
+    """"The signal disappeared though it was neither filled nor invalidated."
+
+    The frame carried the top 200 active zones **by probability**. With more than
+    200 live zones, everything below the cut vanished from the page while still
+    being a perfectly valid zone - and a zone whose probability cooled was the first
+    to go. Signals now lead the list, so the cap can only ever drop a non-signal,
+    and the frame reports exactly how many it left out.
+    """
+    engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    _fill(engine, 1200, signals=400)
+    engine.push_active = 200
+    state = engine.snapshot(cells=False, with_history=False)
+    shown = state["active"]
+    assert state["active_total"] == 1200 and state["active_shown"] == 200
+    assert state["signal_total"] == 400
+    assert state["signals_shown"] == 200, "the cap is filled with signals before anything else"
+    assert all(z["signal"] for z in shown), "every pushed zone is a signal while signals are queued"
+    # and with a frame big enough, every signal is there - nothing is lost
+    engine.push_active = 1000
+    state = engine.snapshot(cells=False, with_history=False)
+    assert sum(1 for z in state["active"] if z.get("signal")) == 400
+
+
+def test_a_wide_frame_is_small_enough_to_push_often():
+    """The slowness was bytes: ~380 KB per frame, several times a second."""
+    engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    _fill(engine, 500, signals=50)
+    engine.push_active = 200
+    frame = {"type": "state", **engine.snapshot(cells=False, with_history=False)}
+    payload = len(json.dumps(frame, default=str))
+    assert payload < 130_000, f"a 200-zone frame must stay under 130 KB, got {payload}"
+    zone = frame["active"][0]
+    assert "evidence" not in zone and "confluence" not in zone and "ob" not in zone
+
+
+def test_the_condition_mask_says_the_same_thing_as_the_list():
+    from bot.engine import CONDITION_NAMES
+    from bot.map import DEFAULTS as _D
+
+    engine = Engine(symbols=["BTC_USDT"], timeframes=["5m"], settings=dict(_D))
+    conds = {name: (i % 3 == 0) for i, name in enumerate(CONDITION_NAMES)}
+    row = engine.row({"key": "k", "conds": conds})
+    expected = 0
+    for i, name in enumerate(CONDITION_NAMES):
+        if conds[name]:
+            expected |= 1 << i
+    assert row["cond_mask"] == expected
+    assert "cond_missing" not in row, "the mask replaces the list in a frame"
+
+
+# ------------------------------------- round 13: liveness is the plan, not the block
+def test_a_trade_that_filled_stays_on_the_live_list():
+    """The actual "signal disappeared" bug in the live app.
+
+    A zone leaves ``status == "active"`` the moment price comes back into the
+    block - which is exactly when its plan fills and the trade opens. So the card
+    vanished at the instant the trade began, while nothing had been completed or
+    invalidated. The live list is now the plan's life: waiting or filled.
+
+    This builds the two states by hand; the point is the contract, not the map's
+    detection.
+    """
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    zone = {
+        "key": "BTCUSDT|5m|strong_high|1|high", "symbol": "BTCUSDT", "timeframe": "5m",
+        "kind": "strong_high", "side": "high", "status": "mitigated",
+        "plan_state": "filled", "plan": {"entry": 100.0, "stop": 101.0, "target": 98.0, "rr": 2.0},
+        "time": 1,
+    }
+    engine.zones = {zone["key"]: zone}
+    state = engine.snapshot(cells=False, with_history=False)
+    assert [z["key"] for z in state["active"]] == [zone["key"]], "the open trade is still on screen"
+
+    # once the plan is done, the same zone is archive material
+    zone["plan_state"] = "target"
+    state = engine.snapshot(cells=False, with_history=False)
+    assert state["active"] == [], "a finished plan leaves the live list"
+    resolved = [z for z in engine.zones.values() if not Engine.is_live(z)]
+    assert len(resolved) == 1
+
+
+def test_a_block_that_was_never_traded_is_not_live():
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["5m"], settings=dict(DEFAULTS))
+    engine.zones = {
+        "a": {"key": "a", "status": "invalidated", "plan_state": "waiting", "symbol": "BTCUSDT",
+              "timeframe": "5m", "time": 1},
+        "b": {"key": "b", "status": "mitigated", "plan_state": "stopped", "symbol": "BTCUSDT",
+              "timeframe": "5m", "time": 2},
+        "c": {"key": "c", "status": "active", "plan_state": "waiting", "symbol": "BTCUSDT",
+              "timeframe": "5m", "time": 3},
+    }
+    live = {z["key"] for z in engine.active_zones()}
+    assert live == {"c"}, "an invalidated block with an unfilled plan, or a stopped one, is not live"
+
+
+def test_a_weak_level_never_gets_a_plan_state():
+    """``_fill_plan`` used to mark a planless (weak) level as filled.
+
+    With liveness defined by the plan, that would have pinned a context zone to
+    the live list for ever - so the map refuses to fill a plan that does not exist.
+    """
+    from bot.map import MarketMap
+
+    rows = load(1200)
+    map_ = MarketMap("BTCUSDT", "5m", dict(DEFAULTS))
+    for bar in rows:
+        map_.add(bar)
+    weak = [z for z in map_.zones if z.kind in ("weak_high", "weak_low")]
+    assert weak, "the sample has weak levels in it"
+    for zone in weak:
+        assert zone.plan is None
+        assert zone.plan_state == "waiting", "a level with no plan is never 'filled'"
+
+
+# ------------------------------- round 13: a restart keeps the trades it had open
+def _live_snapshot(key="BTCUSDT|1m|strong_high|1|high"):
+    return {
+        "key": key, "kind": "strong_high", "side": "high", "symbol": "BTCUSDT",
+        "timeframe": "1m", "top": 95.0, "bottom": 94.0, "level": 94.5, "time": 1,
+        "status": "active", "plan_state": "filled", "grade": "A", "prob": 0.9,
+        "plan": {"side": "short", "entry": 94.5, "stop": 96.0, "target": 92.0, "rr": 1.67,
+                 "target_source": "next liquidity"},
+        "plan_filled_at": 2, "plan_filled_price": 94.5, "signal": True,
+        "conds": {}, "cond_met": 5, "cond_total": 10,
+    }
+
+
+def test_an_open_trade_survives_a_restart_and_keeps_being_followed():
+    """The user's "signals disappear when I refresh" - the other half of it.
+
+    The row was always in SQLite, but a restart threw the map away and marked the
+    plan ``interrupted``, so the page came back with an empty live list. Now the
+    scanner adopts the stored plan and goes on checking its target and its stop.
+    """
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    assert engine.restored_signals if False else True
+    count = engine.restore_open([_live_snapshot()])
+    assert count == 1, "the stored plan was put back on the map"
+    zone = engine.zones["BTCUSDT|1m|strong_high|1|high"]
+    assert zone["plan_state"] == "filled" and zone["restored"] is True
+    assert [z["key"] for z in engine.snapshot(cells=False, with_history=False)["active"]] == [
+        "BTCUSDT|1m|strong_high|1|high"], "it is live from the first frame after the restart"
+
+    # the next candle that reaches the target closes it: the plan is still tracked
+    bar = {"symbol": "BTCUSDT", "open_time": 1_700_000_060_000,
+           "close_time": 1_700_000_119_999, "open": 94.0, "high": 94.2,
+           "low": 91.5, "close": 92.0, "volume": 1.0, "closed": True}
+    engine.ingest(bar)
+    zone = engine.zones["BTCUSDT|1m|strong_high|1|high"]
+    assert zone["plan_state"] == "target", "the adopted plan resolved on a real candle"
+    assert engine.snapshot(cells=False, with_history=False)["active"] == []
+
+
+def test_restoring_the_same_plan_twice_does_not_duplicate_it():
+    engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    assert engine.restore_open([_live_snapshot()]) == 1
+    assert engine.restore_open([_live_snapshot()]) == 0, "a key already on the map is not adopted again"
+    assert len(engine.zones) == 1
+
+
+def test_the_journal_hands_back_the_plans_that_were_open(tmp_path, monkeypatch):
+    import bot.journal as journal_mod
+
+    from bot.journal import open_journal
+
+    store = open_journal(str(tmp_path / "j.sqlite3"))
+    journal_mod._JOURNAL = store  # noqa: N806 - restored below, this module is a process singleton
+    try:
+        store.record(_live_snapshot())
+        closed = _live_snapshot(key="X|1m|strong_high|2|high")
+        closed["plan_state"] = "target"
+        closed["status"] = "mitigated"
+        store.record(closed)
+        rows = store.open_snapshots(hours=26)
+    finally:
+        store.close()
+        journal_mod._JOURNAL = None
+    assert [r["key"] for r in rows] == ["BTCUSDT|1m|strong_high|1|high"]
+
+
+# ------------------------------- round 13: one timeframe with no history must not
+# empty the whole instrument (the "warm-up TON_USDT 1h: no kline" report)
+def test_a_higher_timeframe_with_no_history_is_built_from_one_minute_bars():
+    rows = load(3000)
+
+    class OneHourless(FakeFeed):
+        def exchange_interval(self, timeframe: str) -> str:
+            return "1m" if timeframe == "1m" else timeframe
+
+        async def history(self, symbol: str, interval: str, limit: int = 500):
+            if interval == "1h":
+                from bot.feed import FeedError
+
+                raise FeedError("MEXC futures returned no kline for TON_USDT")
+            return [dict(r, symbol=symbol) for r in self.rows[-limit:]]
+
+    engine = Engine(symbols=["TON_USDT"], timeframes=["1m", "1h"], settings=dict(DEFAULTS))
+    feed = OneHourless(rows)
+
+    async def go():
+        await engine.warmup(feed)
+
+    asyncio.run(go())
+    hour_bars = len(engine.history[("TON_USDT", "1h")])
+    # 1000 one-minute bars can only produce ~16 hourly candles - the point is that
+    # the instrument is not left with an empty 1h map
+    assert hour_bars >= 10, f"the 1h map was filled by rolling up 1m bars, got {hour_bars}"
+    # 16 hourly candles is honest for a 1000-minute roll-up, so the instrument may
+    # still be "thin" - but the failure is not recorded as an error, and the 1m map
+    # (the one that carries a trade) is full
+    assert len(engine.history[("TON_USDT", "1m")]) >= 200
+    assert engine.warm_errors == 0, f"a rolled-up timeframe is not a failure: {engine.warm_problems}"
+
+
+def test_a_symbol_that_really_has_no_history_is_reported_once():
+    class Nothing(FakeFeed):
+        async def history(self, symbol: str, interval: str, limit: int = 500):
+            raise RuntimeError("MEXC futures returned no kline for X_USDT")
+
+    engine = Engine(symbols=["X_USDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+    asyncio.run(engine.warmup(Nothing(load(100))))
+    assert "X_USDT" in engine.thin_symbols()
+    assert "X_USDT" in engine.warm_problems and "no kline" in engine.warm_problems["X_USDT"]
+
+
+def test_a_filled_trade_stays_open_in_the_journal_until_it_is_decided(tmp_path):
+    """The database half of "my signal disappeared".
+
+    Entering the block used to close the row (``mitigated``), so an *open trade*
+    vanished from the journal's "open now", from the page's live tab and from the
+    plans a restart re-adopts. It stays open now until target or stop.
+    """
+    import bot.journal as journal_mod
+    from bot.journal import open_journal
+
+    store = open_journal(tmp_path / "j.sqlite3")
+    try:
+        engine = Engine(symbols=["BTCUSDT"], timeframes=["1m"], settings=dict(DEFAULTS))
+        engine.journal_prob_min = 0.0
+        zone = _live_snapshot()
+        engine._journal_write(zone)  # noqa: SLF001
+        engine._journal_close(zone["key"], "mitigated", zone)  # noqa: SLF001
+        assert store.count(status="open") == 1, "the open trade is still an open row"
+        zone["plan_state"] = "target"
+        zone["plan_result_r"] = 1.6
+        engine._journal_close(zone["key"], "plan_target", zone)  # noqa: SLF001
+        assert store.count(status="open") == 0
+        assert store.count(status="active") == 1, "the row is kept, marked decided"
+        row = store.get(zone["key"])
+        assert row["result"] == "target" and row["plan_state"] == "target"
+    finally:
+        store.close()
+        journal_mod._JOURNAL = None

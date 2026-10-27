@@ -65,6 +65,13 @@ class Engine:
         # bound; every live zone is always kept.
         self.max_zones = 20000
         self.max_active_zones = 300
+        # Round 12: how many active zones one pushed frame carries. The page used
+        # to receive 200, ranked by probability - so when more than 200 were live,
+        # the ones below the cut *vanished from the screen* while still being
+        # perfectly valid zones (neither mitigated nor invalidated). That is the
+        # "signal disappeared" report. Signals now always come first, the cap is
+        # explicit, and the frame says how many were left out.
+        self.push_active = 200
         self.events: list[dict] = []              # newest first: formed / mitigated
         self.kinds: dict[str, int] = {}
         self.resolved: dict[str, int] = {"mitigated": 0, "invalidated": 0}
@@ -99,10 +106,19 @@ class Engine:
     # ------------------------------------------------------------- plumbing
     @staticmethod
     def _interval_for(count: int) -> float:
-        if count <= 60:
+        """How often a frame is pushed. A wide scan must not push 3 times a second.
+
+        Round 12: 60 contracts used to push every 0.35 s - three frames a second of
+        a few hundred kilobytes, and the browser rebuilt its whole list on each one.
+        That is what made the app feel slow. The push is now paced by how much there
+        is to say.
+        """
+        if count <= 20:
             return 0.35
-        if count <= 300:
-            return 1.0
+        if count <= 60:
+            return 0.7
+        if count <= 200:
+            return 1.2
         return 2.0
 
     def add_cells(self, symbol: str) -> None:
@@ -134,6 +150,12 @@ class Engine:
         drop = {str(s).upper() for s in symbols}
         removed = [s for s in self.symbols if s in drop]
         if removed:
+            # Round 10: an instrument that leaves the scan takes its live plans
+            # with it. The archive keeps every row, but it must not keep saying
+            # "open" about a symbol nobody is watching any more - that is how a
+            # signal looked like it vanished AND the open count grew at once.
+            for zone in [z for z in self.zones.values() if z.get("symbol") in drop]:
+                self._journal_drop(zone)
             self.symbols = [s for s in self.symbols if s not in drop]
             self.maps = {k: v for k, v in self.maps.items() if k[0] not in drop}
             self.rollups = {k: v for k, v in self.rollups.items() if k[0] not in drop}
@@ -223,16 +245,41 @@ class Engine:
                 await self._warm_from_minutes(feed, symbol, tf)
                 self.warm_done += 1
                 continue
-            try:
-                candles = await asyncio.wait_for(feed.history(symbol, interval, WARM_BARS), timeout=20)
-                self._warm_failures = 0
-            except Exception as exc:  # a broken symbol must not kill the scanner
+            candles = None
+            problem: Exception | None = None
+            # 1st: the full window. 2nd: the same interval over a much shorter span -
+            # a long `start` is the usual reason an exchange answers "no kline" for a
+            # contract that clearly has candles. 3rd: a retry after the rate limit.
+            for attempt, bars_wanted in enumerate((WARM_BARS, max(120, WARM_BARS // 5), WARM_BARS)):
+                try:
+                    candles = await asyncio.wait_for(
+                        feed.history(symbol, interval, bars_wanted), timeout=25)
+                    self._warm_failures = 0
+                    break
+                except Exception as exc:  # a broken symbol must not kill the scanner
+                    problem = exc
+                    await asyncio.sleep(0.5 if attempt == 1 else 1.0)
+            if not candles:
+                # Round 13: one timeframe with no history used to leave the whole
+                # instrument empty (the "warm-up TON_USDT 1h: FeedError: MEXC
+                # futures returned no kline" report). The 1m series is the one the
+                # exchange always has, so the higher timeframe is built from it.
+                before = len(self.history.get(key, ()))
+                await self._warm_from_minutes(feed, symbol, tf)
+                gained = len(self.history.get(key, ())) - before
+                self.warm_done += 1
+                if gained >= 1:
+                    self.warm_problems.pop(f"{symbol} {tf}", None)
+                    continue
                 self._warm_failures += 1
                 self.warm_errors += 1
-                self.warm_done += 1
-                self.warm_problems[symbol] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                reason = f"{type(problem).__name__}: {str(problem)[:120]}" if problem else "no candles"
+                self.warm_problems[f"{symbol} {tf}"] = reason
+                self.warm_problems[symbol] = f"{tf}: {reason}"
                 if self._warm_failures <= 3:
-                    await self._log(f"warm-up {symbol} {tf}: {type(exc).__name__}: {exc}", "warn")
+                    await self._log(
+                        f"warm-up {symbol} {tf}: {reason} - and rolling up from 1m gave only "
+                        f"{gained} candles, so this timeframe stays empty for now", "warn")
                 continue
             for bar in candles:
                 self._append(key, {**bar, "closed": True})
@@ -305,9 +352,11 @@ class Engine:
             self.warming = False
         short = self.thin_symbols()
         if short:
+            why = "; ".join(f"{k}: {v}" for k, v in list(self.warm_problems.items())[:3])
             await self._log(
-                f"warm-up: {len(short)} of {len(self.symbols)} instruments still short of history - "
-                "the healer re-requests them in the background", "warn")
+                f"warm-up: {len(short)} of {len(self.symbols)} instruments still short of history"
+                + (f" ({why})" if why else "")
+                + " - the healer re-requests them in the background", "warn")
         await self._emit_state(force=True)
 
     def thin_symbols(self, need: int = 200) -> list[str]:
@@ -316,11 +365,23 @@ class Engine:
         These are the ones that silently produce no signals. The diagnostics
         endpoint prints the same number, so "why is this contract empty" has an
         answer on screen instead of a guess.
+
+        Round 13: the requirement is per timeframe. An hourly map can only ever be
+        filled from hourly candles (or from a roll-up of one-minute ones, which
+        gives ~16 hours per 1000 minutes), so demanding 200 hourly candles would
+        keep a perfectly usable instrument on the healer's list for ten days.
         """
         out: list[str] = []
         for symbol in self.symbols:
-            bars = [len(self.history.get((symbol, tf), ())) for tf in self.timeframes]
-            if not bars or min(bars) < need:
+            short = False
+            for tf in self.timeframes:
+                bars = len(self.history.get((symbol, tf), ()))
+                wanted = need if tf in ("1m", "3m", "5m") else min(need, 60)
+                minimum = int(self.maps[(symbol, tf)].cfg.get("structure_min_bars", 30)) if (symbol, tf) in self.maps else 30
+                if bars < max(wanted, minimum):
+                    short = True
+                    break
+            if short:
                 out.append(symbol)
         return out
 
@@ -330,6 +391,25 @@ class Engine:
         await self._emit_state(force=True)
 
     # -------------------------------------------------------------- candles
+    TF_PARENT = {"1m": "5m", "3m": "5m", "5m": "15m", "15m": "30m", "30m": "1h", "1h": "1h"}
+
+    def _refresh_context(self, key: tuple[str, str]) -> None:
+        """Give a map the structure of the timeframe above it (round 13)."""
+        symbol, tf = key
+        map_ = self.maps.get(key)
+        if map_ is None:
+            return
+        parent_tf = self.TF_PARENT.get(tf, tf)
+        if parent_tf == tf:
+            map_.context = {}
+            return
+        parent = self.maps.get((symbol, parent_tf))
+        if parent is None or parent is map_:
+            map_.context = {}
+            return
+        state = parent.structure()
+        map_.context = {**state, "timeframe": parent_tf}
+
     def _append(self, key: tuple[str, str], bar: dict) -> dict[str, Any] | None:
         map_ = self.maps.get(key)
         if map_ is None:
@@ -351,6 +431,10 @@ class Engine:
             return None  # out of order: never let the chart go backwards
         history.append(normalised)
         self.partial.pop(key, None)
+        # Round 13: the timeframe above this one is the "bigger trend" the book asks
+        # for (p.39, p.104). It is read before the bar is added, so a zone can only
+        # ever be graded on structure that was already confirmed.
+        self._refresh_context(key)
         events = map_.add(bar)
         if events.get("zones"):
             for zone in events["zones"]:
@@ -404,15 +488,40 @@ class Engine:
             return
         result = {"plan_target": "target", "plan_stopped": "stopped",
                   "mitigated": "mitigated", "invalidated": "invalidated"}.get(status)
+        # Round 13: entering the block fills the plan - that is the *start* of the
+        # trade, not the end of the signal. The row stays open (so the live tab, the
+        # "open now" count and a restart's re-adoption all still see it) until the
+        # target or the stop decides it.
+        filled = str(zone.get("plan_state") or "") == "filled"
+        keep_open = filled and status in ("mitigated",)
         store.close_signal(
             key,
-            status="active" if status.startswith("plan_") else status,
+            status="active" if (status.startswith("plan_") or keep_open) else status,
             at=int(zone.get("plan_result_at") or zone.get("mitigated_at")
                    or zone.get("invalidated_at") or time.time() * 1000),
             result=result,
             result_r=zone.get("plan_result_r"),
         )
         self._journaled[key] = (zone.get("status"), status)
+
+    def _journal_drop(self, zone: dict) -> None:
+        """Stop following a row without losing it (instrument removed / replaced)."""
+        store = journal()
+        key = zone.get("key")
+        if not store.enabled or not key:
+            return
+        if zone.get("status") != "active":
+            self._journaled.pop(key, None)
+            return
+        store.close_signal(
+            key,
+            status="untracked",
+            at=int(time.time() * 1000),
+            result=zone.get("result"),
+            result_r=zone.get("plan_result_r"),
+            note="the instrument was removed from the scan while this plan was open",
+        )
+        self._journaled.pop(key, None)
 
     def journal_stats(self, max_age: float = 5.0) -> dict[str, Any]:
         """The archive's counters, cached - a push every 0.35 s must not count rows."""
@@ -425,6 +534,34 @@ class Engine:
         except Exception:
             pass
         return self._journal_stats
+
+    def restore_open(self, snapshots: list[dict]) -> int:
+        """Put the plans that were open when the server stopped back on the map.
+
+        Round 13: "signals disappear when I refresh". They were stored - the
+        database has every one - but a restart threw the in-memory map away and
+        marked the open plans ``interrupted``, so the live tab came back empty and
+        the trades were never followed again. Now the scanner adopts them: they are
+        live immediately, and their targets and stops keep being checked against
+        the candles that arrive.
+        """
+        restored = 0
+        for data in snapshots:
+            tf = str(data.get("timeframe") or "")
+            symbol = str(data.get("symbol") or "")
+            map_ = self.maps.get((symbol, tf))
+            if map_ is None:
+                continue
+            zone = map_.adopt(data)
+            if zone is None:
+                continue
+            item = zone.as_dict()
+            item["market"] = market_of(symbol)
+            item["restored"] = True
+            self.zones[item["key"]] = item
+            self._journaled[item["key"]] = (item.get("status"), item.get("plan_state"))
+            restored += 1
+        return restored
 
     def diagnostics(self) -> list[dict[str, Any]]:
         """One row per instrument: what the scanner actually has for it.
@@ -475,7 +612,16 @@ class Engine:
         written = 0
         for zone in self.zones.values():
             key = zone.get("key")
-            if not key or (zone.get("prob") or 0) < self.journal_prob_min:
+            if not key:
+                continue
+            # Once a row exists it is kept up to date for its whole life. The old
+            # gate skipped any zone whose probability had since fallen below the
+            # floor, which froze those rows at "waiting" while the scanner went on
+            # to fill them and hit their target - the record stopped matching the
+            # trade, and looked like the details had been lost.
+            if key not in self._journaled and not (
+                zone.get("signal") or (zone.get("prob") or 0) >= self.journal_prob_min
+            ):
                 continue
             state = (zone.get("status"), zone.get("plan_state"))
             if self._journaled.get(key) == state:
@@ -592,7 +738,9 @@ class Engine:
             self.loops_reset += 1
             for tf in self.timeframes:
                 self._reset_cell((symbol, tf))
-            self._pending_log = f"{symbol}: feed rewound, map restarted"
+            self._pending_log = (
+                f"{symbol}: the replay looped back to the start of the recording, so its map was "
+                "rebuilt from the first candle - a replay-only note, not a live error")
         self.last_open[symbol] = open_time
         for tf in self.timeframes:
             key = (symbol, tf)
@@ -677,8 +825,25 @@ class Engine:
         # the resolved zones are fetched on demand (/api/zones), not pushed
         await self._broadcast({"type": "state", **self.snapshot(cells=False, with_history=False)})
 
+    @staticmethod
+    def is_live(zone: dict) -> bool:
+        """Is this still something the trader is watching?
+
+        Round 13 - the real "my signal disappeared" bug in the live app: a zone
+        leaves ``status == "active"`` the moment price comes back into the block,
+        which is *exactly* when its plan fills and the trade opens. So the trade
+        was hidden at the moment it started, and the card vanished although
+        nothing had been completed or invalidated. Liveness is the **plan**, not
+        the block: a zone is live while its block is untouched, and stays live
+        for as long as the trade it started is open (filled, not yet
+        target/stopped).
+        """
+        if zone.get("status") == "active":
+            return True
+        return zone.get("plan_state") == "filled"
+
     def active_zones(self) -> list[dict]:
-        return [z for z in self.zones.values() if z.get("status") == "active"]
+        return [z for z in self.zones.values() if self.is_live(z)]
 
     async def _broadcast(self, message: dict) -> None:
         if self.broadcast is not None:
@@ -822,6 +987,69 @@ class Engine:
             out["entry_trend"] = Engine._regime(zone.get("entry_trend"))
         return out
 
+    # The handful of fields a frame really needs: enough to draw a card, rank it,
+    # filter it and print its plan - and nothing that is a list of prose. The
+    # evidence, the order-block candle, the confluence lines and the HTF detail are
+    # fetched for the one zone the user opens (`/api/zones/{key}`), which is the only
+    # place they are ever read. Round 12: this took a 300-zone frame from ~380 KB to
+    # ~110 KB, which is what the "the app got slow" report was about.
+    ROW_FIELDS = (
+        "key", "kind", "side", "symbol", "timeframe", "top", "bottom", "level", "time",
+        "status", "strength", "session", "mitigated_at", "mitigated_price",
+        "invalidated_at", "invalidated_price", "grade", "block_atr", "disp_atr", "market",
+        "plan_state", "plan_result_at", "plan_result_r", "prob", "fee_r", "net_r",
+        "tradable", "cond_met", "cond_total", "signal", "measured",
+    )
+
+    @staticmethod
+    def row(zone: dict) -> dict:
+        """A zone as the frame carries it: no prose, only what a card prints.
+
+        Three things keep it small, because this object is sent for *every* live
+        zone on every push: empty fields are left out entirely (a frame was 30 %
+        nulls), the missing-condition list becomes a 10-bit mask the page already
+        knows how to read, and the floats are cut to the precision a screen can
+        show. Nothing is lost - the full zone is one request away.
+        """
+        out = {key: zone.get(key) for key in Engine.ROW_FIELDS if zone.get(key) is not None}
+        plan = Engine._plan(zone.get("plan"))
+        if plan:
+            # target_source is a sentence; the card prints it, so it stays - but a
+            # long name is cut, the full text is in the detailed fetch
+            if isinstance(plan.get("target_source"), str):
+                plan["target_source"] = plan["target_source"][:48]
+            out["plan"] = plan
+        gate = zone.get("gate") or {}
+        if gate:
+            # compact: the card prints the first two reasons, the full list is in
+            # the detailed fetch. ~90 bytes a row, and it is why a pattern in a
+            # range is visibly *not* a signal.
+            out["gate"] = {
+                "ok": bool(gate.get("ok")),
+                "why": list(gate.get("why") or [])[:2],
+                "structure": gate.get("structure"),
+                "htf": gate.get("htf"),
+                "htf_timeframe": gate.get("htf_timeframe"),
+                "location": gate.get("location"),
+            }
+        conds = zone.get("conds") or {}
+        mask = 0
+        for i, name in enumerate(CONDITION_NAMES):
+            if conds.get(name):
+                mask |= 1 << i
+        out["cond_mask"] = mask
+        trend = Engine._regime(zone.get("now_trend") or zone.get("trend"))
+        if trend:
+            out["now_trend"] = trend
+        for key in ("prob", "net_r", "fee_r", "block_atr", "disp_atr", "fvg_atr"):
+            value = out.get(key)
+            if isinstance(value, float):
+                out[key] = round(value, 4 if key == "prob" else 3)
+        measured = out.get("measured")
+        if isinstance(measured, dict):
+            out["measured"] = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in measured.items()}
+        return out
+
     @staticmethod
     def light(zone: dict) -> dict:
         """The few fields the live tape prints."""
@@ -845,7 +1073,7 @@ class Engine:
         grade = {"A+": 3, "A": 2, "B": 1, "C": 0}.get(zone.get("grade"), 0)
         net = zone.get("net_r")
         return (
-            1 if zone.get("status") == "active" else 0,
+            1 if Engine.is_live(zone) else 0,
             float(zone.get("prob") or 0.0),
             float(net if net is not None else -99.0),
             grade,
@@ -858,8 +1086,8 @@ class Engine:
     ) -> list[dict]:
         """Every zone, best first - the list the page's top section is built from."""
         items = list(self.zones.values())
-        if status == "active":
-            items = [z for z in items if z.get("status") == "active"]
+        if status in ("active", "live"):
+            items = [z for z in items if self.is_live(z)]
         elif status != "all":
             items = [z for z in items if z.get("status") == status]
         if market in ("spot", "futures"):
@@ -877,15 +1105,29 @@ class Engine:
         # page fetches the detail of the zone it opens.
         lean = len(self.symbols) > 120
         index = self._strong_levels()
-        active = self.ranked("", limit=max(1, int(self.max_active_zones)))
+        everything = self.ranked("", limit=len(self.zones) or 1)
+        signal_total = sum(1 for z in everything if z.get("signal"))
+        # Signals first, then everything else, both already best-first. A signal can
+        # therefore only be left out if there are more signals than the frame holds.
+        ordered = [z for z in everything if z.get("signal")]
+        ordered += [z for z in everything if not z.get("signal")]
+        cap = max(1, int(self.push_active))
+        active = ordered[:cap]
+        active_total = len(everything)
         # only what is actually sent is enriched: a wide scan must not pay for
         # work the page will never see
         for zone in active:
             self.enrich(zone, index)
         for zone in active:
             zone["market"] = market_of(zone.get("symbol", ""))
-        history = [z for z in self.zones.values() if z.get("status") != "active"]
+        history = [z for z in self.zones.values() if not self.is_live(z)]
         history.sort(key=lambda z: -int(z.get("mitigated_at") or z.get("invalidated_at") or 0))
+        # A resolved zone is still shown (the page keeps the recent ones), so it
+        # needs the same "as of now" fields as a live one - otherwise its card and
+        # its journal row print a blank grade and a blank market. Only the handful
+        # that is actually sent is enriched.
+        for zone in history[:60]:
+            self.enrich(zone, index)
         return {
             "source": self.source,
             "exchange": self.exchange,
@@ -915,11 +1157,18 @@ class Engine:
                 **(self.journal_stats() or {}),
                 "seen": self.journal_seen,
             },
-            "active": [self.slim(z, lean) for z in active[: ACTIVE_CAP]],
-            "history": [self.slim(z, lean) for z in history[:60]] if with_history else [],
+            # Round 12: what the frame holds, and what it had to leave out. The page
+            # says so out loud instead of quietly dropping zones.
+            "active_total": active_total,
+            "active_shown": len(active),
+            "signal_total": signal_total,
+            "signals_shown": sum(1 for z in active if z.get("signal")),
+            "push_limit": cap,
+            "active": [self.row(z) for z in active],
+            "history": [self.slim(z, lean) for z in history[:30]] if with_history else [],
             "events": [
                 {**event, "zone": self.light(event["zone"]) if isinstance(event.get("zone"), dict) else None}
-                for event in self.events[:30]
+                for event in self.events[:12]
             ],
             "seq": self.seq,
             "warming": {

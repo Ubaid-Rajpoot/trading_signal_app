@@ -24,7 +24,7 @@
     font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 1560px; margin: 0 auto; padding: 18px 20px 70px; }
+  .wrap { max-width: 2400px; margin: 0 auto; padding: 18px clamp(14px, 1.6vw, 34px) 70px; }
   button, input, select, textarea { font: inherit; color: inherit; }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-thumb { background: #233049; border-radius: 8px; }
@@ -67,8 +67,7 @@
   .btn.danger { border-color: #5c2430; color: #ffb3c2; background: transparent; }
   .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
 
-  .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
-  @media (max-width: 1250px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
   @media (max-width: 700px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .kpi {
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
@@ -106,8 +105,15 @@
   .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
   .toggle input { accent-color: #63a8ff; }
 
-  .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr); gap: 14px; align-items: start; }
-  @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
+  /* Round 10: three columns on a wide screen. The cards get everything that is
+     left, so a 2560px monitor is used instead of being thrown away in gutters. */
+  .layout { display: grid; gap: 14px; align-items: start;
+    grid-template-columns: minmax(0, 1fr) minmax(380px, 620px); }
+  @media (min-width: 1500px) { .layout { grid-template-columns: minmax(0, 1fr) minmax(420px, 620px); } }
+  @media (min-width: 1780px) {
+    .layout { grid-template-columns: minmax(0, 1fr) minmax(420px, 640px) minmax(400px, 560px); }
+  }
+  @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } .layout > * { min-width: 0; } }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; backdrop-filter: blur(8px); box-shadow: var(--shadow); }
   .panel > h2 {
     margin: 0; padding: 11px 15px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
@@ -117,7 +123,11 @@
   .panel > h2 .right { margin-left: auto; display: flex; gap: 8px; align-items: center; text-transform: none; letter-spacing: 0; font-weight: 500; }
 
   /* zone cards */
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; padding: 12px; max-height: 1120px; overflow-y: auto; }
+  /* No inner scroll box: a card taller than the viewport used to be cut off inside
+     the panel ("content bahir aa raha hai"), and nested scrolling on a wide screen
+     hides half the list. The page scrolls once. */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+    gap: 12px; padding: 12px; align-content: start; }
   .zone {
     border: 1px solid var(--line); background: linear-gradient(180deg, rgba(23,31,46,.9), rgba(15,21,32,.9));
     border-radius: 13px; padding: 11px 12px 10px; cursor: pointer; position: relative; transition: .15s;
@@ -134,6 +144,14 @@
   .status.active { color: var(--amber); background: rgba(255,179,71,.1); border: 1px solid #6b4c1c; }
   .status.mitigated { color: var(--green); background: rgba(46,230,168,.09); border: 1px solid #1d5c47; }
   .status.invalidated { color: var(--muted); background: rgba(255,255,255,.04); border: 1px solid var(--line); }
+  /* round 13: a filled plan is an open trade, so it gets its own colour */
+  .status.filled { color: #8ff3cf; background: rgba(46,230,168,.16); border: 1px solid #2ee6a8; }
+  .prob small.n { opacity: .65; letter-spacing: 0; text-transform: none; font-weight: 600; }
+  /* round 13: the structure gate, on the card, pass or fail */
+  .gate { margin-top: 6px; font-size: 11px; line-height: 1.45; border-radius: 7px; padding: 5px 8px; }
+  .gate.pass { color: #8ff3cf; background: rgba(46,230,168,.07); border: 1px solid #1d5c47; }
+  .gate.fail { color: #ffc98a; background: rgba(255,179,71,.06); border: 1px solid #6b4c1c; }
+  .plan .src.warn { color: #ffc98a; }
   .zone .lvl { display: flex; align-items: baseline; gap: 9px; margin: 8px 0 2px; }
   .zone .lvl .px { font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: .01em; }
   .zone .lvl .dist { font-size: 11.5px; color: var(--muted); }
@@ -141,6 +159,8 @@
   .zone .evid { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
   .zone .evid li { font-size: 11.5px; color: #b9c6da; display: flex; gap: 6px; }
   .zone .evid li::before { content: "▸"; color: var(--accent, var(--blue)); }
+  .zone .evid li.muted { color: var(--muted-2); font-style: italic; }
+  .zone .evid li.muted::before { content: "…"; }
   .zone .bar { margin-top: 9px; height: 4px; border-radius: 99px; background: #1a2436; overflow: hidden; }
   .zone .bar > i { display: block; height: 100%; background: var(--accent); }
   .zone .foot { margin-top: 7px; font-size: 11px; color: var(--muted-2); display: flex; gap: 10px; flex-wrap: wrap; }
@@ -178,11 +198,12 @@
   .scrim { position: fixed; inset: 0; background: rgba(4,7,12,.66); backdrop-filter: blur(2px); display: none; z-index: 40; }
   .scrim.on { display: block; }
   .drawer {
-    position: fixed; top: 0; right: 0; height: 100%; width: min(520px, 96vw); background: #0b1018;
+    position: fixed; top: 0; right: 0; height: 100%; width: min(620px, 96vw); background: #0b1018;
     border-left: 1px solid var(--line); z-index: 41; transform: translateX(102%); transition: transform .22s ease;
     display: flex; flex-direction: column;
   }
   .drawer.on { transform: none; }
+  #drawerJournal { width: min(1000px, 96vw); }
   .drawer header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
   .drawer h3 { margin: 0; font-size: 14px; }
   .drawer .body { padding: 14px 16px 40px; overflow-y: auto; display: grid; gap: 12px; }
@@ -209,8 +230,10 @@
   .jstate { margin-left: auto; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
   .jstate.win { color: #2ee6a8; font-weight: 800; }
   .jstate.loss { color: #ff5c7a; font-weight: 800; }
-  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: #16203300; border: 1px solid var(--line-2); background-color: #131b28; color: var(--text); padding: 10px 16px; border-radius: 11px; font-size: 12.5px; opacity: 0; transition: .2s; z-index: 60; max-width: 90vw; }
-  .toast.on { opacity: 1; transform: translateX(-50%); }
+  .toast { border: 1px solid var(--line-2); background-color: #131b28; color: var(--text);
+    padding: 10px 16px; border-radius: 11px; font-size: 12.5px; max-width: 100%;
+    animation: toastin .18s ease both; }
+  @keyframes toastin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   /* grade + regime chips (round 5) */
   /* round 8: the signal strip - the best measured setups, big */
@@ -226,7 +249,8 @@
   .herokpis .hl { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
   .herokpis .hv { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; line-height: 1.15; }
   .herokpis .hsub { font-weight: 400; color: #5f7692; letter-spacing: 0; text-transform: none; margin-left: 4px; }
-  .heroList { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; padding: 12px 16px 14px; }
+  .heroList { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 258px), 1fr));
+    gap: 10px; padding: 12px 16px 6px; }
   .heroNone { color: var(--muted); font-size: 12.5px; padding: 6px 2px; }
   .sigcard { border: 1px solid #1e3a2c; border-radius: 12px; padding: 10px 12px;
     background: linear-gradient(180deg, rgba(22,44,36,.55), rgba(14,24,22,.55)); cursor: pointer; }
@@ -281,6 +305,7 @@
   .mktsec.spot > header h3 { color: #63a8ff; }
   .mktsec .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
   .mktsec .none { color: var(--muted); font-size: 12px; padding: 6px 2px 10px; }
+  .morebar { display: flex; gap: 8px; justify-content: center; padding: 10px 0 2px; flex-wrap: wrap; }
   .mkt { font-size: 10px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; padding: 1px 6px; border-radius: 5px; border: 1px solid #3a2b5e; color: #c9a8ff; background: rgba(180,135,255,.08); }
   .mkt.spot { border-color: #24466e; color: #8fc4ff; background: rgba(99,168,255,.07); }
 
@@ -312,6 +337,139 @@
   .plan .state.stopped { color: var(--red); }
   .plan .src { color: var(--muted-2); font-size: 10.5px; }
   .hidden { display: none !important; }
+
+  /* ---------------------------------------------------------------- round 10
+     Nothing inside a card is allowed to leave the card. A long price, a chain of
+     conditions, a wide chip row - all of it wraps or is clipped, never pushed
+     sideways out of the box. */
+  .panel, .kpi, .zone, .sigcard, .hero, .jrow, .feedx, .plan, .chartwrap { min-width: 0; }
+  .zone, .sigcard, .jrow, .feedx { overflow: hidden; }
+  .zone .row1, .zone .lvl, .zone .when, .zone .foot, .plan .row, .sigfoot,
+  .ctx, .conds, .sighead, .jhead, .pcard .head, .feedx .head { flex-wrap: wrap; row-gap: 4px; }
+  .zone .px, .plan b, .sigrow b, .when span, .foot span, .sigfoot span, .evid li,
+  .fee, .src, .sigmeta, .jmeta, .dist, .ohlc, #chartMeta, .feedx .meta {
+    overflow-wrap: anywhere; word-break: break-word; min-width: 0;
+  }
+  .sigrow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .sigrow b { display: block; font-size: 12px; line-height: 1.3; }
+  .sigrow div { min-width: 0; }
+
+  /* the right-hand chips travel together, so they can wrap as one group */
+  .tags { margin-left: auto; display: flex; align-items: center; justify-content: flex-end;
+    gap: 6px; flex-wrap: wrap; min-width: 0; }
+  .tags .status { margin-left: 0; }
+  .tags .prob { margin-left: 0; }
+
+  /* a stored signal, printed: live, finished or interrupted */
+  .sigstate { font-size: 9.5px; font-weight: 900; letter-spacing: .09em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 6px; border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap; }
+  .sigstate.live { color: #08111f; background: linear-gradient(180deg,#8ff3cf,#2ee6a8); border-color: #8ff3cf; }
+  .sigstate.win { color: #2ee6a8; border-color: #1d5c47; background: rgba(46,230,168,.1); }
+  .sigstate.loss { color: #ff8fa3; border-color: #5c2430; background: rgba(255,92,122,.1); }
+  .sigstate.flat { color: var(--muted); }
+  .sigcard.done { opacity: .82; }
+  .sigcard.done:hover { opacity: 1; }
+  .herostrip { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline;
+    padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
+  .herostrip .sep { color: var(--muted-2); }
+  .herostrip b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .link { background: none; border: 0; padding: 0; color: #8fd0ff; cursor: pointer;
+    font-size: 11px; font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+
+  /* the archive column: a third column on a wide screen, a full-width band below
+     the map when there is not enough room for one */
+  .col-archive { grid-column: 1 / -1; overflow: visible; }
+  .feedlist { display: grid; gap: 8px; padding: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 330px), 1fr)); }
+  @media (min-width: 1780px) {
+    .col-archive { grid-column: auto; }
+    .col-archive .feedlist { grid-template-columns: 1fr; }
+  }
+  .feedx { border: 1px solid var(--line); border-left: 3px solid var(--accent, #2ee6a8);
+    border-radius: 10px; padding: 8px 10px; background: linear-gradient(180deg, rgba(23,31,46,.85), rgba(15,21,32,.85));
+    cursor: pointer; display: grid; gap: 3px; }
+  .feedx:hover { border-color: var(--line-2); }
+  .feedx .head { display: flex; align-items: center; gap: 7px; }
+  .feedx .sym { font-size: 12.5px; }
+  .feedx .meta { font-size: 10.5px; color: var(--muted); }
+  .feedx .lvl2 { font-size: 11px; color: #b9c6da; font-variant-numeric: tabular-nums; }
+  .feedsec { padding: 0 12px 12px; }
+
+  /* ---------------------------------------------------------------- round 11
+     Signals are a GRID, not one long line you slide along. The side panel has its
+     own tabs (live / archive / tape) so "what is happening right now" and "what
+     happened" never share one list. */
+  .tabbar { display: flex; gap: 6px; padding: 9px 12px 0; border-bottom: 1px solid var(--line);
+    background: rgba(255,255,255,.012); flex-wrap: wrap; }
+  .tab2 { border: 1px solid transparent; border-bottom: 0; background: transparent;
+    border-radius: 9px 9px 0 0; padding: 7px 12px; font-size: 12px; font-weight: 700;
+    color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+  .tab2:hover { color: var(--text); }
+  .tab2.on { color: var(--text); background: var(--panel-2); border-color: var(--line-2);
+    box-shadow: inset 0 2px 0 0 #63a8ff; }
+  .tab2 .n { background: rgba(255,255,255,.09); border-radius: 999px; padding: 0 6px;
+    font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .tab2.on .n { background: rgba(99,168,255,.22); }
+  .tabpane { display: block; }
+  .tabpane.off { display: none; }
+
+  /* the tiles: same information as a card, a third of the height */
+  .siggrid { display: grid; gap: 9px; padding: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 218px), 1fr)); }
+  .tile { border: 1px solid var(--line); border-left: 3px solid var(--accent, #63a8ff);
+    border-radius: 10px; padding: 8px 9px; display: grid; gap: 4px; cursor: pointer;
+    background: linear-gradient(180deg, rgba(23,31,46,.88), rgba(15,21,32,.88)); min-width: 0;
+    overflow: hidden; }
+  .tile:hover { border-color: var(--line-2); transform: translateY(-1px); }
+  .tile .t1 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .tile .t1 b { font-size: 12.5px; letter-spacing: .02em; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .tile .tfx { font-size: 9.5px; font-weight: 800; letter-spacing: .06em; color: var(--blue);
+    background: rgba(99,168,255,.1); border: 1px solid #24466e; border-radius: 5px; padding: 0 5px; }
+  .tile .px { font-size: 13px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .tile .t2 { display: flex; justify-content: space-between; gap: 6px; font-size: 10.5px;
+    color: var(--muted); flex-wrap: wrap; }
+  .tile .t2 b { color: #c9d6e8; font-variant-numeric: tabular-nums; }
+  .tile .t3 { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; font-size: 10px; }
+  .tile .pct { font-weight: 900; font-variant-numeric: tabular-nums; color: #7dffc4; margin-left: auto; }
+  .tile.live { box-shadow: 0 0 0 1px rgba(46,230,168,.28); }
+  .archhead { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 12px 0; }
+  .archhead .chip { padding: 4px 9px; font-size: 11px; }
+  .archpager { display: flex; gap: 8px; align-items: center; justify-content: space-between;
+    padding: 0 12px 12px; color: var(--muted); font-size: 11px; }
+  .statedoc { margin: 0 12px 8px; border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px;
+    background: rgba(8,12,19,.45); }
+  .statedoc summary { cursor: pointer; font-size: 11.5px; color: var(--muted); font-weight: 700;
+    letter-spacing: .04em; }
+  .statedoc[open] summary { color: var(--text); margin-bottom: 6px; }
+  .statedoc .note { font-size: 11.5px; line-height: 1.7; }
+  .archpager .btn { padding: 4px 10px; font-size: 11.5px; }
+
+  /* the live tab: one row per signal, every number that matters */
+  .livetable { display: grid; gap: 8px; padding: 12px; }
+  .lrow { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+    display: grid; gap: 5px; cursor: pointer; background: rgba(15,21,32,.6); min-width: 0; }
+  .lrow:hover { border-color: #2ee6a8; }
+  .lrow.waiting { border-left: 3px solid var(--amber); }
+  .lrow.filled { border-left: 3px solid #63a8ff; }
+  .lrow .h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .lrow .h b { font-size: 13px; }
+  .lrow .nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
+  .lrow .nums div { background: rgba(8,14,22,.5); border: 1px solid #17293c; border-radius: 7px;
+    padding: 4px 6px; min-width: 0; }
+  .lrow .nums span { display: block; font-size: 9px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); }
+  .lrow .nums b { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .bar2 { height: 3px; border-radius: 99px; background: #1a2436; overflow: hidden; }
+  .bar2 > i { display: block; height: 100%; background: linear-gradient(90deg, #63a8ff, #2ee6a8); }
+
+  /* toasts stack: three warnings used to overwrite each other in one line */
+  .toasts { position: fixed; left: 50%; transform: translateX(-50%); bottom: 22px; z-index: 60;
+    display: flex; flex-direction: column-reverse; gap: 8px; align-items: center; width: min(560px, 92vw); pointer-events: none; }
+  .toasts .toast { position: static; transform: none; opacity: 1; width: 100%; text-align: center;
+    pointer-events: auto; box-shadow: 0 18px 40px -20px #000; }
+  .toast.err { border-color: #5c2430; color: #ffc2cd; background-color: #1d1219; }
+  .toast.ok { border-color: #1d5c47; color: #b8ffe6; background-color: #0f1a18; }
 </style>
 </head>
 <body>
@@ -340,15 +498,17 @@
 
   <section class="hero" id="hero">
     <div class="herotop">
-      <div class="herotitle"><b>SIGNALS</b><span>measured on real candles, out of sample</span></div>
+      <div class="herotitle"><b>SIGNALS</b><span>live first, then what they did — every one kept in the database</span></div>
       <div class="herokpis">
         <div><span class="hl">live now</span><span class="hv" id="hNow">0</span></div>
-        <div><span class="hl">measured hit rate</span><span class="hv" id="hWin">–</span></div>
+        <div><span class="hl">kept</span><span class="hv" id="hKept">0</span></div>
+        <div><span class="hl">hit rate (kept)</span><span class="hv" id="hHit">–</span></div>
         <div><span class="hl">R per signal</span><span class="hv" id="hNet">–</span></div>
-        <div><span class="hl">signals / day<span class="hsub" id="hPerDay"></span></span><span class="hv" id="hDaily">–</span></div>
+        <div><span class="hl">measured<span class="hsub" id="hPerDay"></span></span><span class="hv" id="hWin">–</span></div>
       </div>
     </div>
     <div class="heroList" id="heroList"></div>
+    <div class="herostrip" id="heroStrip"></div>
   </section>
 
   <section class="kpis">
@@ -392,7 +552,8 @@
     </div>
     <div class="field"><label>quality</label>
       <select id="quality">
-        <option value="signals" selected>signals · measured ≥ 85% (default)</option>
+        <option value="setups" selected>setups · every pattern, with its gate reason (default)</option>
+        <option value="signals">signals · measured ≥ 85% + trending structure</option>
         <option value="ninety">every ≥ 90% band (more, smaller)</option>
         <option value="trade">trade-ready · fee clears + edge</option>
         <option value="prime">A+ and A · measured ≥ 85%</option>
@@ -415,6 +576,7 @@
         <option value="symbol">symbol</option>
       </select>
     </div>
+    <button class="btn ghost mini hidden" id="btnLoadAll">load every live zone</button>
     <span class="meta" id="shown"></span>
   </div>
 
@@ -450,11 +612,70 @@
         </div>
         <div class="chartmeta" id="chartMeta">select a zone</div>
       </section>
-      <section class="panel">
-        <h2>Live tape <span class="right"><span class="meta" id="tapeCount"></span></span></h2>
-        <div class="feed" id="tape"></div>
-      </section>
     </div>
+
+    <aside class="panel col-archive" id="archivePanel">
+      <h2>Signals <span class="right">
+        <span class="meta" id="archiveMeta">–</span>
+        <button class="btn ghost mini" id="btnArchiveAll">full window</button>
+      </span></h2>
+      <div class="tabbar" id="signalTabs" role="tablist">
+        <button class="tab2 on" data-stab="live" role="tab">Live now <span class="n" id="nLive">0</span></button>
+        <button class="tab2" data-stab="archive" role="tab">Archive <span class="n" id="nArch">0</span></button>
+        <button class="tab2" data-stab="tape" role="tab">Tape <span class="n" id="nTape">0</span></button>
+      </div>
+
+      <div class="tabpane" id="paneLive">
+        <p class="note" style="padding:10px 12px 0;margin:0">Everything the model calls a signal <b>right now</b>:
+          waiting for the entry, or already filled. <span id="liveSummary"></span></p>
+        <div class="livetable" id="liveList"></div>
+      </div>
+
+      <div class="tabpane off" id="paneArchive">
+        <div class="archhead">
+          <div class="chips" id="archFilters">
+            <button class="chip on" data-afilter="all">everything</button>
+            <button class="chip" data-afilter="live">still open</button>
+            <button class="chip" data-afilter="won">target hit</button>
+            <button class="chip" data-afilter="lost">stopped</button>
+            <button class="chip" data-afilter="invalid">invalidated</button>
+          </div>
+          <div class="spacer"></div>
+          <div class="chips" id="archView">
+            <button class="chip on" data-aview="grid">grid</button>
+            <button class="chip" data-aview="list">list</button>
+          </div>
+        </div>
+        <details class="statedoc">
+          <summary>what the badges mean</summary>
+          <div class="note">
+            <b style="color:#63a8ff">LIVE</b> - the plan is open (waiting for the entry, or filled and running).<br />
+            <b style="color:#2ee6a8">TARGET HIT</b> - price reached the target printed on the card. The R booked is
+            the plan's own R:R, before fees.<br />
+            <b style="color:#ff8fa3">STOPPED</b> - price reached the stop printed on the card. -1R.<br />
+            <b>MITIGATED</b> - price came back into the block. If the plan had filled, its target/stop decided the R.<br />
+            <b>INVALIDATED</b> - a candle <i>closed</i> beyond the block, so the level that made this setup strong is
+            gone. For a filled plan that means the stop was taken (-1R); for one that never filled, it means the trade
+            never triggered at all.<br />
+            <b>INTERRUPTED / NOT WATCHED</b> - the scanner restarted, or the instrument was removed, while the plan was
+            still open. The row is kept, it is simply no longer being followed.
+          </div>
+        </details>
+        <div class="siggrid" id="archiveList"></div>
+        <div class="archpager">
+          <button class="btn ghost" id="btnArchPrev">‹ previous</button>
+          <span id="archivePage">–</span>
+          <button class="btn ghost" id="btnArchNext">next ›</button>
+        </div>
+      </div>
+
+      <div class="tabpane off" id="paneTape">
+        <div class="feed" id="tape"></div>
+        <div class="chartmeta" style="border-top:1px solid var(--line)">
+          <span id="tapeCount"></span>
+        </div>
+      </div>
+    </aside>
   </div>
 </div>
 
@@ -512,10 +733,12 @@
       <button class="btn primary" id="btnAdd50">Add top 50 by turnover</button>
       <button class="btn ghost" id="btnAddAll">Add every instrument</button>
       <button class="btn ghost" id="btnRefreshUniverse">Refresh list</button>
+      <button class="btn ghost" id="btnDiagnose" title="bars per timeframe, zones and any warm-up error for every instrument">Diagnose</button>
     </div>
     <div class="field"><label>search</label><input type="search" id="uniSearch" placeholder="btc, eth, sol…" /></div>
     <div class="symlist" id="uniList"></div>
     <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:6px 0 0">Streaming now</h3>
+    <p class="note" id="scanHealth"></p>
     <div class="symlist" id="activeList"></div>
   </div>
 </aside>
@@ -528,6 +751,7 @@
     <p class="note" id="journalNote">Every signal is written to a database the moment it is found, and its record is
       updated as price fills the plan, reaches the target or takes the stop. Nothing here is ever deleted — a signal
       that has left the live list is still here, with the details it had when it formed.</p>
+    <div id="journalDetail" class="hidden"></div>
     <div class="grid2" style="margin-bottom:8px">
       <label>symbol<input type="search" id="jSymbol" placeholder="btc, eth…" /></label>
       <label>grade
@@ -536,13 +760,28 @@
       <label>state
         <select id="jStatus"><option value="">any</option><option value="open">open (waiting / filled)</option>
           <option value="target">target hit</option><option value="stopped">stopped</option>
-          <option value="mitigated">mitigated</option><option value="invalidated">invalidated</option></select></label>
+          <option value="mitigated">mitigated</option><option value="invalidated">invalidated</option>
+          <option value="interrupted">interrupted (restart)</option>
+          <option value="untracked">not watched (removed)</option></select></label>
       <label>window
         <select id="jWindow"><option value="0">everything</option><option value="1440">last 24 h</option>
           <option value="10080">last 7 days</option><option value="43200">last 30 days</option></select></label>
     </div>
     <div class="chips" id="journalStats" style="margin-bottom:6px"></div>
-    <div class="symlist" id="journalList"></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="chips" id="journalView">
+        <button class="chip on" data-jview="grid">grid</button>
+        <button class="chip" data-jview="list">list</button>
+      </div>
+      <div class="spacer"></div>
+      <span class="meta" id="journalCount"></span>
+    </div>
+    <div class="siggrid" id="journalList" style="padding:0"></div>
+    <div class="archpager" style="padding:0">
+      <button class="btn ghost" id="btnJournalPrev">‹ previous</button>
+      <span id="journalPage">–</span>
+      <button class="btn ghost" id="btnJournalNext">next ›</button>
+    </div>
   </div>
 </aside>
 
@@ -554,7 +793,7 @@
   </div>
 </aside>
 
-<div class="toast" id="toast"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
 const KINDS = {
@@ -588,12 +827,51 @@ const TABS = [
 const state = {
   data: null, tab: "all", search: "", tfs: new Set(), sort: "prob",
   showMode: "recent", recentMinutes: 120, showWeak: false, selected: null, universe: [], uniError: null,
-  quality: "signals", hiddenByQuality: 0, market: "futures",
+  quality: "setups", hiddenByQuality: 0, market: "futures",
   bands: [],
   historyItems: [], historyAt: 0,
+  // the archive, as the page last read it. It survives a failed poll on purpose.
+  feed: { items: [], at: 0, stats: null, error: null }, jFocus: null,
+  // round 11: the side panel is tabbed and the archive is paged - "200 signals"
+  // must be a grid you scan, not a list you slide along
+  ui: { tab: "live", aFilter: "all", aView: "grid", aPage: 0, aPer: 12 },
+  arch: { rows: [], total: 0, at: 0, error: null },
+  allActive: null, allActiveAt: 0, cardLimit: 60,
   chartKey: "", lastRender: 0,
 };
 const $ = (id) => document.getElementById(id);
+
+/* Round 12 - the other half of "the app got slow".
+   The scanner pushes a frame every 0.7-2 s and the page used to rebuild every list
+   on every frame: 200 cards, the strip, the tape, the live rows - all thrown away
+   and recreated even when not one number had changed. jsdom measures it, a browser
+   feels it. Each pane now draws only when its own content changes, and the page
+   never draws more cards than fit on a few screens (60 at a time, "show more"). */
+const drawn = {};
+function redraw(name, signature, render) {
+  if (drawn[name] === signature) return false;
+  drawn[name] = signature;
+  render();
+  return true;
+}
+function forget(...names) { names.forEach((n) => { delete drawn[n]; }); }
+
+/* A thrown error used to leave the page half-drawn with no explanation. Anything
+   that escapes a timer or an event handler now lands in the toast stack, once per
+   distinct message, so "it stopped updating" has a visible cause. */
+const seenErrors = new Set();
+window.addEventListener("error", (event) => {
+  const key = String(event.message || event.error || "script error");
+  if (seenErrors.has(key)) return;
+  seenErrors.add(key);
+  try { toast(`the page hit a script error: ${friendlyError(event.error || key)}`, "err"); } catch (e) {}
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const key = String((event.reason && event.reason.message) || event.reason || "promise");
+  if (seenErrors.has(key)) return;
+  seenErrors.add(key);
+  try { toast(`a background request failed: ${friendlyError(event.reason || key)}`, "err"); } catch (e) {}
+});
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
 
 function fmtPx(v) {
@@ -631,9 +909,42 @@ function ago(ms) {
   if (s < 172800) return Math.round(s / 3600) + "h ago";
   return Math.round(s / 86400) + "d ago";
 }
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.classList.add("on");
-  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 4200);
+/* Warnings used to land in one line that each new message overwrote - three
+   problems arrived, one was read. They stack now, newest at the bottom, each with
+   its own lifetime, and an error is visibly different from a note. */
+function toast(msg, kind) {
+  const host = $("toasts");
+  if (!host) return;
+  const text = String(msg == null ? "" : msg).trim();
+  if (!text) return;
+  const node = el("div", "toast" + (kind ? " " + kind : ""));
+  node.textContent = text;
+  node.title = text;
+  host.appendChild(node);
+  while (host.children.length > 4) host.removeChild(host.firstChild);
+  setTimeout(() => { node.style.transition = "opacity .25s"; node.style.opacity = "0";
+    setTimeout(() => node.remove(), 260); }, kind === "err" ? 9000 : 5200);
+}
+
+/* A raw exception in a toast is not an explanation. Anything the browser or a
+   decoder throws is translated into what happened and what to do about it - the
+   exact text the user hit was
+   "DecodingError: brotli: decoder process called with data when
+   'can_accept_more_data()' is False". */
+function friendlyError(e) {
+  const raw = String((e && (e.message || e)) || "").trim();
+  if (/brotli|decodingerror|decompress|decoder/i.test(raw)) {
+    return "the exchange sent a body the server could not decode. It retried on its own - press the button again, nothing was lost.";
+  }
+  if (/failed to fetch|networkerror|load failed|network request failed/i.test(raw)) {
+    return "cannot reach the server. Check it is running (or the VPN), then try again.";
+  }
+  if (/timeout|timed out|aborterror/i.test(raw)) {
+    return "the exchange took too long to answer. Try again in a moment - a slow list is not a broken one.";
+  }
+  if (/http 5\d\d/i.test(raw)) return `the server hit an error (${raw.slice(0, 80)}). Its log has the detail; retry once.`;
+  if (/http 429/i.test(raw)) return "the exchange is rate-limiting us. Wait ~10 seconds before adding more.";
+  return raw.slice(0, 180) || "something went wrong";
 }
 
 /* --------------------------------------------------------------- transport
@@ -731,10 +1042,55 @@ function setBadge(cls, text) {
 }
 
 /* --------------------------------------------------------------- rendering */
+/* A frame is bounded on purpose (bytes = speed). When the scanner holds more live
+   zones than the frame carries, the page must NOT pretend the rest do not exist:
+   it says how many, and can fetch every one of them on demand. This is the other
+   half of "my signal disappeared": a zone below the frame's cut used to simply not
+   be on the page, valid or not. */
+function mergedActive() {
+  const d = state.data || {};
+  const pushed = d.active || [];
+  if (state.allActive && state.allActive.length) {
+    const byKey = new Map();
+    pushed.forEach((z) => byKey.set(z.key, z));
+    state.allActive.forEach((z) => byKey.set(z.key, { ...z, ...(byKey.get(z.key) || {}) }));
+    return [...byKey.values()];
+  }
+  return pushed;
+}
+
+async function loadAllActive() {
+  const btn = $("btnLoadAll");
+  if (btn) { btn.disabled = true; btn.textContent = "loading…"; }
+  try {
+    const r = await fetch("/api/zones?status=active&limit=4000", { cache: "no-store" });
+    const body = await r.json();
+    state.allActive = (body.items || []).map((z) => engineRow(z));
+    state.allActiveAt = Date.now();
+    toast(`loaded ${state.allActive.length} live zones`, "ok");
+    drawCards();
+  } catch (e) {
+    toast(friendlyError(e), "err");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "load every live zone"; }
+  }
+}
+
+// /api/zones returns the full zone; the list draws from the same shape as a frame row
+function engineRow(z) {
+  const row = { ...z };
+  if (!row.cond_mask && row.conds) {
+    let mask = 0;
+    CONDITION_ORDER.forEach(([name], i) => { if ((row.conds || {})[name]) mask |= 1 << i; });
+    row.cond_mask = mask;
+  }
+  return row;
+}
+
 function allZones() {
   const d = state.data;
   if (!d) return [];
-  const active = d.active || [];
+  const active = mergedActive();
   if (state.showMode === "active") return active;
   // Resolved zones are fetched on demand. They stay on the list exactly as they
   // were - dimmed, with the time they formed AND the time/price that mitigated
@@ -778,11 +1134,30 @@ const CONDITION_ORDER = [
   ["algo", "algo candle"], ["displacement", "displacement"], ["block", "order block"],
   ["session", "session"], ["confluence", "confluence"], ["trend", "trending"],
 ];
+/* Round 12: a pushed row no longer carries the missing-condition list (it carries a
+   10-bit mask instead, which is what keeps a frame small enough to push often).
+   The card, the filter and the checklist all read it through here. */
+function zoneConds(z) {
+  if (z && Array.isArray(z.cond_missing)) return { met: null, missing: new Set(z.cond_missing) };
+  const mask = z && Number.isInteger(z.cond_mask) ? z.cond_mask : null;
+  if (mask == null) return { met: null, missing: new Set() };
+  const missing = new Set();
+  CONDITION_ORDER.forEach(([name], i) => { if (!(mask & (1 << i))) missing.add(name); });
+  return { met: null, missing };
+}
 const planOf = (z) => (z && z.plan) || null;
 const planRR = (z) => { const p = planOf(z); return p && p.rr != null ? p.rr : null; };
 const isSniper = (z) => (planRR(z) || 0) >= RR_MIN;
 const probOf = (z) => (z && z.prob != null ? z.prob : null);
 const probText = (z) => { const p = probOf(z); return p == null ? "–" : Math.round(p * 100) + "%"; };
+// Round 13: a percentage without its sample is a slogan. Every measured number the
+// page prints also says how many setups it was measured on and over what - the
+// band record the model file ships from a held-out block.
+const measuredOf = (z) => (z && z.measured) || null;
+const sampleText = (z) => {
+  const m = measuredOf(z);
+  return m && m.n != null ? `n=${m.n}` : "";
+};
 const gradeRankOf = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
 const isTradeReady = (z) => !!z.tradable;
 
@@ -790,6 +1165,11 @@ function kindsForTab(tabId) {
   const tab = TABS.find((t) => t.id === tabId) || TABS[0];
   return new Set(tab.kinds);
 }
+function resetCardPage() {
+  state.cardLimit = 60;
+  forget("cards");
+}
+
 function visibleZones() {
   const d = state.data;
   if (!d) return [];
@@ -807,7 +1187,8 @@ function visibleZones() {
   const gradeRank = (z) => GRADE_RANK[z.grade] == null ? 0 : GRADE_RANK[z.grade];
   const readyOf = (z) => !!(z.now_trend && z.now_trend.ready);
   const before = items.length;
-  if (state.quality === "signals") items = items.filter((z) => !!z.signal);            // p >= 85% and the fee clears
+  if (state.quality === "signals") items = items.filter((z) => !!z.signal);            // p >= 85%, fee clears, trending structure
+  if (state.quality === "setups") items = items.filter((z) => (z.plan || z.level) && !["weak_high", "weak_low"].includes(z.kind));
   else if (state.quality === "ninety") items = items.filter((z) => (z.prob || 0) >= 0.60);  // the whole >= 90% band
   else if (state.quality === "trade") items = items.filter(isTradeReady);
   else if (state.quality === "prime") items = items.filter((z) => gradeRank(z) >= 2);   // A+ and A (measured)
@@ -822,8 +1203,10 @@ function visibleZones() {
     const p = price[z.symbol];
     return p == null ? Infinity : Math.abs(z.level - p) / p;
   };
-  const rank = (z) => (z.status === "active" ? 0 : 1);
-  items.sort((a, b) => rank(a) - rank(b));   // active zones always lead the list
+  // round 13: an open trade (a filled plan) is as live as an untouched block, so
+  // both lead the list - otherwise a trade that started would sink to the bottom
+  const rank = (z) => (z.status === "active" || z.plan_state === "filled" ? 0 : 1);
+  items.sort((a, b) => rank(a) - rank(b));   // live zones always lead the list
   const lead = (a, b) => (rank(a) - rank(b)) || (readyOf(b) ? 1 : 0) - (readyOf(a) ? 1 : 0) || gradeRank(b) - gradeRank(a);
   if (state.sort === "prob") items.sort((a, b) => (rank(a) - rank(b))
     || ((probOf(b) || -1) - (probOf(a) || -1))
@@ -837,9 +1220,14 @@ function visibleZones() {
 }
 
 // ---------------------------------------------------------------- signals
-// The strip at the top of the page. It shows only plans whose *measured*
-// accuracy (out of sample, from /api/model) is 90% or better and whose reward
-// pays the exchange fee - the whole point of round 8.
+// The strip at the top. Round 8 showed only what is live *right now*, so a signal
+// that reached its target simply disappeared from the page - which is exactly what
+// "signals come and then vanish" looked like. Round 10 merges two sources:
+//   1. the live map  (a plan that is waiting or filled)
+//   2. the database  (/api/journal - every signal, with the outcome it got)
+// A finished signal turns into a TARGET / STOPPED badge and stays on screen until
+// newer ones push it down. Nothing is dropped on a failed poll either: the last
+// good copy is kept and re-drawn.
 async function loadBands() {
   try {
     const res = await fetch("/api/model", { cache: "no-store" });
@@ -847,55 +1235,167 @@ async function loadBands() {
     state.bands = data.bands || [];
     state.modelInfo = data;
   } catch (e) {
-    state.bands = [];
+    state.bands = state.bands || [];
   }
   drawHero();
 }
 
-function heroSignals() {
+function liveSignals() {
   const d = state.data;
   if (!d) return [];
   return (d.active || [])
     .filter((z) => z.signal)
     .sort((a, b) => (b.prob || 0) - (a.prob || 0));
 }
+const heroSignals = liveSignals;   // the old name still means "signals now"
+
+async function loadSignalFeed() {
+  try {
+    const r = await fetch("/api/journal?signals_only=1&limit=12&order=seen", { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (Array.isArray(d.items)) {
+      state.feed = { items: d.items, at: Date.now(), stats: d.stats || state.feed.stats, error: null };
+    }
+  } catch (e) {
+    // keep the previous copy on purpose: a network blip must never empty what is
+    // already on screen - that is the whole complaint this round fixes
+    if (!state.feed.items.length) {
+      state.feed = { items: [], at: 0, stats: state.feed.stats, error: friendlyError(e) };
+    }
+  }
+  safe(drawHero, "the signal strip");
+  // the visible grid only; the other tabs load when opened
+  if (state.ui.tab === "archive") safe(loadArchive, "the archive grid");
+}
+
+const SIGSTATE = {
+  live: ["live", "LIVE"],
+  target: ["win", "TARGET HIT"],
+  stopped: ["loss", "STOPPED"],
+  mitigated: ["flat", "MITIGATED"],
+  invalidated: ["flat", "INVALIDATED"],
+  untracked: ["flat", "NOT WATCHED"],
+  interrupted: ["flat", "INTERRUPTED"],
+};
+
+function archivedSignal(row) {
+  const side = String(row.direction || "").toUpperCase() === "SHORT" ? "high" : "low";
+  const open = row.status === "active" && !row.result;
+  return {
+    key: row.key, symbol: row.symbol, timeframe: row.timeframe, kind: row.kind, side,
+    grade: row.grade, prob: row.prob, net_r: row.net_r, fee_r: row.fee_r, tradable: !!row.tradable,
+    plan: { side: side === "high" ? "short" : "long", entry: row.entry, stop: row.stop,
+            target: row.target, rr: row.rr, risk_pct: row.risk_pct },
+    measured: { letter: row.grade, win: row.band_win, n: row.band_n },
+    time: row.formed_at, archived: true, result_r: row.result_r, plan_state: row.plan_state,
+    journalState: open ? "live" : (row.result || row.status || "mitigated"),
+  };
+}
+
+// live first (best measured chance first), then the stored ones, newest activity first
+function heroEntries() {
+  const live = liveSignals().slice(0, 12);
+  const seen = new Set(live.map((z) => z.key));
+  const stored = (state.feed.items || [])
+    .filter((row) => !seen.has(row.key))
+    .map(archivedSignal);
+  return { live, stored };
+}
 
 function drawHero() {
   const host = $("heroList");
   if (!host) return;
-  const list = heroSignals();
+  const { live, stored } = heroEntries();
+  const stats = (state.feed && state.feed.stats) || (state.data && state.data.journal) || {};
   const bands = state.bands || [];
   const aBand = bands.find((b) => b.letter === "A") || bands[0];
-  $("hNow").textContent = list.length;
-  $("hNow").style.color = list.length ? "#7dffc4" : "#5f7692";
+
+  $("hNow").textContent = live.length;
+  $("hNow").style.color = live.length ? "#7dffc4" : "#5f7692";
+  $("hKept").textContent = stats.signals != null ? stats.signals : 0;
+  $("hHit").textContent = stats.signal_hit_rate != null
+    ? Math.round(stats.signal_hit_rate * 100) + "%" : "–";
+  $("hHit").style.color = stats.signal_hit_rate == null ? "#5f7692"
+    : stats.signal_hit_rate >= 0.6 ? "#7dffc4" : "#ffb3c1";
+  $("hHit").title = stats.signal_decided
+    ? `${stats.signal_wins} of ${stats.signal_decided} finished signals reached their target`
+    : "no signal has finished yet";
   $("hWin").textContent = aBand ? Math.round(aBand.win * 100) + "%" : "–";
-  if (aBand) $("hPerDay").textContent = `· ${aBand.n} in 90d`;
-  const best = list[0];
-  $("hNet").textContent = best && best.net_r != null ? `${best.net_r > 0 ? "+" : ""}${best.net_r.toFixed(2)}R` : "–";
-  const perDay = aBand ? (aBand.n / 90).toFixed(1) : null;
-  $("hDaily").textContent = perDay ? perDay : "–";
+  if (aBand) $("hPerDay").textContent = ` · ${aBand.n} in 90d`;
+  const best = live[0];
+  $("hNet").textContent = best && best.net_r != null
+    ? `${best.net_r > 0 ? "+" : ""}${best.net_r.toFixed(2)}R` : "–";
+  $("hDaily") && ($("hDaily").textContent = aBand ? (aBand.n / 90).toFixed(1) : "–");
+
+  const shown = live.slice();
+  const room = Math.max(0, 12 - shown.length);
+  shown.push(...stored.slice(0, room));
+  const heroSig = [
+    stats.signals, stats.open, stats.signal_decided, stats.signal_hit_rate,
+    stats.signal_avg_r, aBand && aBand.letter, aBand && aBand.win,
+    shown.map((z) => `${z.key}:${z.journalState || "live"}:${z.prob ? z.prob.toFixed(2) : ""}`).join("|"),
+  ].join("~");
+  if (drawn.hero === heroSig && host.childElementCount) return;
+  drawn.hero = heroSig;
   host.innerHTML = "";
-  if (!list.length) {
+  if (!shown.length) {
     const e = el("div", "heroNone");
-    e.textContent = "No plan has cleared the 85% measured bar right now, so the page shows none. "
-      + "Switch quality to \"every ≥ 90% band\" to see the wider band, or wait for the next candle.";
+    e.textContent = "No plan has cleared the measured bar yet. The archive below already holds every signal the "
+      + "scanner has produced - the strip fills the moment a new one forms.";
     host.appendChild(e);
-    return;
+  } else {
+    shown.forEach((z) => host.appendChild(signalCard(z)));
   }
-  list.slice(0, 4).forEach((z) => host.appendChild(signalCard(z)));
+
+  const strip = $("heroStrip");
+  if (strip) {
+    strip.innerHTML = "";
+    const parts = [
+      [String(live.length), "live now"],
+      [String(stored.length), "kept and shown from the database"],
+      [String(stats.signal_decided || 0), "finished"],
+      [stats.signal_avg_r != null ? `${stats.signal_avg_r > 0 ? "+" : ""}${Number(stats.signal_avg_r).toFixed(2)}R` : "–", "average per finished signal"],
+    ];
+    parts.forEach(([v, label], i) => {
+      if (i) strip.appendChild(el("span", "sep", "·"));
+      const sp = el("span");
+      sp.appendChild(el("b", null, v));
+      sp.appendChild(document.createTextNode(" " + label));
+      strip.appendChild(sp);
+    });
+    const btn = el("button", "link", `all ${stats.signals != null ? stats.signals : ""} signals →`);
+    btn.onclick = () => {
+      setSignalTab("archive");
+      $("archivePanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    strip.appendChild(btn);
+  }
 }
 
 function signalCard(z) {
   const plan = planOf(z) || {};
   const short = (plan.side || (z.side === "high" ? "short" : "long")) === "short";
-  const node = el("div", "sigcard" + (short ? " sell" : ""));
+  const archived = !!z.archived;
+  const stateKey = archived ? (z.journalState || "mitigated") : "live";
+  const [cls, label] = SIGSTATE[stateKey] || ["flat", String(stateKey).toUpperCase()];
+  const node = el("div", "sigcard" + (short ? " sell" : "") + (archived && stateKey !== "live" ? " done" : ""));
+  node.dataset.key = z.key || "";
   const head = el("div", "sighead");
-  head.appendChild(el("span", "sym", z.symbol.replace("USDT", "") + "/USDT"));
+  head.appendChild(el("span", "sym", String(z.symbol || "").replace("_", "").replace("USDT", "") + "/USDT"));
   head.appendChild(el("span", "dir " + (short ? "short" : "long"), short ? "SHORT" : "LONG"));
+  if (archived) {
+    const badge = el("span", "sigstate " + cls, label);
+    badge.title = z.result_r != null
+      ? `finished: ${z.result_r > 0 ? "+" : ""}${Number(z.result_r).toFixed(2)}R against a 1R risk`
+      : "this signal is in the database; its outcome is not decided yet";
+    head.appendChild(badge);
+  }
   head.appendChild(el("span", "acc", probText(z)));
   node.appendChild(head);
   node.appendChild(el("div", "sigmeta",
-    `${z.timeframe} · ${(KINDS[z.kind] || {}).label || z.kind} · ${marketOf(z) === "futures" ? "fut" : "spot"}`));
+    `${z.timeframe} · ${(KINDS[z.kind] || {}).label || z.kind} · ${marketOf(z) === "futures" ? "fut" : "spot"}`
+    + (z.time ? ` · ${fmtTime(z.time)}` : "")));
   const row = el("div", "sigrow");
   [["entry", plan.entry], ["stop", plan.stop], ["target", plan.target]].forEach(([k, v]) => {
     const cell = el("div");
@@ -906,13 +1406,309 @@ function signalCard(z) {
   node.appendChild(row);
   const foot = el("div", "sigfoot");
   const m = z.measured;
-  foot.appendChild(el("span", null, m
+  foot.appendChild(el("span", null, m && m.win != null
     ? `${Math.round((m.win || 0) * 100)}% measured · ${Math.round((m.win || 0) * (m.n || 0))}/${m.n} out of sample`
     : "measurement loading"));
-  foot.appendChild(el("span", null, z.net_r != null ? `${z.net_r > 0 ? "+" : ""}${z.net_r.toFixed(2)}R after fees` : ""));
+  const tail = z.result_r != null
+    ? `${z.result_r > 0 ? "+" : ""}${Number(z.result_r).toFixed(2)}R booked`
+    : (z.net_r != null ? `${z.net_r > 0 ? "+" : ""}${z.net_r.toFixed(2)}R after fees` : "");
+  foot.appendChild(el("span", null, tail));
   node.appendChild(foot);
-  node.onclick = () => selectZone(z);
+  node.onclick = () => {
+    if (archived) openArchiveSignal(z);
+    else selectZone(z);
+  };
   return node;
+}
+
+// ------------------------------------------------------- the archive column
+/* ------------------------------------------------------- the side panel: live
+   One row per signal that is *happening now*, with the four numbers a trader
+   actually asks for: where is entry, how far is price from it, where is the
+   target and where is the stop. A bar shows how close the plan is to being
+   filled. This is the "what is going on in each live signal" view - it used to
+   be a paragraph on a card you had to open. */
+function drawLive() {
+  const host = $("liveList");
+  if (!host) return;
+  const sig = ((state.data && state.data.active) || [])
+    .filter((z) => z.signal)
+    .map((z) => `${z.key}:${z.plan_state || ""}:${z.prob ? z.prob.toFixed(2) : ""}`)
+    .sort().join("|");
+  if (drawn.live === sig && host.childElementCount) return;
+  drawn.live = sig;
+  const price = (state.data && state.data.price) || {};
+  const all = (state.data && state.data.active) || [];
+  const live = all.filter((z) => z.signal)
+    .sort((a, b) => (b.prob || 0) - (a.prob || 0));
+  const filled = live.filter((z) => z.plan_state === "filled");
+  const waiting = live.filter((z) => z.plan_state !== "filled");
+  if ($("nLive")) $("nLive").textContent = String(live.length);
+  if ($("liveSummary")) {
+    $("liveSummary").textContent = live.length
+      ? `${filled.length} filled · ${waiting.length} waiting for the entry`
+      : "Nothing live right now - the Archive tab still holds every signal.";
+  }
+  host.innerHTML = "";
+  if (!live.length) {
+    host.appendChild(el("div", "heroNone",
+      "no live signal at this second. Open the Archive tab: nothing that was ever shown has been thrown away."));
+    return;
+  }
+  live.forEach((z) => {
+    const plan = planOf(z) || {};
+    const short = plan.side === "short";
+    const stateKey = z.plan_state === "filled" ? "filled" : "waiting";
+    const px = price[z.symbol];
+    const dist = (v) => (px == null || v == null ? "–" : fmtPct(((v - px) / px) * 100));
+    const node = el("div", "lrow " + stateKey);
+    const head = el("div", "h");
+    head.appendChild(el("b", null, String(z.symbol || "").replace("_", "").replace("USDT", "") + "/USDT"));
+    head.appendChild(el("span", "dir " + (short ? "short" : "long"), short ? "SHORT" : "LONG"));
+    head.appendChild(el("span", "tfx", z.timeframe));
+    head.appendChild(el("span", "grade " + String(z.grade || "").toLowerCase().replace("+", "p"), z.grade || "–"));
+    head.appendChild(el("span", "prob " + ((z.prob || 0) >= 0.85 ? "hi" : "mid"), probText(z)));
+    const badge = el("span", "sigstate " + (stateKey === "filled" ? "live" : "flat"),
+      stateKey === "filled" ? "FILLED" : "WAITING");
+    badge.style.marginLeft = "auto";
+    head.appendChild(badge);
+    node.appendChild(head);
+
+    const nums = el("div", "nums");
+    [["entry", fmtPx(plan.entry), dist(plan.entry)],
+     ["target", fmtPx(plan.target), dist(plan.target)],
+     ["stop", fmtPx(plan.stop), dist(plan.stop)],
+     ["expected", z.net_r != null ? `${z.net_r > 0 ? "+" : ""}${Number(z.net_r).toFixed(2)}R` : "–",
+      (plan.rr != null ? `R:R ${plan.rr}` : "R:R –") + (z.tradable ? " · fee ok" : " · fee eats it")]]
+      .forEach(([k, v, extra]) => {
+      const cell = el("div");
+      cell.appendChild(el("span", null, k));
+      cell.appendChild(el("b", null, v));
+      if (extra) {
+        const sub = el("span", null, extra);
+        sub.style.letterSpacing = "0";
+        sub.style.textTransform = "none";
+        cell.appendChild(sub);
+      }
+      nums.appendChild(cell);
+    });
+    node.appendChild(nums);
+
+    // how far price still is from the entry, as a bar (0% = at the level)
+    if (px != null && plan.entry != null) {
+      const gap = Math.abs(plan.entry - px) / px;
+      const pct = Math.max(0, Math.min(100, 100 - Math.min(100, gap * 100 * 40)));
+      const bar = el("div", "bar2");
+      const fill = el("i");
+      fill.style.width = pct.toFixed(0) + "%";
+      bar.appendChild(fill);
+      bar.title = `${fmtPct(((plan.entry - px) / px) * 100)} from the entry`;
+      node.appendChild(bar);
+    }
+    const foot = el("div", "sigmeta");
+    foot.textContent = `${(KINDS[z.kind] || {}).label || z.kind} · formed ${fmtTime(z.time)} · ${ago(z.time)}`
+      + (plan.target_source ? ` · target = ${plan.target_source}` : "");
+    node.appendChild(foot);
+    node.onclick = () => selectZone(z);
+    host.appendChild(node);
+  });
+}
+
+/* --------------------------------------------------- the side panel: archive
+   Paged grid over the database. Filters are server-side, so "target hit" with
+   5,000 rows costs one query, not a client-side scan of everything. */
+const ARCH_STATUS = { all: "", live: "open", won: "target", lost: "stopped", invalid: "invalidated" };
+
+function archQuery(extra = {}) {
+  const p = new URLSearchParams({
+    signals_only: "1", limit: String(state.ui.aPer),
+    offset: String(state.ui.aPage * state.ui.aPer), order: "formed",
+  });
+  const status = ARCH_STATUS[state.ui.aFilter] ?? "";
+  if (status) p.set("status", status);
+  Object.entries(extra).forEach(([k, v]) => p.set(k, v));
+  return p.toString();
+}
+
+async function loadArchive() {
+  try {
+    const r = await fetch("/api/journal?" + archQuery(), { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (Array.isArray(d.items)) {
+      state.arch = { rows: d.items, total: d.total || d.items.length, at: Date.now(), error: null };
+      state.feed.stats = d.stats || state.feed.stats;
+    }
+  } catch (e) {
+    // never blank the grid because one request failed
+    state.arch.error = friendlyError(e);
+  }
+  safe(drawArchive, "the archive grid");
+  safe(drawHero, "the signal strip");
+}
+
+function archiveTile(row) {
+  const z = archivedSignal(row);
+  const accent = z.journalState === "stopped" ? "#ff5c7a"
+    : z.journalState === "target" ? "#2ee6a8"
+    : z.journalState === "live" ? "#63a8ff" : "#5f6c84";
+  const [cls, label] = SIGSTATE[z.journalState] || ["flat", String(z.journalState).toUpperCase()];
+  const short = z.plan.side === "short";
+  const node = el("div", "tile" + (z.journalState === "live" ? " live" : ""));
+  node.style.setProperty("--accent", accent);
+  node.dataset.key = row.key;
+  const t1 = el("div", "t1");
+  t1.appendChild(el("b", null, String(row.symbol || "").replace("_", "").replace("USDT", "") + "/USDT"));
+  t1.appendChild(el("span", "dir " + (short ? "short" : "long"), short ? "S" : "L"));
+  t1.appendChild(el("span", "tfx", row.timeframe));
+  t1.appendChild(el("span", "pct", probText(z)));
+  node.appendChild(t1);
+  const t3 = el("div", "t3");
+  t3.appendChild(el("span", "sigstate " + cls, label));
+  if (row.result_r != null) {
+    const rr = el("b", null, `${row.result_r > 0 ? "+" : ""}${Number(row.result_r).toFixed(2)}R`);
+    rr.style.fontSize = "10.5px";
+    rr.style.color = row.result_r > 0 ? "#2ee6a8" : "#ff8fa3";
+    t3.appendChild(rr);
+  }
+  t3.appendChild(el("span", null, row.grade || "–"));
+  node.appendChild(t3);
+  node.appendChild(el("div", "px", fmtPx(row.entry)));
+  const t2 = el("div", "t2");
+  const tp = el("span"); tp.appendChild(document.createTextNode("t ")); tp.appendChild(el("b", null, fmtPx(row.target)));
+  const sp = el("span"); sp.appendChild(document.createTextNode("s ")); sp.appendChild(el("b", null, fmtPx(row.stop)));
+  t2.appendChild(tp); t2.appendChild(sp);
+  node.appendChild(t2);
+  node.appendChild(el("div", "meta", fmtTime(row.formed_at)));
+  node.onclick = () => openArchiveSignal(z);
+  return node;
+}
+
+function archiveListRow(row) {
+  const z = archivedSignal(row);
+  const node = el("div", "feedx");
+  const accent = z.journalState === "stopped" ? "#ff5c7a"
+    : z.journalState === "target" ? "#2ee6a8"
+    : z.journalState === "live" ? "#63a8ff" : "#5f6c84";
+  node.style.setProperty("--accent", accent);
+  node.dataset.key = row.key;
+  const head = el("div", "head");
+  head.appendChild(el("span", "sym", String(row.symbol || "").replace("_", "").replace("USDT", "") + "/USDT"));
+  const short = z.plan.side === "short";
+  head.appendChild(el("span", "dir " + (short ? "short" : "long"), short ? "SHORT" : "LONG"));
+  const [cls, label] = SIGSTATE[z.journalState] || ["flat", String(z.journalState).toUpperCase()];
+  const badge = el("span", "sigstate " + cls, label);
+  badge.style.marginLeft = "auto";
+  head.appendChild(badge);
+  node.appendChild(head);
+  node.appendChild(el("div", "meta", `${row.timeframe} · ${row.grade || "–"} · ${probText(z)} · ${fmtTime(row.formed_at)}`));
+  node.appendChild(el("div", "lvl2",
+    `entry ${fmtPx(row.entry)} · stop ${fmtPx(row.stop)} · target ${fmtPx(row.target)}`
+    + (row.result_r != null ? ` · ${row.result_r > 0 ? "+" : ""}${Number(row.result_r).toFixed(2)}R` : "")));
+  node.onclick = () => openArchiveSignal(z);
+  return node;
+}
+
+function drawArchive() {
+  const host = $("archiveList");
+  if (!host) return;
+  const stats = (state.feed && state.feed.stats) || (state.data && state.data.journal) || {};
+  const meta = $("archiveMeta");
+  if (meta) {
+    meta.textContent = stats.signals != null
+      ? `${stats.signals} kept · ${stats.open || 0} open · ${stats.signal_decided || 0} finished`
+      : "reading the database…";
+  }
+  if ($("nArch")) $("nArch").textContent = String(stats.signals != null ? stats.signals : state.arch.total || 0);
+  const rows = state.arch.rows || [];
+  const archSig = [state.ui.aView, state.ui.aFilter, state.ui.aPage, state.arch.total,
+    rows.map((r) => `${r.key}:${r.status}:${r.result || ""}`).join("|")].join("~");
+  if (drawn.archive === archSig && host.childElementCount) return;
+  drawn.archive = archSig;
+  host.className = state.ui.aView === "list" ? "feedlist" : "siggrid";
+  host.innerHTML = "";
+  if (!rows.length) {
+    host.appendChild(el("div", "heroNone",
+      state.arch.error ? `the archive could not be read: ${state.arch.error}`
+        : "nothing matches this filter yet - a signal is stored the moment it forms"));
+  } else {
+    rows.forEach((row) => host.appendChild(
+      state.ui.aView === "list" ? archiveListRow(row) : archiveTile(row)
+    ));
+  }
+  const per = state.ui.aPer;
+  const from = state.arch.total ? state.ui.aPage * per + 1 : 0;
+  const to = Math.min(state.arch.total || 0, (state.ui.aPage + 1) * per);
+  if ($("archivePage")) {
+    $("archivePage").textContent = state.arch.total
+      ? `${from}–${to} of ${state.arch.total} · page ${state.ui.aPage + 1} of ${Math.max(1, Math.ceil(state.arch.total / per))}`
+      : "nothing to page";
+  }
+  if ($("btnArchPrev")) $("btnArchPrev").disabled = state.ui.aPage <= 0;
+  if ($("btnArchNext")) $("btnArchNext").disabled = to >= (state.arch.total || 0);
+}
+
+/* ---------------------------------------------------------- panel controls */
+function setSignalTab(tab) {
+  state.ui.tab = tab;
+  document.querySelectorAll("#signalTabs [data-stab]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.stab === tab);
+  });
+  [["live", "paneLive"], ["archive", "paneArchive"], ["tape", "paneTape"]].forEach(([id, pane]) => {
+    const node = $(pane);
+    if (node) node.classList.toggle("off", id !== tab);
+  });
+  if (tab === "archive") loadArchive();
+  if (tab === "live") drawLive();
+  if (tab === "tape") drawTape();
+}
+document.querySelectorAll("#signalTabs [data-stab]").forEach((b) => {
+  b.onclick = () => setSignalTab(b.dataset.stab);
+});
+
+document.querySelectorAll("#archFilters [data-afilter]").forEach((b) => {
+  b.onclick = () => {
+    state.ui.aFilter = b.dataset.afilter;
+    state.ui.aPage = 0;
+    document.querySelectorAll("#archFilters [data-afilter]").forEach((o) => o.classList.toggle("on", o === b));
+    loadArchive();
+  };
+});
+document.querySelectorAll("#archView [data-aview]").forEach((b) => {
+  b.onclick = () => {
+    state.ui.aView = b.dataset.aview;
+    document.querySelectorAll("#archView [data-aview]").forEach((o) => o.classList.toggle("on", o === b));
+    drawArchive();
+  };
+});
+$("btnLoadAll").onclick = loadAllActive;
+setInterval(() => {
+  // a "load every live zone" snapshot is only trusted for a couple of minutes
+  if (state.allActive && Date.now() - (state.allActiveAt || 0) > 120000) {
+    state.allActive = null;
+    drawCards();
+  }
+}, 30000);
+$("btnArchPrev").onclick = () => { if (state.ui.aPage > 0) { state.ui.aPage -= 1; loadArchive(); } };
+$("btnArchNext").onclick = () => { state.ui.aPage += 1; loadArchive(); };
+$("btnArchiveAll").onclick = () => { openDrawer("drawerJournal"); loadJournal(); };
+
+function openArchiveSignal(z) {
+  state.jFocus = z.key;
+  openDrawer("drawerJournal");
+  const sym = $("jSymbol");
+  if (sym) sym.value = String(z.symbol || "").replace("_USDT", "");
+  loadJournal().then(() => { drawJournal(); showJournalDetail(z.key); });
+}
+
+// one broken section must never take the whole page down with it
+function safe(fn, label) {
+  try {
+    return fn();
+  } catch (err) {
+    if (window.console) console.error(label || fn.name, err);
+    return null;
+  }
 }
 
 function onState() {
@@ -958,11 +1754,12 @@ function onState() {
   $("kActiveSub").textContent = `${ready} tradeable now · ${byKind.strong_low || 0} strong low`;
 
   drawTabs(active);
-  drawHero();
+  safe(drawHero, "the signal strip");
+  safe(drawLive, "the live tab");
   drawTfChips();
-  scheduleCards();
-  scheduleHistory();
-  drawTape();
+  safe(scheduleCards);
+  safe(scheduleHistory);
+  safe(drawTape);
   // keep the selected zone in step: it may have been mitigated since we drew it
   if (state.selected) {
     const fresh = allZones().concat((state.data.history || [])).find((z) => z.key === state.selected);
@@ -1004,6 +1801,9 @@ function scheduleCards() {
 
 function drawTabs(active) {
   const host = $("tabs");
+  const tabsSig = active.map((z) => z.kind).sort().join(",") + "|" + state.tab;
+  if (drawn.tabs === tabsSig && host.childElementCount) return;
+  drawn.tabs = tabsSig;
   const counts = {};
   active.forEach((z) => { counts[z.kind] = (counts[z.kind] || 0) + 1; });
   host.innerHTML = "";
@@ -1012,7 +1812,7 @@ function drawTabs(active) {
     const b = el("button", "tab" + (tab.cls ? " " + tab.cls : "") + (state.tab === tab.id ? " on" : ""));
     b.appendChild(el("span", null, tab.label));
     if (n) b.appendChild(el("span", "n", n));
-    b.onclick = () => { state.tab = tab.id; drawTabs(active); drawCards(); };
+    b.onclick = () => { state.tab = tab.id; resetCardPage(); drawTabs(active); drawCards(); };
     host.appendChild(b);
   });
 }
@@ -1046,11 +1846,39 @@ function statusLine(z) {
   return z.status;
 }
 
+function updateShownLine(items, page) {
+  const d2 = state.data || {};
+  const hidden = state.hiddenByQuality || 0;
+  const activeCount = items.filter((z) => z.status === "active").length;
+  const resolvedCount = items.length - activeCount;
+  const base = resolvedCount
+    ? `${items.length} shown · ${activeCount} active · ${resolvedCount} recently mitigated`
+    : `${items.length} shown`;
+  const capped = (d2.active_total || 0) > (d2.active_shown || 0) && !state.allActive;
+  const loadBtn = $("btnLoadAll");
+  if (loadBtn) loadBtn.classList.toggle("hidden", !capped);
+  const capNote = capped
+    ? ` · the frame carries ${d2.active_shown} of ${d2.active_total} live zones - load the rest`
+    : "";
+  const shownNow = page ? page.length : items.length;
+  const moreNote = page && items.length > shownNow
+    ? ` · showing ${shownNow} of ${items.length}` : "";
+  $("shown").textContent = (hidden ? `${base} · ${hidden} hidden by the quality filter` : base) + moreNote + capNote;
+  $("listMeta").textContent = items.length ? `${items.length} zones` : "";
+}
+
 function drawCards() {
   const host = $("cards");
   const items = visibleZones();
   const d = state.data || {};
   const price = d.price || {};
+  const page = items.slice(0, state.cardLimit);
+  const sig = [state.cardLimit, state.showMode, state.selected || "", items.length,
+    (d.active_total || 0), (d.active_shown || 0), state.historyItems.length,
+    page.map((z) => `${z.key}:${z.status}:${z.plan_state || ""}:${z.prob ? z.prob.toFixed(3) : "-"}`).join("|"),
+  ].join("~");
+  if (drawn.cards === sig && host.childElementCount) { updateShownLine(items, page); return; }
+  drawn.cards = sig;
   host.innerHTML = "";
   const activeCount = items.filter((z) => z.status === "active").length;
   const resolvedCount = items.length - activeCount;
@@ -1058,7 +1886,7 @@ function drawCards() {
   const base = resolvedCount
     ? `${items.length} shown · ${activeCount} active · ${resolvedCount} recently mitigated`
     : `${items.length} shown`;
-  $("shown").textContent = hidden ? `${base} · ${hidden} hidden by the quality filter` : base;
+  updateShownLine(items, page);
   $("listMeta").textContent = items.length ? `${items.length} zones` : "";
   if (!items.length) {
     const e = el("div", "empty");
@@ -1086,16 +1914,33 @@ function drawCards() {
       section.appendChild(el("div", "none", "no futures zone passes the current filters"));
     } else {
       const grid = el("div", "grid");
-      list.slice(0, 300).forEach((z) => grid.appendChild(card(z, price[z.symbol])));
+      list.slice(0, state.cardLimit).forEach((z) => grid.appendChild(card(z, price[z.symbol])));
       section.appendChild(grid);
+      if (list.length > state.cardLimit) {
+        const rest = el("div", "morebar");
+        const more = el("button", "btn ghost", `show ${Math.min(60, list.length - state.cardLimit)} more (${list.length - state.cardLimit} left)`);
+        more.onclick = () => { state.cardLimit += 60; forget("cards"); drawCards(); };
+        rest.appendChild(more);
+        const all = el("button", "btn ghost", "show all at once");
+        all.onclick = () => { state.cardLimit = list.length; forget("cards"); drawCards(); };
+        rest.appendChild(all);
+        section.appendChild(rest);
+      }
     }
     host.appendChild(section);
   });
 }
 
 function card(z, price) {
+  // A frame is replaced on every push, so the fetched detail is kept in its own
+  // cache and read from there - merging it into the pushed object was lost again
+  // 0.35 s later.
+  const full = detailCache.get(z.key) || z;
   const meta = KINDS[z.kind] || { label: z.kind, color: "#63a8ff", short: "?" };
-  const node = el("div", "zone" + (z.status !== "active" ? " resolved" : "") + (state.selected === z.key ? " sel" : ""));
+  // a filled plan is an open trade, not a resolved block: it must not be drawn
+  // dimmed (round 13)
+  const liveCard = z.status === "active" || z.plan_state === "filled";
+  const node = el("div", "zone" + (liveCard ? "" : " resolved") + (state.selected === z.key ? " sel" : ""));
   node.style.setProperty("--accent", meta.color);
 
   const r1 = el("div", "row1");
@@ -1109,27 +1954,41 @@ function card(z, price) {
   tag.style.borderColor = meta.color + "66";
   tag.style.background = meta.color + "14";
   r1.appendChild(tag);
+  // everything on the right travels as one group, so a narrow card wraps the
+  // group instead of letting a chip escape the box
+  const tags = el("div", "tags");
+  r1.appendChild(tags);
   if (z.grade) {
     const g = el("span", "grade " + String(z.grade).toLowerCase().replace("+", "p"), z.grade);
     g.title = probOf(z) == null
       ? "no measured probability for this zone (the model file is missing)"
       : `measured: ${probText(z)} of these plans reached their target before their stop `
         + `(90 days of real 1m BTC, checked on a held-out 90 days - docs/conditions.md)`;
-    r1.appendChild(g);
+    tags.appendChild(g);
   }
   const p = probOf(z);
   if (p != null) {
     const pc = el("span", "prob " + (p >= 0.85 ? "hi" : p >= 0.7 ? "mid" : "lo"), probText(z));
     pc.appendChild(el("small", null, " TARGET FIRST"));
-    pc.title = "measured chance that this plan reaches its liquidity target before its stop";
-    r1.appendChild(pc);
+    const n = sampleText(z);
+    if (n) pc.appendChild(el("small", "n", " · " + n));
+    pc.title = "measured chance that this plan reaches its liquidity target before its stop, "
+      + "checking 90 days the model never saw" + (n ? ` (${n} setups in this band)` : "");
+    tags.appendChild(pc);
   }
   if (z.tradable) {
     const t = el("span", "readytag", "TRADE-READY");
     t.title = "the measured edge survives the exchange fee on this plan";
-    r1.appendChild(t);
+    tags.appendChild(t);
   }
-  r1.appendChild(el("span", "status " + z.status, z.status === "active" ? "active" : z.status));
+  const statusText = z.plan_state === "filled" ? "IN TRADE"
+    : z.status === "active" ? "active" : z.status;
+  const statusChip = el("span", "status " + (z.plan_state === "filled" ? "filled" : z.status), statusText);
+  if (z.plan_state === "filled") {
+    statusChip.title = "price came back into the block and the plan is open - this trade stays on "
+      + "the live list until its target or its stop is hit";
+  }
+  tags.appendChild(statusChip);
   node.appendChild(r1);
 
   const lvl = el("div", "lvl");
@@ -1161,6 +2020,27 @@ function card(z, price) {
     node.classList.add("ready");
   } else if (nt.state === "range") {
     ctx.appendChild(el("span", "range", "range — the book says wait"));
+  }
+  // Round 13: the structure gate. A pattern in a range is still drawn - it is just
+  // never called a signal - and the card says which test it failed, so "why is
+  // there no signal" has an answer on screen.
+  const gate = z.gate || {};
+  if (z.restored) {
+    const r = el("div", "gate pass");
+    r.appendChild(el("span", null, "↺ adopted from the database at start-up - this plan was open "
+      + "when the scanner last stopped, and is being followed again"));
+    node.appendChild(r);
+  }
+  if (gate && (gate.ok != null)) {
+    const g = el("div", "gate " + (gate.ok ? "pass" : "fail"));
+    if (gate.ok) {
+      g.appendChild(el("span", null, `✓ trend aligned · ${gate.structure || ""}`
+        + (gate.htf ? ` · ${gate.htf_timeframe || "higher tf"} ${String(gate.htf).replace("trend_", "trend ")}` : "")
+        + (gate.location ? ` · ${gate.location}` : "")));
+    } else {
+      g.appendChild(el("span", null, "not a signal: " + ((gate.why || []).slice(0, 2).join(" · ") || "no structure reading")));
+    }
+    node.appendChild(g);
   }
   if (z.block_atr != null) ctx.appendChild(el("span", null, `block ${z.block_atr}×ATR`));
   if (z.disp_atr != null) ctx.appendChild(el("span", null, `leg ${z.disp_atr}×ATR`));
@@ -1196,12 +2076,23 @@ function card(z, price) {
       line2.textContent = `risk ${plan.risk_pct}% of price · plan costs ${z.fee_r == null ? "?" : z.fee_r + "R"} in fees`;
       box.appendChild(line2);
     }
+    // Round 13: the honest arithmetic behind a high hit rate. With R:R 0.3 a stop
+    // is worth three wins, which is how a "97 %" signal can still empty an account
+    // if it is sized like a certainty.
+    if (rr != null && rr > 0 && rr < 1) {
+      const pay = el("div", "src warn");
+      const wins = (1 / rr);
+      pay.textContent = `R:R ${rr} means one stop costs ${wins.toFixed(1)} wins - `
+        + `size the trade so a single loss is small, never as if the ${probText(z)} were a guarantee`;
+      pay.title = "the measured hit rate is not a promise; the payoff per win is smaller than the risk";
+      box.appendChild(pay);
+    }
     node.appendChild(box);
   }
 
   // why this one: the book's conditions, one by one
   if (z.cond_total) {
-    const missing = new Set(z.cond_missing || []);
+    const missing = zoneConds(z).missing;
     const box = el("div", "conds");
     const title = el("div", "src");
     title.textContent = `${z.cond_met}/${z.cond_total} of the book's conditions`;
@@ -1230,9 +2121,14 @@ function card(z, price) {
   }
 
   const ev = el("ul", "evid");
-  (z.evidence || []).slice(0, 5).forEach((text) => ev.appendChild(el("li", null, text)));
+  (full.evidence || []).slice(0, 5).forEach((text) => ev.appendChild(el("li", null, text)));
+  if (!(full.evidence || []).length) {
+    // a pushed row is lean on purpose; say where the detail comes from instead of
+    // looking empty
+    ev.appendChild(el("li", "muted", "opening this card loads its evidence…"));
+  }
   node.appendChild(ev);
-  const extra = [].concat(z.confluence || [], z.htf || []);
+  const extra = [].concat(full.confluence || full.htf || []);
   if (extra.length) {
     const conf = el("div", "conf");
     extra.slice(0, 4).forEach((text) => conf.appendChild(el("span", null, text)));
@@ -1247,11 +2143,11 @@ function card(z, price) {
 
   const foot = el("div", "foot");
   foot.appendChild(el("span", null, `${z.strength} condition${z.strength === 1 ? "" : "s"} met`));
-  if (z.ob && z.ob.color) {
-    foot.appendChild(el("span", null, `OB candle ${z.ob.color} ${fmtPx(z.ob.low)}–${fmtPx(z.ob.high)} @ ${fmtTime(z.ob.time)}`));
+  if (full.ob && full.ob.color) {
+    foot.appendChild(el("span", null, `OB candle ${full.ob.color} ${fmtPx(full.ob.low)}–${fmtPx(full.ob.high)} @ ${fmtTime(full.ob.time)}`));
   }
   foot.appendChild(el("span", null, statusLine(z)));
-  if (z.swept_level != null) foot.appendChild(el("span", null, `swept ${fmtPx(z.swept_level)}`));
+  if (full.swept_level != null) foot.appendChild(el("span", null, `swept ${fmtPx(full.swept_level)}`));
   node.appendChild(foot);
 
   node.onclick = () => selectZone(z);
@@ -1281,9 +2177,34 @@ chart.marginBars = function (span) {
   return Math.max(4, Math.round(span * this.marginFraction));
 };
 
+/* The frame carries what a card prints; the sentences are fetched for the one zone
+   the user opens. Cached, so opening the same card twice costs nothing. */
+const detailCache = new Map();
+async function loadZoneDetail(key) {
+  if (!key || detailCache.has(key)) return detailCache.get(key) || null;
+  try {
+    const r = await fetch("/api/zones/" + encodeURIComponent(key), { cache: "no-store" });
+    if (!r.ok) return null;
+    const body = await r.json();
+    const zone = body && body.zone;
+    if (!zone) return null;
+    detailCache.set(key, zone);
+    // merge into whatever the page is holding, so the card draws its evidence
+    [state.selectedZone, ...((state.data && state.data.active) || [])].forEach((item) => {
+      if (item && item.key === key) Object.assign(item, zone);
+    });
+    forget("cards");           // the card now has prose it did not have before
+    if (state.selected === key) drawCards();
+    return zone;
+  } catch (e) {
+    return null;
+  }
+}
+
 function selectZone(z) {
   state.selected = z.key;
   state.selectedZone = z;
+  loadZoneDetail(z.key);
   document.querySelectorAll(".zone.sel").forEach((n) => n.classList.remove("sel"));
   drawCards();
   openChart(z);
@@ -1733,8 +2654,12 @@ function drawChartMeta(z, last) {
 function drawTape() {
   const host = $("tape");
   const events = (state.data && state.data.events) || [];
+  const tapeSig = events.slice(0, 40).map((e) => `${e.type}:${(e.zone || {}).key}`).join("|");
+  if (drawn.tape === tapeSig && host.childElementCount) return;
+  drawn.tape = tapeSig;
   host.innerHTML = "";
   $("tapeCount").textContent = events.length ? `${events.length} recent` : "";
+  if ($("nTape")) $("nTape").textContent = String(events.length);
   if (!events.length) { host.appendChild(el("div", null, "Nothing detected yet — the tape fills as candles close.")); return; }
   events.slice(0, 40).forEach((ev) => {
     const z = ev.zone || {};
@@ -1752,7 +2677,7 @@ function drawTape() {
 }
 
 /* --------------------------------------------------------------- controls */
-$("search").oninput = (e) => { state.search = e.target.value.trim().toUpperCase(); drawCards(); };
+$("search").oninput = (e) => { state.search = e.target.value.trim().toUpperCase(); resetCardPage(); drawCards(); };
 $("showMode").onchange = (e) => {
   state.showMode = e.target.value;
   $("recentField").style.display = state.showMode === "recent" ? "" : "none";
@@ -1769,11 +2694,12 @@ $("market").onchange = (e) => {
 };
 $("quality").onchange = (e) => {
   state.quality = e.target.value;
+  resetCardPage();
   drawCards();
   if (chart.zone) renderChart();
 };
-$("showWeak").onchange = (e) => { state.showWeak = e.target.checked; drawCards(); };
-$("sort").onchange = (e) => { state.sort = e.target.value; drawCards(); };
+$("showWeak").onchange = (e) => { state.showWeak = e.target.checked; resetCardPage(); drawCards(); };
+$("sort").onchange = (e) => { state.sort = e.target.value; resetCardPage(); drawCards(); };
 $("btnSettings").onclick = () => openSettings();
 $("btnSymbols").onclick = () => { openDrawer("drawerSymbols"); drawUniverse(); loadUniverse(false); };
 $("btnHelp").onclick = () => openDrawer("drawerHelp");
@@ -1876,7 +2802,15 @@ function drawUniverse() {
   active.innerHTML = "";
   (state.data && state.data.symbols || []).forEach((sym) => {
     const row = el("div", "symrow");
-    row.appendChild(el("span", null, sym));
+    const left = el("div", "jleft");
+    left.appendChild(el("span", null, sym));
+    const d = (state.diag || {})[sym];
+    if (d) {
+      const cells = Object.entries(d.cells || {})
+        .map(([tf, c]) => `${tf} ${c.bars}${c.ready ? "" : "!"}`).join(" · ");
+      left.appendChild(el("div", "jmeta", cells + (d.problem ? ` · ${d.problem}` : "")));
+    }
+    row.appendChild(left);
     const b = el("button", "btn danger", "remove");
     b.onclick = () => removeSymbol(sym);
     row.appendChild(b);
@@ -1892,25 +2826,36 @@ async function postSymbols(body) {
     let data = null;
     try { data = await r.json(); } catch (e) { data = null; }
     if (!r.ok || !data) {
-      toast(`could not change the list (HTTP ${r.status})${data && data.detail ? ": " + String(data.detail).slice(0, 120) : ""}`);
+      const detail = data && data.detail ? ` (${String(data.detail).slice(0, 160)})` : "";
+      toast(friendlyError(`HTTP ${r.status}${detail}`), "err");
       return null;
     }
-    if (data.error) toast(String(data.error).slice(0, 160));
-    (data.warnings || []).forEach(toast);
+    if (data.error) toast(friendlyError(data.error), "err");
+    (data.warnings || []).forEach((w) => toast(w));
     return data;
   } catch (e) {
-    toast(`could not reach the server: ${String(e.message || e).slice(0, 120)}`);
+    toast(friendlyError(e), "err");
     return null;
   }
 }
+const adding = new Set();
 async function addSymbols(list) {
-  const res = await postSymbols({ add: list });
-  if (res && res.added && res.added.length) toast(`added ${res.added.length} instrument(s) - they warm up in the background`);
-  if (res) drawUniverse();
+  const key = list.join(",");
+  if (adding.has(key)) return;              // a second click must not double-add
+  adding.add(key);
+  try {
+    const res = await postSymbols({ add: list });
+    if (res && res.added && res.added.length) {
+      toast(`added ${res.added.length} instrument(s) - they warm up in the background`, "ok");
+    }
+    if (res) drawUniverse();
+  } finally {
+    adding.delete(key);
+  }
 }
 async function removeSymbol(sym) {
   const res = await postSymbols({ remove: [sym] });
-  if (res) drawUniverse();
+  if (res) { toast(`${sym} removed - its signals stay in the archive`, "ok"); drawUniverse(); }
 }
 $("uniSearch").oninput = drawUniverse;
 document.querySelectorAll("[data-uni-market]").forEach((b) => {
@@ -1921,6 +2866,33 @@ document.querySelectorAll("[data-uni-market]").forEach((b) => {
   };
 });
 $("btnRefreshUniverse").onclick = () => loadUniverse(true);
+
+/* "why does this contract show nothing?" answered with numbers, per instrument and
+   per timeframe - the same table /api/diagnostics serves. Warming is slow and the
+   exchange rate-limits; without this the drawer just looks empty. */
+async function loadDiagnostics() {
+  const btn = $("btnDiagnose");
+  btn.disabled = true;
+  btn.textContent = "reading…";
+  try {
+    const r = await fetch("/api/diagnostics", { cache: "no-store" });
+    const d = await r.json();
+    state.diag = {};
+    (d.items || []).forEach((row) => { state.diag[row.symbol] = row; });
+    const thin = (d.items || []).filter((row) => row.problem || !Object.values(row.cells || {}).some((c) => c.ready));
+    $("scanHealth").textContent = `${(d.items || []).length} instrument(s) · `
+      + `${d.warming ? `${d.warming.done}/${d.warming.total} warmed` : "warm-up finished"}`
+      + (thin.length ? ` · ${thin.length} short of history` : " · every instrument has enough history")
+      + (d.journal && d.journal.reaped ? ` · ${d.journal.reaped} old plan(s) closed as interrupted on restart` : "");
+    drawUniverse();
+  } catch (e) {
+    toast(friendlyError(e), "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Diagnose";
+  }
+}
+$("btnDiagnose").onclick = loadDiagnostics;
 // one path for both bulk buttons: the exchange list can be slow, rate-limited
 // or down, and the answer must say which of those happened instead of nothing
 async function addPreset(preset) {
@@ -1928,13 +2900,13 @@ async function addPreset(preset) {
   try {
     const r = await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset, market: state.uniMarket || "futures" }) });
     try { res = await r.json(); } catch (e) { res = null; }
-    if (!r.ok || !res) return toast(`could not read the exchange list (HTTP ${r.status}) - try "Refresh list" again`);
+    if (!r.ok || !res) return toast(friendlyError(`HTTP ${r.status} — could not read the exchange list`), "err");
   } catch (e) {
-    return toast(`could not reach the server: ${String(e.message || e).slice(0, 120)}`);
+    return toast(friendlyError(e), "err");
   }
-  if (res.error) return toast(String(res.error).slice(0, 160));
-  (res.warnings || []).forEach(toast);
-  toast(`added ${(res.added || []).length} instrument(s)`);
+  if (res.error) return toast(friendlyError(res.error), "err");
+  (res.warnings || []).forEach((w) => toast(w));
+  toast(`added ${(res.added || []).length} instrument(s)`, "ok");
   drawUniverse();
 }
 $("btnAdd50").onclick = () => addPreset("top50");
@@ -2174,29 +3146,37 @@ setInterval(() => {
 // ---------------------------------------------------------------- journal
 // Every signal is in the database, so the page can always show it again - even
 // after it has left the live list. This drawer is the user's record book.
-const journal = { rows: [], stats: {}, at: 0, busy: false };
+const journal = { rows: [], stats: {}, at: 0, busy: false, page: 0, per: 12, total: 0, view: "grid" };
 
-async function loadJournal() {
-  if (journal.busy) return;
-  journal.busy = true;
-  const params = new URLSearchParams({ limit: "300", signals_only: "1" });
+function journalParams(extra = {}) {
+  const params = new URLSearchParams({
+    limit: String(journal.per), offset: String(journal.page * journal.per),
+  });
   const sym = ($("jSymbol").value || "").trim();
   if (sym) params.set("symbol", sym);
   if ($("jGrade").value) params.set("grade", $("jGrade").value);
   if ($("jStatus").value) params.set("status", $("jStatus").value);
   const mins = Number($("jWindow").value || 0);
   if (mins) params.set("since", String(Date.now() - mins * 60000));
+  Object.entries(extra).forEach(([k, v]) => params.set(k, v));
+  return params;
+}
+
+async function loadJournal() {
+  if (journal.busy) return;
+  journal.busy = true;
   try {
-    const res = await fetch("/api/journal?" + params.toString(), { cache: "no-store" });
+    const res = await fetch("/api/journal?" + journalParams().toString(), { cache: "no-store" });
     const data = await res.json();
     journal.rows = data.items || [];
+    journal.total = data.total || journal.rows.length;
     journal.stats = data.stats || {};
     state.journalStats = journal.stats;
     journal.at = Date.now();
     drawJournal();
     onState();
   } catch (err) {
-    $("journalNote").textContent = "could not read the archive: " + err;
+    $("journalNote").textContent = "could not read the archive: " + friendlyError(err);
   } finally {
     journal.busy = false;
   }
@@ -2226,60 +3206,133 @@ function drawJournal() {
   }
   if (st.decided) stat("all graded rows", Math.round((st.hit_rate || 0) * 100) + `% of ${st.decided}`);
   if (st.avg_r != null) stat("all rows avg R", (st.avg_r > 0 ? "+" : "") + Number(st.avg_r).toFixed(2));
+  if (st.interrupted) stat("interrupted", st.interrupted, "#ffd479");
   stat("last 24 h of data", st.signals_last_24h || 0, "#7dffc4");
 
   const host = $("journalList");
+  host.className = journal.view === "list" ? "feedlist" : "siggrid";
+  host.style.padding = "0";
   host.innerHTML = "";
   if (!journal.rows.length) {
-    const e = el("div", "none", "nothing in the archive for this filter yet — a signal is stored the moment it forms");
-    host.appendChild(e);
+    host.appendChild(el("div", "heroNone",
+      "nothing in the archive for this filter yet — a signal is stored the moment it forms"));
+  } else {
+    journal.rows.forEach((row) => {
+      if (journal.view === "list") {
+        const node = archiveListRow(row);
+        host.appendChild(node);
+        return;
+      }
+      host.appendChild(archiveTile(row));
+    });
+  }
+  const per = journal.per;
+  const from = journal.total ? journal.page * per + 1 : 0;
+  const to = Math.min(journal.total || 0, (journal.page + 1) * per);
+  if ($("journalPage")) {
+    $("journalPage").textContent = journal.total
+      ? `${from}–${to} of ${journal.total} · page ${journal.page + 1} of ${Math.max(1, Math.ceil(journal.total / per))}`
+      : "nothing to page";
+  }
+  if ($("journalCount")) $("journalCount").textContent = journal.total ? `${journal.total} match this filter` : "";
+  if ($("btnJournalPrev")) $("btnJournalPrev").disabled = journal.page <= 0;
+  if ($("btnJournalNext")) $("btnJournalNext").disabled = to >= (journal.total || 0);
+}
+
+document.querySelectorAll("#journalView [data-jview]").forEach((b) => {
+  b.onclick = () => {
+    journal.view = b.dataset.jview;
+    document.querySelectorAll("#journalView [data-jview]").forEach((o) => o.classList.toggle("on", o === b));
+    drawJournal();
+  };
+});
+$("btnJournalPrev").onclick = () => { if (journal.page > 0) { journal.page -= 1; loadJournal(); } };
+$("btnJournalNext").onclick = () => { journal.page += 1; loadJournal(); };
+
+/* One stored signal, opened from the strip, the grid or the archive column. The
+   row is read back from the database, so it works even when the zone left the live
+   map hours ago - that is the point of storing it. */
+async function showJournalDetail(key) {
+  const host = $("journalDetail");
+  if (!host || !key) return;
+  host.classList.remove("hidden");
+  host.innerHTML = "";
+  host.appendChild(el("div", "note", "reading the record…"));
+  let row = null;
+  try {
+    const r = await fetch("/api/journal/" + encodeURIComponent(key), { cache: "no-store" });
+    if (r.ok) row = await r.json();
+  } catch (e) { /* fall back to the list */ }
+  if (!row) row = (journal.rows || []).find((x) => x.key === key) || null;
+  host.innerHTML = "";
+  if (!row) {
+    host.appendChild(el("div", "note", "that signal is not in the archive any more (this should not happen)."));
     return;
   }
-  journal.rows.forEach((row) => {
-    const node = el("div", "symrow jrow");
-    const left = el("div", "jleft");
-    const head = el("div", "jhead");
-    const dir = row.direction || (row.side === "high" ? "SHORT" : "LONG");
-    head.appendChild(el("b", null, row.symbol.replace("_", "").replace("USDT", "") + "/USDT"));
-    head.appendChild(el("span", "dir " + (dir === "SHORT" ? "short" : "long"), dir));
-    head.appendChild(el("span", "jtf", row.timeframe));
-    head.appendChild(el("span", "jgrade", `${row.grade || "–"} · ${row.prob != null ? Math.round(row.prob * 100) + "%" : "–"}`));
-    left.appendChild(head);
-    left.appendChild(el("div", "jmeta",
-      `${(KINDS[row.kind] || {}).label || row.kind} · formed ${fmtTime(row.formed_at)}`
-      + ` · ${row.cond_met}/${row.cond_total} conditions`));
-    const plan = `entry ${fmtPx(row.entry)} · stop ${fmtPx(row.stop)} · target ${fmtPx(row.target)}`
-      + (row.rr != null ? ` · ${row.rr}R` : "") + (row.fee_r != null ? ` · fee ${row.fee_r}R` : "");
-    left.appendChild(el("div", "jmeta", plan));
-    node.appendChild(left);
-    const state_ = row.result === "target" ? "TARGET ✅" : row.result === "stopped" ? "STOPPED"
-      : row.plan_state === "filled" ? "filled" : row.status === "active" ? "waiting" : row.status;
-    const tag = el("span", "jstate " + (row.result === "target" ? "win" : row.result === "stopped" ? "loss" : ""), state_);
-    node.appendChild(tag);
-    node.onclick = () => {
-      const live = [...(state.data && state.data.active || []), ...(state.data && state.data.history || [])]
-        .find((z) => z.key === row.key);
-      if (live) { closeDrawers(); selectZone(live); }
-      else toast(`${row.symbol} ${row.timeframe} · ${row.kind} · ${row.grade || "–"} — archived, this zone is no longer on the live map`);
-    };
-    host.appendChild(node);
-  });
+  const box = el("div", "plan");
+  box.style.borderColor = "#2ee6a8";
+  const head = el("div", "row jhead");
+  head.appendChild(el("b", null, String(row.symbol || "").replace("_", "").replace("USDT", "") + "/USDT"));
+  head.appendChild(el("span", "dir " + ((row.direction || "LONG") === "SHORT" ? "short" : "long"), row.direction || "LONG"));
+  head.appendChild(el("span", "jtf", row.timeframe));
+  head.appendChild(el("span", "jgrade", `${row.grade || "–"} · ${row.prob != null ? Math.round(row.prob * 100) + "%" : "–"}`));
+  const done = row.result === "target" ? "TARGET ✅" : row.result === "stopped" ? "STOPPED"
+    : row.status === "active" ? (row.plan_state || "open") : row.status;
+  const tag = el("span", "jstate " + (row.result === "target" ? "win" : row.result === "stopped" ? "loss" : ""), done);
+  tag.style.marginLeft = "auto";
+  head.appendChild(tag);
+  box.appendChild(head);
+  const line = (label, value) => {
+    const r = el("div", "row");
+    r.appendChild(el("span", null, label + " "));
+    r.appendChild(el("b", null, value));
+    return r;
+  };
+  box.appendChild(line("formed", fmtTime(row.formed_at)));
+  box.appendChild(line("entry", fmtPx(row.entry)));
+  box.appendChild(line("stop", fmtPx(row.stop)));
+  box.appendChild(line("target", fmtPx(row.target)));
+  box.appendChild(line("R:R", row.rr != null ? `${row.rr} · risk ${row.risk_pct}% of price` : "–"));
+  box.appendChild(line("cost", `${row.fee_r != null ? row.fee_r + "R in fees" : "–"} · ${row.net_r != null ? row.net_r + "R expected" : ""}`));
+  box.appendChild(line("measured", row.band_win != null
+    ? `${Math.round(row.band_win * 100)}% · ${Math.round(row.band_win * (row.band_n || 0))}/${row.band_n} out of sample` : "–"));
+  box.appendChild(line("conditions", `${row.cond_met}/${row.cond_total}`));
+  if (row.result_r != null) box.appendChild(line("result", `${row.result_r > 0 ? "+" : ""}${row.result_r}R`));
+  if (row.closed_at) box.appendChild(line("closed", fmtTime(row.closed_at)));
+  if (row.note) box.appendChild(el("div", "src", row.note));
+  const live = [...((state.data && state.data.active) || []), ...((state.data && state.data.history) || [])]
+    .find((z) => z.key === row.key);
+  if (live) {
+    const go = el("button", "btn ghost mini", "show on the chart");
+    go.style.marginTop = "7px";
+    go.onclick = () => { closeDrawers(); selectZone(live); };
+    box.appendChild(go);
+  }
+  host.appendChild(box);
+  const close = el("button", "link", "hide this record");
+  close.onclick = () => { host.classList.add("hidden"); host.innerHTML = ""; };
+  host.appendChild(close);
 }
 
 $("btnJournal").onclick = () => { openDrawer("drawerJournal"); loadJournal(); };
+$("btnArchiveAll").onclick = () => { openDrawer("drawerJournal"); loadJournal(); };
 $("btnJournalExport").onclick = () => {
   const params = new URLSearchParams({ limit: "5000", signals_only: "1" });
   if ($("jGrade").value) params.set("grade", $("jGrade").value);
   window.open("/api/journal.csv?" + params.toString(), "_blank");
 };
 ["jSymbol", "jGrade", "jStatus", "jWindow"].forEach((id) => {
-  $(id).oninput = () => { clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 250); };
-  $(id).onchange = () => { clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 120); };
+  $(id).oninput = () => { journal.page = 0; clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 250); };
+  $(id).onchange = () => { journal.page = 0; clearTimeout(journal.timer); journal.timer = setTimeout(loadJournal, 120); };
 });
 setInterval(() => { if (document.getElementById("drawerJournal").classList.contains("on")) loadJournal(); }, 20000);
 
 loadJournal();
 loadBands();
+loadSignalFeed();
+loadArchive();
+setSignalTab("live");
+setInterval(loadSignalFeed, 15000);
 connect();
 </script>
 </body>

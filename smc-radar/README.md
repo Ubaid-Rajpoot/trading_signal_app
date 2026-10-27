@@ -255,6 +255,138 @@ every zone comes back, with the reason it was hidden shown on its card.
   unchanged; the default quality filter is still A+ and A; old modes are one
   click away.
 
+### Round 13 — the contract list, the disappearing trade, and the range gate
+
+Five reported failures and one accusation, all fixed and measured:
+[`docs/round-13-range-gate-and-storage.md`](docs/round-13-range-gate-and-storage.md).
+
+* **`DecodingError: brotli ... can_accept_more_data() is False`** — the exchange
+  served plain JSON labelled `content-encoding: br`; a decoder with nothing left to
+  accept raises exactly that. The transport now reads the body **raw** and decides
+  itself (JSON by its first byte, gzip/deflate by magic, brotli if the package is
+  installed), so no third-party decoder can get stuck. The contract list is retried
+  on a backoff and the last good one is kept, with its age.
+* **`warm-up TON_USDT 1h: no kline`** — one timeframe without history no longer
+  empties the instrument: three attempts, then a **roll-up from 1m** (which always
+  exists), and only a symbol with no 1-minute history is reported (once, in
+  Diagnose).
+* **Noisy toasts** — "re-requesting history" speaks only when the set of thin
+  instruments changes; timeouts are 45 s with a retry; the replay's "map restarted"
+  note now explains itself.
+* **A trade vanished at the instant it opened.** A zone stopped being "active" the
+  moment price entered the block — which is when its plan fills. Liveness is now the
+  **plan**: a filled trade stays live until its target or stop, in the frame, in the
+  journal (`OPEN_SQL`) and in the "open now" count. Measured before the fix: 208
+  filled plans were missing from the live list.
+* **…and it survived a restart.** Open plans are **adopted** from SQLite at
+  start-up (`restore_hours: 12`, `restore_max: 150`), after the history loads, so the
+  arriving candles keep deciding them. A real restart adopted 150.
+* **Signals in a ranging market.** The book's own structure test is now code
+  (`MarketMap.structure` + `trade_gate`): HH+HL / LH+LL from confirmed swings, equal
+  highs/lows = liquidity not structure, a 79 % retracement = no structure, the
+  timeframe above must agree, and a sell belongs in premium / a buy in discount.
+  Every card prints the verdict or the reason it failed.
+* **The numbers, honestly** (90 held-out days, the plan as traded):
+  at p≥0.85 the gate moves the hit rate **95.4 % → 97.4 %** while removing **91 %**
+  of the signals and 0.02 R of expectancy. It is the book's rule and the user's
+  rule, so it ships on — and `"structure_gate": false` turns it off.
+* **Why the account emptied:** R:R 0.31 means **one stop costs 3.2 wins**; at a
+  "96 %" sounding size, one stop is the account. The card now says so in amber, and
+  every percentage carries its sample size (`97 % · n=151`).
+* The model was re-fitted on the plan the app **actually trades** (`--stop-mode
+  block`, stop beyond the block) — the old 97 % described a `level` stop nobody was
+  taking. New bands, holdout, gate on: A+ 98 % (n=44) · A 97 % (n=151) · B 92 %
+  (n=334) · C 84 % (n=661, −0.05 R → never a signal).
+
+### Round 12 — the signal that "disappeared", and why the app got slow
+
+Two reports, one cause each.
+
+* **"A signal vanished although it was neither filled nor invalidated."** It was not the
+  pattern engine and not the database: the pushed frame carried **the top 200 active
+  zones by probability**, so with more than 200 live zones the ones below the cut were
+  never sent — the page could not draw what it did not receive. Signals now **lead the
+  frame**, the cap can only ever drop a non-signal, and every frame says
+  `active_total / active_shown / signal_total / signals_shown`. The list header prints
+  *"the frame carries 200 of 960 live zones"* with a **load every live zone** button that
+  pulls the complete list in one request. The database never lost anything: a signal is
+  written when it forms, whatever the frame does — and `tools/ui/perf.mjs` checks every
+  live signal is readable from `/api/journal/{key}` with the same entry and stop.
+* **"The whole software became very slow."** Bytes, then rendering. A frame carried the
+  prose with it (~1.3 KB per zone) and went out 2–3 times a second: ~419 KB per frame. It
+  now carries only what a card prints (~0.57 KB), the cadence is paced by scan width
+  (0.35 s → 0.7 s at 60 instruments, 1.2 s up to 200, 2 s beyond), and the sentences are a
+  single request for the zone you actually open (`GET /api/zones/{key}`): **419 KB → 130 KB
+  per 200-zone frame, ≈0.1 MB/s instead of ≈1 MB/s**. On the page, every pane is drawn
+  only when its own signature changes and the list draws 60 cards at a time — an idle
+  frame now costs **2.0 ms and keeps the same DOM nodes**, where before it rebuilt 200
+  cards every 0.35 s.
+
+Detail, tables and the reproduce commands:
+[`docs/round-12-vanishing-and-speed.md`](docs/round-12-vanishing-and-speed.md).
+
+### Round 11 — signals are a grid, and the live ones get their own tab
+
+*"Signals are all in one line — if there are 200, do I slide along one by one? Can't there
+be a grid view? And a separate side tab for the live signals, so I can see what is
+happening in each."*
+
+* **The side panel is tabbed**: **Live now** (one row per live signal - entry, target,
+  stop, how far each is from the live price, expected R after fees, R:R, and whether it
+  is WAITING or FILLED), **Archive** (a paged grid of every stored signal with
+  server-side filters and a grid⇄list switch), and **Tape**.
+* **A real grid, not a sliding line**: tiles of `minmax(218px, 1fr)` - as many across as
+  the panel allows - each printing symbol, direction, timeframe, measured chance, state
+  badge, result in R, grade, entry, target, stop and time. `GET /api/journal` gained
+  `offset` and returns `total`, so the grid says `1–12 of 213 · page 1 of 18` and one
+  page is one indexed query. The top strip is a 12-tile grid too, with
+  `all N signals →` jumping into the archive tab; the **Journal** drawer is the
+  full-window version (1,000 px, same grid, own filters and pager).
+* **"what the badges mean"** sits inside the archive tab: LIVE · TARGET HIT · STOPPED ·
+  MITIGATED · INVALIDATED · INTERRUPTED / NOT WATCHED, each in one sentence - including
+  the two that matter when a signal seems to vanish.
+* **A real bug fell out of it**: only live zones were enriched, so a *resolved* zone
+  reached the page (and its archive tile) with no grade and no market. Everything that is
+  sent is enriched now; a test pins it.
+
+Detail: [`docs/round-11-signal-grid.md`](docs/round-11-signal-grid.md).
+
+### Round 10 — nothing vanishes, nothing spills, and the exchange cannot break a button
+
+Three things came back, and all three were fair:
+
+* **"Signals still vanish."** The round-9 archive stored them; four other paths still hid
+  or mis-stated them. The strip at the top showed *only* the live map, so a plan that hit
+  its target left the page while sitting safely in SQLite — the strip now merges the live
+  map with the database and keeps the finished ones on screen as **TARGET HIT / STOPPED /
+  MITIGATED**. `sync_journal()` no longer freezes a row whose probability fell below the
+  floor; removing an instrument marks its live rows **untracked** instead of leaving them
+  "active" for ever; a restart marks the plans it can no longer follow **interrupted**
+  (kept, with a note); and a decided outcome is now **final**, so replaying the same
+  candles cannot rewrite "target +1.6 R" into "stopped −1 R". Measured across two
+  processes on one database: 15 signals / 6 finished / 5 targets / **+0.245 R** in both
+  runs — the scoreboard is idempotent, and a failed poll can no longer empty the page.
+* **"Adding a coin throws `DecodingError: brotli: …`."** Real, and the scanner's fault:
+  every REST call used a default HTTP client that advertises `br`, and a body handed to a
+  reused brotli decoder throws `can_accept_more_data() is False` half-way. Requests now
+  advertise **`gzip, deflate` only**, retry once with `identity`, retry `429`/`5xx` but
+  never a `4xx`, and turn an unreadable body into an error that names the URL. The API
+  reports a broken exchange list as data (`ok: false`) instead of a 500, and the page
+  translates decoder/network/timeout text into a sentence. Toasts stack now instead of
+  overwriting one another.
+* **UI/UX.** The page uses the screen: `max-width` 2400 px, an `auto-fit` KPI band, and a
+  **third column from 1780 px** (cards · chart + tape · **signal archive**) so a wide
+  monitor is not two empty gutters. The card list is no longer a scroll box inside a
+  scrolling page (`max-height: 1120px; overflow-y: auto` clipped tall cards), the
+  right-hand chips wrap as one group, entry/stop/target use three shrinkable columns, and
+  every value is `overflow-wrap` inside a clipped card — content cannot leave the box any
+  more. `Symbols → Diagnose` prints bars per timeframe, zones and the warm-up error for
+  every instrument, and a script error now shows up as a toast instead of a page that
+  quietly stops updating.
+
+Full detail, the measured tables and the reproduce commands:
+[`docs/round-10-ui-and-integrity.md`](docs/round-10-ui-and-integrity.md).
+
 ### Round 9 — futures only, and a signal you cannot lose
 
 Three demands: *remove the spot side completely*, *futures must produce a lot of
@@ -444,7 +576,7 @@ cd smc-radar
 ../.venv/bin/python tools/fit_model.py --train study-data/BTCUSDT-1m-90d.csv \
     --holdout study-data/BTCUSDT-1m-90d-holdout.csv --target-atr-min 1.0   # docs/signals.md
 PORT=8891 bash tools/smoke.sh                          # HTTP/WS/SSE + start-up time + health
-cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node quality.mjs
+cd tools/ui && npm i && node chart.mjs && node transports.mjs && node algo1m.mjs && node perf.mjs && node quality.mjs && node layout.mjs
 ```
 
 The scan above runs on **real Binance 1-minute candles** for BTCUSDT,

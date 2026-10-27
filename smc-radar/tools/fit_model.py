@@ -64,12 +64,31 @@ FEATURES = (
 )
 
 
-def collect(bars: list[dict], symbol: str, timeframe: str, settings: dict) -> list:
+TIMEFRAME_PARENT = {"1m": "5m", "3m": "5m", "5m": "15m", "15m": "30m", "30m": "1h", "1h": "1h"}
+
+
+def collect(bars: list[dict], symbol: str, timeframe: str, settings: dict,
+            parent_bars: list[dict] | None = None) -> list:
     """Every zone the map produced, in formation order (no look-ahead: the map
-    only ever sees the candles up to that point)."""
+    only ever sees the candles up to that point).
+
+    Round 13: when the timeframe above is supplied, it is stepped in lock-step and
+    handed to the map as ``context`` **before** each bar - exactly what the running
+    app does - so the structure gate is measured on the same information the live
+    scanner has, and never on a future candle.
+    """
     map_ = MarketMap(symbol, timeframe, settings)
+    parent_tf = TIMEFRAME_PARENT.get(timeframe, timeframe)
+    parent = MarketMap(symbol, parent_tf, settings) if parent_bars else None
+    parent_index = 0
     seen: dict[str, object] = {}
     for bar in bars:
+        if parent is not None and parent_bars is not None:
+            while (parent_index < len(parent_bars)
+                   and int(parent_bars[parent_index]["close_time"]) <= int(bar["close_time"])):
+                parent.add(parent_bars[parent_index])
+                parent_index += 1
+            map_.context = {**parent.structure(), "timeframe": parent_tf} if parent.bars else {}
         map_.add(bar)
         for zone in map_.zones:
             seen.setdefault(zone.key, zone)
@@ -77,12 +96,15 @@ def collect(bars: list[dict], symbol: str, timeframe: str, settings: dict) -> li
 
 
 def rows_for(csv: str, settings: dict, symbol: str = "BTCUSDT",
-             timeframes: tuple[str, ...] = TIMEFRAMES) -> list[dict]:
+             timeframes: tuple[str, ...] = TIMEFRAMES, with_context: bool = True) -> list[dict]:
     out: list[dict] = []
     maker, taker = float(settings["fee_maker_bps"]), float(settings["fee_taker_bps"])
+    raw = read_csv(Path(csv))
     for tf in timeframes:
-        bars = roll(read_csv(Path(csv)), tf)
-        for zone in collect(bars, symbol, tf, settings):
+        bars = roll(raw, tf)
+        parent_tf = TIMEFRAME_PARENT.get(tf, tf)
+        parent_bars = roll(raw, parent_tf) if with_context and parent_tf != tf else None
+        for zone in collect(bars, symbol, tf, settings, parent_bars):
             plan = zone.plan or {}
             if plan.get("target") is None:
                 continue
@@ -97,8 +119,14 @@ def rows_for(csv: str, settings: dict, symbol: str = "BTCUSDT",
             # both sides, a stop crosses the spread and pays taker on the way out
             bps = (maker + maker) if res["result"] == "target" else (maker + taker)
             fee_r = bps / 1e4 / (risk_pct / 100.0)
+            gate = zone.gate or {}
             out.append(
                 {
+                    "gate": bool(gate.get("ok")),
+                    "gate_why": (gate.get("why") or [None])[0],
+                    "structure": gate.get("structure"),
+                    "htf_state": gate.get("htf"),
+                    "location": gate.get("location"),
                     "kind": zone.kind, "side": zone.side, "tf": tf, "time": int(zone.time),
                     "conds": dict(zone.conds or {}), "rr": float(plan.get("rr") or 0.0),
                     "risk_pct": risk_pct, "block_atr": float(zone.block_atr or 0.0),
@@ -182,9 +210,14 @@ def wilson(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, centre - spread), min(1.0, centre + spread))
 
 
-def gate(rows: list[dict], p: list[float], cut: float, fee_max: float) -> dict:
-    """The signals a cut of ``cut`` produces, net of the fee."""
-    sel = [i for i in range(len(rows)) if p[i] >= cut and rows[i]["fee_r"] <= fee_max]
+def gate(rows: list[dict], p: list[float], cut: float, fee_max: float,
+         structure_only: bool = False) -> dict:
+    """The signals a cut of ``cut`` produces, net of the fee (and of the structure gate)."""
+    sel = [
+        i for i in range(len(rows))
+        if p[i] >= cut and rows[i]["fee_r"] <= fee_max
+        and (rows[i].get("gate") if structure_only else True)
+    ]
     if not sel:
         return {"n": 0, "win": None, "net": None, "rr": None, "fee_r": None}
     wins = int(sum(rows[i]["win"] for i in sel))
@@ -200,7 +233,8 @@ def gate(rows: list[dict], p: list[float], cut: float, fee_max: float) -> dict:
     }
 
 
-def report(name: str, rows: list[dict], p: list[float], fee_max: float, days: float) -> dict:
+def report(name: str, rows: list[dict], p: list[float], fee_max: float, days: float,
+           structure_only: bool = False) -> dict:
     table: dict[str, dict] = {}
     win = sum(r["win"] for r in rows) / len(rows) if rows else 0.0
     net = sum(r["net"] for r in rows) / len(rows) if rows else 0.0
@@ -209,7 +243,7 @@ def report(name: str, rows: list[dict], p: list[float], fee_max: float, days: fl
     table["all"] = {"n": len(rows), "win": win, "net": net,
                     "auc": auc(p, [r["win"] for r in rows]), "days": days}
     for cut in (0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95):
-        g = gate(rows, p, cut, fee_max)
+        g = gate(rows, p, cut, fee_max, structure_only=structure_only)
         table[f"p>={cut}"] = g
         if not g["n"]:
             continue
@@ -244,6 +278,10 @@ def main() -> int:
     ap.add_argument("--timeframes", default=",".join(TIMEFRAMES))
     ap.add_argument("--target-atr-min", type=float, default=1.0)
     ap.add_argument("--stop-mode", default="level", choices=("level", "block"))
+    ap.add_argument("--gate", action="store_true",
+                    help="fit on, and report, only the setups the structure gate allows "
+                         "(trending structure on this timeframe AND the one above, "
+                         "premium/discount location)")
     ap.add_argument("--out", default="bot/signal_model.json", help="where to write the model")
     args = ap.parse_args()
     tfs = tuple(t.strip() for t in args.timeframes.split(",") if t.strip())
@@ -252,10 +290,18 @@ def main() -> int:
     print(f"target minimum {args.target_atr_min} ATR · stop mode {args.stop_mode} · "
           f"timeframes {', '.join(tfs)}")
 
+    gated = bool(args.gate)
     train = rows_for(args.train, settings, args.symbol, tfs)
     hold = rows_for(args.holdout, settings, args.symbol, tfs)
     days_train = 90.0
     days_hold = 90.0
+    # The weights are fitted on **every** plan (the model's job is to rank the
+    # chance that a plan pays, whatever the market), while the numbers the page
+    # prints - the bands - are measured on the setups the structure gate lets
+    # through, because those are the ones that are ever offered as signals.
+    print(f"structure gate: {'ON (reported with the gate on)' if gated else 'off'} · "
+          f"{sum(1 for r in train if r['gate'])}/{len(train)} training setups pass it, "
+          f"{sum(1 for r in hold if r['gate'])}/{len(hold)} in the holdout")
     w = fit([vector(r) for r in train], [r["win"] for r in train])
 
     print("\nweights (what the app ships):")
@@ -263,9 +309,10 @@ def main() -> int:
         print(f"  {name:<18}{value:+.3f}")
 
     print(f"\n{'group':<22}{'plans':>7}{'win':>7}{'net R':>8}{'AUC':>7}")
-    results = {"train": report("train (fitted)", train, predict(w, [vector(r) for r in train]), 0.30, days_train)}
+    results = {"train": report("train (fitted)", train, predict(w, [vector(r) for r in train]), 0.30,
+                               days_train, structure_only=gated)}
     p_hold = predict(w, [vector(r) for r in hold])
-    results["holdout"] = report("holdout (unseen 90d)", hold, p_hold, 0.30, days_hold)
+    results["holdout"] = report("holdout (unseen 90d)", hold, p_hold, 0.30, days_hold, structure_only=gated)
     print()
     results["calibration"] = calibration(hold, p_hold)
 
@@ -275,7 +322,7 @@ def main() -> int:
         idx = [i for i, r in enumerate(hold) if r["tf"] == tf]
         rows = [hold[i] for i in idx]
         p = [p_hold[i] for i in idx]
-        g = gate(rows, p, 0.85, 0.30)
+        g = gate(rows, p, 0.85, 0.30, structure_only=gated)
         per_tf[tf] = g
         print(f"  {tf:<4} plans {len(rows):>6}  all: win {sum(r['win'] for r in rows)/max(1,len(rows)):>4.0%} "
               f"net {sum(r['net'] for r in rows)/max(1,len(rows)):>+5.2f}   "
@@ -287,7 +334,7 @@ def main() -> int:
     cuts = {"A+": 0.90, "A": 0.85, "B": 0.75, "C": 0.60}
     bands = []
     for letter, cut in cuts.items():
-        g = gate(hold, p_hold, cut, 0.30)
+        g = gate(hold, p_hold, cut, 0.30, structure_only=gated)
         bands.append({"letter": letter, "cut": cut, "win": round(g["win"] or 0.0, 4),
                       "n": g["n"], "net": round(g["net"] or 0.0, 3),
                       "ci95": g["ci95"] if g["n"] else [0.0, 1.0]})
@@ -312,7 +359,17 @@ def main() -> int:
         "fees_bps": {"maker": DEFAULTS["fee_maker_bps"], "taker": DEFAULTS["fee_taker_bps"]},
         "command": (f"python tools/fit_model.py --train {args.train} --holdout {args.holdout}"
                     f" --target-atr-min {args.target_atr_min} --stop-mode {args.stop_mode}"),
-        "target": "P(the plan's target is reached before its stop), out of sample",
+        "gate": {
+            "applied_to_bands": gated,
+            "rule": ("a signal needs trending structure on its own timeframe AND on the one above it, "
+                     "with the trade aligned to it, and a short in premium / a long in discount"),
+            "pass_rate_train": round(sum(1 for r in train if r["gate"]) / max(1, len(train)), 4),
+            "pass_rate_holdout": round(sum(1 for r in hold if r["gate"]) / max(1, len(hold)), 4),
+        },
+        "target": ("P(this plan - the next liquidity level as the target, the stop beyond the block as "
+                   "the app trades it - reaches its target before its stop), measured on 90 days the "
+                   "model never saw"),
+        "plan": {"stop_mode": args.stop_mode, "target_atr_min": args.target_atr_min},
     }
     out = ROOT / args.out
     out.write_text(json.dumps(model, indent=1) + "\n")
