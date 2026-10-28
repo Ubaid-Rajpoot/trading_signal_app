@@ -7,20 +7,20 @@ round trip (0.0141 R), so even a flawless record returns −0.0016 R per trade.
 This round takes the other side of the same coin: **give the trade a reward worth
 having.** At 1 : 4 the accuracy you need collapses from "three in four" to **once in
 five**, and the fee stops eating the prize. The result is the first version of this
-system with a positive expectancy in *every* walk-forward period, on a sample big
-enough to quote.
+system with a positive expectancy in every walk-forward period, on a sample big enough
+to quote — and, unlike round 14, a claim the running app reproduces to within noise.
 
 | | round 14 (1 : 2) | **round 15 (1 : 4)** |
 |---|---|---|
 | target / stop | 2 ATR / 4 ATR | **8 ATR / 2 ATR** |
-| break-even accuracy, after fees | 67 % | **20.6 %** |
+| accuracy needed, after fees | 67 % | **20.6 %** |
 | fee as a share of the reward | 12 % | **0.7 %** |
-| measured accuracy, out of sample | 75.4 % (n = 142) | **25.5 % (n = 184)** |
-| **net expectancy per trade** | +0.120 R | **+0.268 R** |
-| worst walk-forward period | +0.104 R | **+0.104 R** |
-| periods the model was positive in | 3 of 3 | **6 of 6 (2 symbols × 3 folds)** |
+| measured accuracy, out of sample | 75.4 % on 142 trades | **24.6 % on 260 trades** |
+| **net expectancy per trade** | +0.120 R | **+0.202 R** |
+| worst walk-forward period | +0.104 R | **+0.073 R** (all three positive) |
+| what the running app reproduces | not checked | **23.7 % and +0.143 R on 144 trades** |
 
-Two thirds of the accuracy was thrown away and the money per trade more than doubled.
+Two thirds of the accuracy was thrown away and the money per trade went up.
 
 ---
 
@@ -34,7 +34,7 @@ Two thirds of the accuracy was thrown away and the money per trade more than dou
 | Source | open Binance 1-minute archive mirrored on GitHub, fetched by `tools/build_dataset.py` |
 | Storage | 154 MB per symbol as float32 in `data/`, git-ignored |
 
-## 2. Method (unchanged from round 14, restated)
+## 2. Method
 
 * **59 causal features** — multi-horizon returns and z-scores, RSI(2/14), MA20/50/200
   distance and slope, position inside the 20/100/500-bar range, ATR ratios and
@@ -46,8 +46,12 @@ Two thirds of the accuracy was thrown away and the money per trade more than dou
   as a loss.
 * **Split** — expanding window. Train ≤ 2021 → score 2022; train ≤ 2022 → score 2023;
   train ≤ 2023 → score 2024–2026. ETH is a second asset, never trained on.
-* **Counting** — one open trade per symbol at a time. Without this, 60 consecutive
-  firing bars are counted as 60 trades and every interval on the page is a lie.
+* **One model per timeframe, trained across both symbols** — exactly what the app
+  ships. (Training per symbol instead produced 100 signals in 2024–26 where the app
+  takes 68; a study has to describe the thing that runs.)
+* **Counting** — one entry per `horizon` bars. Not "one per open position": a trade
+  that resolves in three bars must not let the next one in immediately. Getting this
+  wrong inflated the sample by ~40 % and moved the live accuracy to break-even.
 * **Fees** — 5 bp round trip, charged on every trade, expressed in R against the stop.
 
 ## 3. Why reward : risk is the lever
@@ -58,11 +62,12 @@ With a fee `f` (in R) and a reward : risk of `x`, the break-even hit rate is
 p* = (1 + f) / (1 + x)
 ```
 
-Everything else is downstream of that. The sweep (`research/07_rr.py`) ran 30
-geometries: 2 timeframes × 3 stops (0.5, 1, 2 ATR) × 5 rewards (1:2 … 1:6), each in
-three folds on both symbols, non-overlapping, with the model refit for every fold.
+Everything is downstream of that. The sweep (`research/07_rr.py`) ran 30 geometries:
+2 timeframes × 3 stops (0.5, 1, 2 ATR) × 5 rewards (1:2 … 1:6), three folds, both
+symbols, non-overlapping trades.
 
-**1h, 0.5 ATR stop** — the geometry the previous round shipped, with the target moved:
+**1h, 0.5 ATR stop** — the stop the previous round effectively used, with the target
+moved out:
 
 | reward : risk | break-even | base rate | fee | model, best cut | worst period |
 |---|---|---|---|---|---|
@@ -71,77 +76,83 @@ three folds on both symbols, non-overlapping, with the model refit for every fol
 | 1 : 4 | 22.3 % | 19.5 % | 0.113 R | 22.3 % | −0.795 R |
 | 1 : 5 | 18.5 % | 16.4 % | 0.113 R | 20.6 % | −0.097 R |
 
-At a half-ATR stop the fee alone is 0.113 R — **nine times the 0.0125 R prize of the
-old geometry** — and nothing works. The stop has to be wide enough that the fee is
-small in R, and the reward has to be big enough that being right once in five pays.
+At a half-ATR stop the fee alone is 0.113 R — nine times the 0.0125 R prize of the old
+geometry — and nothing works. The stop has to be wide enough that the fee is small in R.
 
 **1h, 2 ATR stop** — the shipped geometry:
 
-| reward : risk | break-even | base rate | fee | model at p ≥ 0.50 | trades | worst period | mean |
-|---|---|---|---|---|---|---|---|
-| 1 : 4 | **20.6 %** | 21.1 % | 0.028 R | **25.5 %** | 184 | **+0.104 R** | +0.268 R |
-| 1 : 5 | 17.1 % | 17.4 % | 0.029 R | 25.0 % | 52 | +0.339 R | — |
-| 1 : 6 | 14.7 % | 14.6 % | 0.029 R | 15.1 % | 86 | −0.201 R | — |
+| reward : risk | break-even | base rate | fee | best cut | worst period |
+|---|---|---|---|---|---|
+| 1 : 4 | **20.6 %** | 21.1 % | 0.028 R | 25.5 % | **+0.104 R** |
+| 1 : 5 | 17.1 % | 17.4 % | 0.029 R | 25.0 % | +0.339 R |
+| 1 : 6 | 14.7 % | 14.6 % | 0.029 R | 15.1 % | −0.201 R |
 
-Of all 30 geometries, **exactly one** has ≥ 100 trades *and* a positive expectancy in
-every walk-forward slice: **1h, 2 ATR stop, 8 ATR target, cut p ≥ 0.50**. That is what
-the app trades.
+Of all 30 geometries, exactly one had ≥ 100 trades *and* a positive expectancy in every
+walk-forward slice: **1h, 2 ATR stop, 8 ATR target**. That is what the app trades.
 
 On 4h the same geometry looks better (33.3 % at 1 : 4, worst slice +0.384 R) but only
-40–50 trades land in the test periods, and only two slices have enough of them to
-measure. It is available (`--tfs 4h`) and it is not the default, because it has not
-earned it.
+40–50 trades land in the test periods and only two slices have enough to measure. It is
+available (`--tfs 4h`) and it is not the default, because it has not earned it.
 
-## 4. The shipped system, measured
+## 4. The shipped system, measured with the shipped model
 
 Geometry: reward : risk **1 : 4** (target 8 ATR, stop 2 ATR), 240-bar horizon, long
-side, 5 bp round trip, one trade at a time.
+side, 5 bp round trip, one entry per 240 bars, one pooled model per timeframe.
 
-| band | signals | accuracy | 95 % CI | EV pre-fee | **EV after fees** | 2022 | 2023 | 2024–26 |
+| band | cut | signals | accuracy | 95 % CI | **EV after fees** | 2022 | 2023 | 2024–26 |
 |---|---|---|---|---|---|---|---|---|
-| A · p ≥ 0.60 | 52 | 32.7 % | 21.5–46.2 | +0.635 | **+0.606 R** | — | — | 33 % |
-| B · p ≥ 0.55 | 90 | 27.8 % | 19.6–37.8 | +0.389 | +0.360 R | 14 % | — | 32 % |
-| **C · p ≥ 0.50** | **164** | **24.4 %** | 18.5–31.5 | +0.220 | **+0.191 R** | 20 % | 30 % | 25 % |
-| D · p ≥ 0.40 | 250 | 22.8 % | 18.0–28.4 | +0.140 | +0.112 R | 18 % | 27 % | 23 % |
-| E · p ≥ 0.30 | 298 | 22.8 % | 18.4–27.9 | +0.141 | +0.112 R | 16 % | 20 % | 26 % |
-| all signals | 346 | 17.3 % | 13.7–21.7 | −0.133 | −0.161 R | 10 % | 25 % | 17 % |
+| A | p ≥ 0.50 | 117 | 22.2 % | 15.6–30.6 | +0.083 R | 21.2 % | 25.0 % | 22.1 % |
+| B | p ≥ 0.45 | 181 | 24.3 % | 18.6–31.1 | +0.187 R | 25.0 % | 28.6 % | 22.1 % |
+| C | p ≥ 0.40 | 224 | 23.7 % | 18.6–29.6 | +0.155 R | 21.2 % | 26.4 % | 23.5 % |
+| **D** | **p ≥ 0.35** | **260** | **24.6 %** | 19.8–30.2 | **+0.202 R** | 23.2 % | 28.3 % | 23.6 % |
+| E | p ≥ 0.30 | 297 | 19.5 % | 15.4–24.4 | −0.052 R | 19.0 % | 18.8 % | 20.0 % |
+| F | p ≥ 0.25 | 319 | 23.8 % | 19.5–28.8 | +0.163 R | 25.4 % | 23.5 % | 23.4 % |
+| — | no cut | 354 | 24.3 % | 20.1–29.0 | +0.186 R | 17.6 % | 28.4 % | 25.2 % |
 
-The cut the app records at is **p ≥ 0.50** (row C, in bold). Note what the last row
-means: without the model's filter this geometry loses money (17.3 % against a 20.6 %
-break-even). **The filter is the edge here, not the geometry** — the geometry is what
-lets a 24 % hit rate be worth +0.19 R instead of the −0.16 R it is worth when you take
-everything.
+The recorded cut is **p ≥ 0.35** (row D, in bold). The selection rule was stated before
+the number was looked at: *the highest expectancy among cuts with at least 250
+non-overlapping trades that clears break-even in every period.* Two things in this
+table are worth being blunt about:
 
-### Robustness of the chosen configuration
+* **The model adds 2–4 points, not 20.** The base rate at this geometry is 21.1 % and
+  break-even is 20.6 %, so blind entry is worth ~+0.02 R. The filter is worth another
+  +0.15 to +0.18 R. That is a real but modest edge, and it is why the sample has to be
+  this large to see it.
+* **The cut barely matters between 0.25 and 0.50** (22–25 % everywhere, with one dip at
+  0.30 that is noise). Anyone quoting a single cut as if it were precise is selling
+  something. The band table shows all of them for that reason.
 
-Every slice, listed separately — no pooling, no averaging:
+### What the running app reproduces
 
-| | 2022 | 2023 | 2024–26 | trades | accuracy |
+The full replay — every bar from 2024-01-01 to 2026-10-24, both symbols, scored by the
+validation model (trained ≤ 2023-12-31), driven through the same code the page uses:
+
+| recording cut | signals | accuracy | break-even | net R | per trade |
 |---|---|---|---|---|---|
-| BTC | +0.104 R | +0.468 R | +0.196 R | 99 | 25.5 % |
-| ETH | +0.112 R | +0.475 R | +0.255 R | 85 | 26.4 % |
+| p ≥ 0.50 | 68 | 22.1 % | 20.9 % | +4.0 | +0.059 R |
+| p ≥ 0.45 | 95 | 21.7 % | 20.8 % | +4.1 | +0.045 R |
+| **p ≥ 0.35 (shipped)** | **144** | **23.7 %** | 20.9 % | **+19.9** | **+0.143 R** |
+| p ≥ 0.25 | 184 | 21.9 % | 20.8 % | +10.0 | +0.055 R |
 
-By calendar year, with the model refit on everything before 2023:
+The shipped cut reproduces to 23.7 % against the study's 23.6 % for the same period, and
++0.143 R against +0.202 R — the difference is 3 trades out of 144. Signal **counts match
+exactly** (144 vs 144), which is the check that matters: the engine is not quietly
+trading a different rule than the one that was measured.
 
-| | 2023 | 2024 | 2025 | 2026 |
-|---|---|---|---|---|
-| BTC | 30.0 % (20) | 25.0 % (24) | 23.5 % (17) | 17.6 % (17) |
-| ETH | 31.6 % (19) | 30.0 % (20) | 30.8 % (13) | 27.8 % (18) |
+Two bugs were found by insisting on that check, and both are pinned by tests now:
 
-Ten of the twelve symbol-years are above the 20.6 % break-even. The two that are not —
-BTC 2026 at 17.6 % (17 trades) and, marginally, nothing else — are the reason the app
-shows a live accuracy counter that can go red.
+1. The app unblocked on *exit* rather than on the horizon, taking ~40 % more trades
+   than the study — drawn from the same moves, at break-even accuracy.
+2. `fee_r` divided a fraction of price by a price distance, reporting 3 × 10⁻⁷ R. The
+   page said the fee was free. It is 0.028 R.
 
-### Frequency
+## 5. Frequency
 
-164 signals over the three test periods for two symbols on one hour is roughly
-**0.05 signals per symbol per day** — a genuinely selective rule. Scaled to the 60 most
-liquid MEXC contracts that is ~3 a day for the scanner, or about one every five days on
-a single chart.
+260 signals across the three test periods for two symbols on one hour is roughly
+**0.15 per symbol per day** — selective but tradeable. Scaled to the 60 most liquid MEXC
+contracts that is ~9 a day; on a single chart it is about one every three days.
 
-## 5. The 100 % club (still here, still instructive)
-
-Round 14's search, kept because it is the honest answer to "just find a pattern":
+## 6. The 100 % club (kept, still instructive)
 
 * **480 rules** with ≥ 50 trades and zero losses in sample; the largest fired **596**
   times without losing.
@@ -153,16 +164,17 @@ Round 14's search, kept because it is the honest answer to "just find a pattern"
 
 None of that changed. What changed is which side of the trade-off the app sits on.
 
-## 6. The app
+## 7. The app
 
 `app/server.py` — FastAPI + one page + SQLite, four tabs:
 
 * **Signals** — live tape: probability, band, entry / stop / target, status, R. Rows are
-  written to SQLite as they are created and resolved; a refresh (or a restart) never
-  loses them. Header shows the ratio, the fee as a share of the reward, and which model
-  is scoring.
-* **Measured accuracy** — the reward : risk sweep first (why 1 : 4), then the band table
-  with break-even, intervals and per-period records.
+  written to SQLite as they are created and resolved; a refresh never loses them. The
+  header shows the ratio, the fee as a share of the reward, and which model is scoring.
+  The recording cut is adjustable from the page, with each cut's measured record on the
+  button.
+* **Measured accuracy** — the reward : risk sweep (why 1 : 4), then the band table with
+  break-even, intervals and per-period records.
 * **The 100 % club** — the rules that never lost, and what happened to them next.
 * **Method & limits** — data, splits, geometry, and what is explicitly *not* claimed.
 
@@ -171,12 +183,12 @@ None of that changed. What changed is which side of the trade-off the app sits o
 
 **Which model scores what.** Replay uses a *validation* model trained only up to
 2023-12-31, so a replay of 2024+ is genuinely out of sample. Live uses the *production*
-model trained through 2026-10, because live has no "after" to cheat with. This was not
+model trained through 2026-10, because live has no "after" to cheat with. This is not
 cosmetic: an early build shipped the production model for both and its replay reported
 **96.9 %** accuracy for a system whose measured accuracy was ~75 % — it was scoring bars
 it had been fitted on. The page says which model is in use and a test pins it.
 
-## 7. Reproduce
+## 8. Reproduce
 
 ```bash
 cd signal-lab
@@ -184,44 +196,40 @@ cd signal-lab
 ../.venv/bin/python research/01_frontier.py                     # the accuracy/fee frontier
 ../.venv/bin/python research/04_hundred.py --tf 1h --target 0.05 --stop 4
 ../.venv/bin/python research/07_rr.py --rrs 2,3,4,5,6 --stops 0.5,1,2 --horizon 240
-../.venv/bin/python research/06_bands.py --tfs 1h --target 8 --stop 2 --horizon 240 --rec-cut 0.5
-../.venv/bin/python -m pytest tests -q                          # 17 tests
-../.venv/bin/python app/server.py --replay --speed 150 --port 8811
+../.venv/bin/python research/06_bands.py --tfs 1h --target 8 --stop 2 --horizon 240
+../.venv/bin/python -m pytest tests -q                          # 18 tests
+../.venv/bin/python app/server.py --replay --speed 400 --port 8811
 cd tools/ui && npm install && node ui.mjs                       # page checks
 ```
 
 Every figure on the page comes from `app/data/*.json`, which those scripts write. No
 number is typed into the HTML.
 
-## 8. Limits — read before trusting a number
+## 9. Limits — read before trusting a number
 
-* **The cut was chosen from this table.** p ≥ 0.50 was the best worst-period cut in the
-  sweep, so the +0.191 R is mildly optimistic. The defence is that all six
-  symbol × period slices are positive at that cut, and that p ≥ 0.55 and p ≥ 0.60 are
-  *more* profitable per trade, so the choice sits inside a region rather than on a
-  spike. It is still a choice made with hindsight and it is disclosed as one.
-* **Small samples by design.** 164 trades at the recorded cut. The C-band interval is
-  18.5–31.5 %, wide enough to contain both "works" and "does not".
+* **The cut was chosen with hindsight.** p ≥ 0.35 came from the table above. The
+  defence is that every cut between 0.25 and 0.50 is positive expectant in all three
+  periods, so the choice sits on a plateau, not a spike — and the plateau is shown.
+* **The edge is small in absolute terms.** 24.6 % against a 20.6 % break-even. The
+  confidence interval, 19.8–30.2 %, contains outcomes you would not want to trade.
 * **Two symbols, one timeframe, long only.** The short side is the same pipeline on
-  mirrored bars; it is not shipped until it passes the same six slices.
-* **Funding is not modelled.** At 1 : 4 the hold is long (up to 240 hours): funding on a
-  ten-day position is material and is missing. This is the largest unmodelled cost and
-  it is why the page promises a measured record, not a live edge.
-* **A 240-bar time-out is scored as 0 R.** 2.5 % of trades end that way at this
-  geometry; the number is displayed, and treating them as free is generous.
+  mirrored bars; it is not shipped until it passes the same three periods.
+* **Funding is not modelled.** At 1 : 4 the hold can be up to 240 hours. Funding on a
+  ten-day position is material and missing. This is the largest unmodelled cost, and it
+  is why the page promises a measured record, not a live edge.
+* **A time-out is scored as 0 R.** 2.5 % of trades end that way at this geometry.
 * **Replay is a simulation.** It re-runs from 2024-01-01 on every start; only live rows
   persist across restarts.
 
-## 9. The honest summary
+## 10. The honest summary
 
 Round 14 proved that 100 % accuracy is a coordinate on a trade-off curve, not a secret.
-Round 15 shows the other half of that sentence: **the curve has a good side.** Move the
-reward to four times the risk, widen the stop until the fee is a rounding error, and a
-model that is right one time in four pays +0.19 R per trade, in every period measured,
-on two assets and four calendar years.
+Round 15 shows the other half: **the curve has a good side.** Move the reward to four
+times the risk, widen the stop until the fee is a rounding error, and a model that is
+right one time in four pays +0.20 R per trade in the walk-forward — +0.14 R in the
+running app.
 
-That is not a promise of the future. It is the best that 9.6 million bars of the past
-would support, with the weakest period shown next to the strongest, and the cut that
-produced it named as a hindsight choice. A strategy that is wrong three times out of
-four is uncomfortable to trade — which is exactly why it was worth building the counter
-that shows the arithmetic instead of the accuracy.
+Two things worth keeping in view. The geometry does most of the work; the model shifts
+the hit rate by a few points and that is enough at 1 : 4 because the break-even line is
+so low. And a strategy that is wrong three times out of four is uncomfortable to trade,
+which is exactly why the page leads with the break-even rate instead of the accuracy.

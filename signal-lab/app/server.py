@@ -32,6 +32,7 @@ app = FastAPI(title="SignalLab")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 ENGINE: Engine | None = None
+LOOP = False
 _runner: threading.Thread | None = None
 _stop = threading.Event()
 WEB = os.path.join(HERE, "web")
@@ -159,7 +160,10 @@ def _run_replay(engine: Engine) -> None:
         t0 = time.time()
         for _ in range(max(1, int(engine.speed / 10))):
             if not engine.step():
-                return
+                if not LOOP:
+                    return
+                engine.rewind()
+                break
         dt = time.time() - t0
         sleep = max(0.0, 0.1 - dt)
         _stop.wait(sleep)
@@ -179,6 +183,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--replay", action="store_true")
+    ap.add_argument("--loop", action="store_true", help="start the replay again when it reaches the end")
     ap.add_argument("--speed", type=float, default=25.0)
     ap.add_argument("--cut", type=float, default=0.0, help="probability cut; 0 = from the bands")
     ap.add_argument("--port", type=int, default=8811)
@@ -187,6 +192,8 @@ def main() -> None:
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
 
+    global LOOP
+    LOOP = args.loop
     ENGINE = Engine(mode="live" if args.live else "replay", speed=args.speed,
                     cut=(args.cut or None),
                     symbols=[s for s in args.symbols.split(",") if s],

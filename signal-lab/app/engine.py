@@ -79,6 +79,10 @@ class Stream:
         self.i = -1
         self.pending: Signal | None = None
         self.open: list[Signal] = []
+        # the research measures one trade per `horizon` bars, not one per open
+        # position: a trade that resolves in 3 bars must not let the next one in
+        # immediately, or the sample is 4x larger than the one that was measured
+        self.next_ok_bar = 0
 
 
 class Engine:
@@ -201,6 +205,16 @@ class Engine:
             self.steps += 1
             return True
 
+    def rewind(self) -> None:
+        """Start the replay again from the beginning (a simulation is not a record)."""
+        with self.lock:
+            self._db.execute("DELETE FROM signals WHERE mode = 'replay'")
+            self._db.commit()
+            self.memory = []
+            self.steps = 0
+            self.finished = False
+            self.prepare()
+
     def _bands_for(self, p: float) -> tuple[float, str] | None:
         for cut, letter in self.band_cuts:
             if p >= cut:
@@ -255,7 +269,7 @@ class Engine:
         st.open = still
 
         # 3. look at the closed bar: is there a setup?
-        if i < 60 or st.open or st.pending:
+        if i < 60 or i < st.next_ok_bar or st.pending:
             return
         hist = max(0, i - WARMUP + 1)
         sl = s.slice(hist, i + 1)
@@ -278,6 +292,7 @@ class Engine:
         sig.stop = c - self.geometry["stop"] * atr
         sig.target = c + self.geometry["target"] * atr
         st.pending = sig
+        st.next_ok_bar = i + self.horizon   # the lock-out the research applied
 
     # ------------------------------------------------------------- live mode
     def _prepare_live(self) -> None:  # pragma: no cover - needs the exchange

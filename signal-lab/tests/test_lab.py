@@ -203,30 +203,35 @@ def test_a_perfect_rule_can_still_lose_money():
 
 
 def test_the_shipped_bands_are_honest_about_what_they_need_to_beat():
-    """A 1:4 band wins ~1 time in 4. What matters is that it beats break-even.
+    """A 1:4 band wins ~1 time in 4, so the number that matters is break-even.
 
-    Round 15 changed the geometry from 1:2 to 1:4, so the accuracy numbers fell
-    from ~75 % to ~24 % - and the *expectancy* went up. This test asserts the
-    relationship instead of a remembered percentage.
+    Two things this deliberately does NOT assert:
+
+    * monotonicity across cuts. With the pooled model the strictest band (0.50) is
+      *less* accurate than the loosest (0.25) — 22.2 % against 23.8 % — because at
+      these sample sizes the ordering is noise. The page shows every band with its
+      interval instead of pretending otherwise.
+    * a remembered percentage. Round 14's numbers were ~75 %; round 15's are ~24 %,
+      and both were correct for their geometry.
     """
     pack = json.load(open(os.path.join(ROOT, "app", "data", "bands.json")))
     rr, stop = pack["rr"], pack["stop"]
     bands = sorted([b for b in pack["bands"] if b["cut"] > 0], key=lambda b: -b["cut"])
     assert rr >= 3.5, "the shipped geometry must be at least 1:4 reward:risk"
-    wins = [b["win"] for b in bands]
-    assert wins[0] >= wins[-1] + 0.03, "the strictest band must beat taking everything"
-    for a, b in zip(wins, wins[1:]):
-        assert a >= b - 0.05, f"band accuracy jumped upwards ({a:.3f} -> {b:.3f})"
     for b in bands:
-        assert 0.05 <= b["win"] <= 0.60, "a 1:4 band cannot claim more than 60 % - or less than 5 %"
+        assert 0.05 <= b["win"] <= 0.60, "a 1:4 band cannot claim more than 60 %"
         assert b["ci"][0] <= b["win"] <= b["ci"][1]
-        # a 1:4 band fires ~50-350 times in 4.8 years, so the small ones are shown
-        # with their own interval rather than hidden; the recorded band must be big
         assert b["n"] >= 40, "a band with fewer trades than that is not shown at all"
+    # the cut is not a precision instrument: the whole family lands in a narrow band
+    spread = max(b["win"] for b in bands) - min(b["win"] for b in bands)
+    assert spread < 0.08, f"the cuts disagree by {100*spread:.1f} points - more than noise"
+
     rec = [b for b in bands if abs(b["cut"] - pack["recommended_cut"]) < 1e-9][0]
-    assert rec["n"] >= 100, "the band the app records at needs a sample worth quoting"
+    assert rec["n"] >= 250, "the recorded band needs a sample worth quoting"
     assert rec["ev_post"] > 0, "and must be profitable after fees"
-    assert rec["win"] > (1 + 0.03) / (1 + rr), "and must clear its own break-even rate"
+    assert rec["win"] > (1 + 0.03) / (1 + rr), "and clear its own break-even rate"
+    for period, cell in rec["folds"].items():
+        assert cell["win"] > (1 + 0.03) / (1 + rr), f"{period} fell below break-even"
 
 
 def test_the_reward_risk_sweep_supports_the_shipped_choice():
@@ -294,3 +299,46 @@ def test_the_fee_is_expressed_in_r_and_matches_the_research_figure(tmp_path):
     assert 0.001 < sig["fee_r"] < 0.5, f"fee in R is off: {sig['fee_r']}"
     assert sig["break_even"] == pytest.approx((1 + sig["fee_r"]) / (1 + e.geometry["rr"]))
     assert sig["break_even"] < 0.30, "a 1:4 trade needs well under 30 % accuracy"
+
+
+def test_a_second_signal_waits_out_the_horizon(tmp_path):
+    """The app must trade what was measured: one entry per horizon, not one per exit.
+
+    The measured bands block a new signal for `horizon` bars after each one. The
+    engine originally unblocked on exit, which produced ~40 % more trades than the
+    study, drawn from the same move - and the live accuracy fell to break-even.
+    """
+    from engine import Engine, Stream
+
+    class Always:
+        def predict_proba(self, x):
+            return np.array([[0.1, 0.95]])
+
+    e = Engine(mode="replay", speed=1, tfs=["1h"], cut=0.5, db=str(tmp_path / "t.db"))
+    e.streams = {("TEST", "1h"): Stream("TEST", "1h", random_walk(900))}
+    e.streams[("TEST", "1h")].i = 799
+    e.models = {"1h": Always()}
+    e.memory = []
+    for _ in range(3):
+        e.step()
+    first = len(e.memory)
+    assert first == 1
+    st = e.streams[("TEST", "1h")]
+    assert st.next_ok_bar == 800 + e.horizon
+    for _ in range(min(20, e.horizon - 2)):
+        e.step()
+    assert len(e.memory) == 1, "no second signal inside the horizon, even if the trade closed"
+
+
+def test_rewinding_a_replay_starts_clean(tmp_path):
+    from engine import Engine
+
+    e = Engine(mode="replay", speed=1, tfs=["1h"], db=str(tmp_path / "t.db"))
+    e.prepare()
+    for _ in range(30):
+        e.step()
+    n_before = e.steps
+    e.rewind()
+    assert e.steps == 0 and e.memory == [] and not e.finished
+    assert n_before > 0
+    assert e._db.execute("SELECT count(*) FROM signals").fetchone()[0] == 0

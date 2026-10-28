@@ -40,11 +40,12 @@ hit rate you need is `(1 + f) / (1 + x)`. That single formula decides everything
 | geometry | accuracy needed | fee share of the reward | what the model does | net per trade |
 |---|---|---|---|---|
 | 1 : 2 (round 14) | 67 % | 12 % | 75.4 % on 142 trades | +0.120 R |
-| **1 : 4 (round 15, shipped)** | **20.6 %** | **0.7 %** | **25.5 % on 184 trades** | **+0.268 R** |
+| **1 : 4 (round 15, shipped)** | **20.6 %** | **0.7 %** | **24.6 % on 260 trades** | **+0.202 R** |
 
-The shipped system: **target 8 ATR, stop 2 ATR, 1h, p ≥ 0.50**, one trade at a time.
-Positive expectancy in **all six** walk-forward slices (2 symbols × 3 periods), +0.104 R
-in the worst of them, and 10 of 12 symbol-years above break-even.
+The shipped system: **target 8 ATR, stop 2 ATR, 1h, p ≥ 0.35**, one entry per 240 bars.
+Positive in **all three** walk-forward periods (23.2 % / 28.3 % / 23.6 % accuracy,
++0.202 R per trade), and the running app reproduces it: **144 signals, 23.7 %, +19.9 R**
+over the full 2024–2026 replay — the same count the study predicts.
 
 And the 100 % question, answered for the record:
 

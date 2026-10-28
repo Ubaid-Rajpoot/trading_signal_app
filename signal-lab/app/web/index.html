@@ -182,7 +182,9 @@
       </table>
       <p class="note">Each row is the best probability cut for that geometry, measured on
       non-overlapping trades in three expanding-window folds (2022, 2023, 2024–26). "Worst fold" is
-      the whole test: a configuration only counts if its <i>worst</i> period is still positive after fees.</p>
+      the whole test: a configuration only counts if its <i>worst</i> period is still positive after fees.
+      The sweep trains one model per symbol; the band table below trains one model across both, exactly
+      as the app ships it — which is why the two disagree by a point or two.</p>
     </div>
 
     <div class="panel">

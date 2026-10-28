@@ -140,11 +140,11 @@ having and the accuracy you need collapses.
 | geometry | accuracy needed | fee share of reward | model | net per trade |
 |---|---|---|---|---|
 | 1 : 2 | 67 % | 12 % | 75.4 % on 142 trades | +0.120 R |
-| **1 : 4 (shipped)** | **20.6 %** | **0.7 %** | **25.5 % on 184 trades** | **+0.268 R** |
+| **1 : 4 (shipped)** | **20.6 %** | **0.7 %** | **24.6 % on 260 trades** | **+0.202 R** |
 
-Shipped: target 8 ATR, stop 2 ATR, 1h, p ≥ 0.50, one trade at a time. Positive in **all
-six** walk-forward slices (2 symbols × 3 periods), worst +0.104 R, 10 of 12 symbol-years
-above break-even.
+Shipped: target 8 ATR, stop 2 ATR, 1h, p ≥ 0.35, one entry per 240 bars. Positive in
+**all three** walk-forward periods, and the app reproduces it on the full 2024–2026
+replay: 144 signals, 23.7 % accuracy, +19.9 R.
 
 ```bash
 cd signal-lab

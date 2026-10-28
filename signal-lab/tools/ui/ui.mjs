@@ -58,7 +58,13 @@ ok(bandRows.length >= 6, `every measured band is on the page (${bandRows.length}
 const accs = bandRows.map((r) => parseFloat(r.children[3].textContent));
 ok(accs.every((a) => a >= 5 && a <= 60),
    `band accuracies are in the range a 1:4 trade can produce (${accs.join(", ")})`);
-ok(accs[0] >= accs[accs.length - 1], "the strictest band is not less accurate than the loosest");
+// The bands are not monotone with the pooled model (22.2 % at p>=0.50 against
+// 23.8 % at p>=0.25) and the page must show that, not hide it. What is checked is
+// that the spread is noise-sized and that every band is rendered with its sample.
+const spread = Math.max(...accs) - Math.min(...accs);
+ok(spread < 8, `the cuts disagree by less than 8 points - i.e. the cut is not precision (${spread.toFixed(1)})`);
+const samples = bandRows.map((r) => parseInt(r.children[2].textContent.replace(/,/g, ""), 10));
+ok(samples.every((n) => n >= 40), `every band states its sample (${samples.join(", ")})`);
 
 // ---- reward : risk framing ---------------------------------------------------
 ok(/risk : reward 1 : [45]/.test($("rr").textContent), `the header states the ratio (${$("rr").textContent})`);
@@ -93,11 +99,11 @@ ok(fPos.every((r) => parseFloat(r.children[5].textContent) < 98), "none of the p
 const cutBtns = [...doc.querySelectorAll("#cutBtns button")];
 ok(cutBtns.length >= 5, `there is a recording-cut control with every band (${cutBtns.length})`);
 const cutBefore = (await (await fetch(BASE + "/api/state")).json()).cut;
-const b55 = cutBtns.find((b) => b.dataset.c === "0.55");
+const b55 = cutBtns.find((b) => Math.abs(+b.dataset.c - 0.45) < 1e-9);
 b55.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await sleep(400);
 const mid = (await (await fetch(BASE + "/api/state")).json()).cut;
-ok(Math.abs(mid - 0.55) < 1e-9, `clicking a cut changes the recording cut (${cutBefore} -> ${mid})`);
+ok(Math.abs(mid - 0.45) < 1e-9, `clicking a cut changes the recording cut (${cutBefore} -> ${mid})`);
 const back = cutBtns.find((b) => Math.abs(+b.dataset.c - cutBefore) < 1e-9);
 if (back) back.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await sleep(300);

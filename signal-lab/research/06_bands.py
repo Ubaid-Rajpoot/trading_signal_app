@@ -96,8 +96,8 @@ def main():
     ap.add_argument("--target", type=float, default=2.0)
     ap.add_argument("--stop", type=float, default=4.0)
     ap.add_argument("--horizon", type=int, default=240)
-    ap.add_argument("--rec-cut", type=float, default=0.5,
-                    help="the probability cut the app records at (chosen on the walk-forward)")
+    ap.add_argument("--rec-cut", type=float, default=0.35,
+                    help="the cut the app records at: highest expectancy among cuts with >= 250 trades")
     ap.add_argument("--out-model", default="app/model.pkl")
     ap.add_argument("--out", default="app/data/bands.json")
     args = ap.parse_args()
@@ -111,37 +111,42 @@ def main():
         parts = []
         for sym in args.symbols.split(","):
             d = load(sym, tf, args.target, args.stop, args.horizon)
-            fee_r = FEE_RT / (args.stop * float(np.nanmedian(d["atr_frac"][d["ok"]])))
-            d["fee_r"] = fee_r
+            d["fee_r"] = FEE_RT / (args.stop * float(np.nanmedian(d["atr_frac"][d["ok"]])))
             d["symbol"] = sym
             parts.append(d)
-            print(f"{sym} {tf}: {int(d['ok'].sum()):,} resolved bars, fee {fee_r:.3f} R")
+            print(f"{sym} {tf}: {int(d['ok'].sum()):,} resolved bars, fee {d['fee_r']:.3f} R")
 
-            for label, a, b in FOLDS:
-                tr = d["ok"] & (d["s"].t * 60000 < a)
+        # ONE model per timeframe, trained on every symbol, exactly as the app ships
+        # it. Training per symbol matched the app badly enough to change the answer
+        # (100 signals in 2024-26 instead of the 68 the engine really takes).
+        F_all = np.concatenate([d["F"] for d in parts])
+        out_all = np.concatenate([d["out"] for d in parts])
+        ok_all = np.concatenate([d["ok"] for d in parts])
+        t_all = np.concatenate([d["s"].t for d in parts])
+
+        for label, a, b in FOLDS:
+            tr = ok_all & (t_all * 60000 < a)
+            if tr.sum() < 5000:
+                continue
+            m = fit(F_all, out_all, tr)
+            for d in parts:
                 te = d["ok"] & (d["s"].t * 60000 >= a) & (d["s"].t * 60000 < b)
-                if tr.sum() < 5000 or te.sum() < 200:
+                if te.sum() < 200:
                     continue
-                m = fit(d["F"], d["out"], tr)
-                p = m.predict_proba(d["F"][te])[:, 1]
-                y = (d["out"][te] == 1).astype(int)
+                p = m.predict_proba(d["F"])[:, 1]
+                y = (d["out"] == 1).astype(int)
                 for c in CUTS:
-                    sel = thin(p >= c, args.horizon)
-                    if sel.sum() < 20:
+                    sel = thin((p >= c) & te, args.horizon)
+                    if sel.sum() < 15:
                         continue
                     pooled[c]["w"] += int(y[sel].sum())
                     pooled[c]["n"] += int(sel.sum())
                     pooled[c]["w_fold"][label] = pooled[c]["w_fold"].get(label, 0) + int(y[sel].sum())
                     pooled[c]["n_fold"][label] = pooled[c]["n_fold"].get(label, 0) + int(sel.sum())
-                    key = f"{sym} {tf} {label}"
+                    key = f"{d['symbol']} {tf} {label}"
                     per_tf[tf].setdefault(c, {})[key] = dict(
                         n=int(sel.sum()), win=float(y[sel].mean()))
-                    pooled[c].setdefault("days", 0)
-                    pooled[c]["days"] += len(d["s"]) / (24 * (60 if tf == "1h" else 240))
-        F_all = np.concatenate([d["F"] for d in parts])
-        out_all = np.concatenate([d["out"] for d in parts])
-        ok_all = np.concatenate([d["ok"] for d in parts])
-        t_all = np.concatenate([d["s"].t for d in parts])
+
         before_2024 = t_all < (1704067200000 // 60000)
         final[tf] = {"parts": parts, "names": parts[0]["names"],
                      "fee_r": float(np.mean([d["fee_r"] for d in parts])),
