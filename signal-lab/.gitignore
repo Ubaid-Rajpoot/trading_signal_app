@@ -1,0 +1,5 @@
+/data/
+/results/*.json
+/results/*.log
+__pycache__/
+/app/data/signals.db
