@@ -36,7 +36,7 @@ FEE_RT = hunt.FEE_RT
 FOLDS = [("2022", 1640995200000, 1672531200000),
          ("2023", 1672531200000, 1704067200000),
          ("2024-26", 1704067200000, 9999999999999)]
-CUTS = [0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.60, 0.00]
+CUTS = [0.60, 0.55, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.00]
 
 
 def wilson(w, n, z=1.96):
@@ -95,7 +95,9 @@ def main():
     ap.add_argument("--tfs", default="4h,1h")
     ap.add_argument("--target", type=float, default=2.0)
     ap.add_argument("--stop", type=float, default=4.0)
-    ap.add_argument("--horizon", type=int, default=60)
+    ap.add_argument("--horizon", type=int, default=240)
+    ap.add_argument("--rec-cut", type=float, default=0.5,
+                    help="the probability cut the app records at (chosen on the walk-forward)")
     ap.add_argument("--out-model", default="app/model.pkl")
     ap.add_argument("--out", default="app/data/bands.json")
     args = ap.parse_args()
@@ -185,6 +187,7 @@ def main():
     print(f"\nsaved model -> {args.out_model}")
 
     out = dict(target=args.target, stop=args.stop, horizon=args.horizon, rr=k,
+               recommended_cut=args.rec_cut,
                fee_bp=FEE_RT * 1e4, bands=bands, folds=[f[0] for f in FOLDS],
                symbols=args.symbols.split(","), tfs=list(final),
                per_tf={tf: {str(c): v for c, v in per_tf[tf].items()} for tf in per_tf})

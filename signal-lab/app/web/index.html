@@ -91,6 +91,8 @@
       </div>
     </div>
     <div class="spacer"></div>
+    <div class="badge" id="rr" title="risk : reward of every trade">—</div>
+    <div class="clock" id="fee" title="round-trip cost, in R and as a share of the prize">—</div>
     <div class="clock" id="model" title="which model the engine is scoring with">—</div>
     <div class="clock" id="clock">—</div>
     <div class="speed" id="speed"></div>
@@ -102,10 +104,10 @@
       <div class="s" id="kSignalsSub">resolved + open</div></div>
     <div class="kpi"><div class="l">Accuracy (this run)</div><div class="v" id="kAcc">—</div>
       <div class="s" id="kAccSub">wilson 95 % CI</div></div>
-    <div class="kpi"><div class="l">Claimed by band</div><div class="v" id="kClaim">—</div>
-      <div class="s">measured out of sample, 2022–2026</div></div>
+    <div class="kpi"><div class="l">Break-even accuracy</div><div class="v" id="kBE">—</div>
+      <div class="s" id="kBESub">what 1 : 4 with fees actually needs</div></div>
     <div class="kpi"><div class="l">Net R (this run)</div><div class="v" id="kNet">—</div>
-      <div class="s">after 5 bp round trip</div></div>
+      <div class="s" id="kNetSub">after fees</div></div>
     <div class="kpi"><div class="l">Open now</div><div class="v" id="kOpen">—</div>
       <div class="s" id="kOpenSub">one per symbol / timeframe</div></div>
   </div>
@@ -120,7 +122,12 @@
   <!-- ---------------------------------------------------------------- signals -->
   <section id="t-signals">
     <div class="panel">
-      <h2>Live signal tape</h2>
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <h2 style="margin:0">Live signal tape</h2>
+        <div class="spacer" style="flex:1"></div>
+        <span class="dim" style="font-size:11.5px">recording at p ≥</span>
+        <div class="speed" id="cutBtns"></div>
+      </div>
       <p class="sub">Every row is a real setup: the model's probability of reaching <b>+2 ATR</b> before
       <b>−4 ATR</b>, filled at the next bar's open, resolved by the first barrier touched. A bar that
       touches both barriers is counted as a loss. Rows survive a refresh — they are written to
@@ -147,8 +154,8 @@
         <h2>This run vs the claim</h2>
         <p class="sub">The claim is measured on 2022, 2023 and 2024–2026 — years and rows the model
         never trained on. If the live run drifts far from it, the claim is wrong, not the run.</p>
-        <table><thead><tr><th>Band</th><th>Signals</th><th>Live acc.</th><th>Claimed</th>
-          <th>Net R</th></tr></thead><tbody id="bandLive"></tbody></table>
+        <table><thead><tr><th>Band</th><th>Signals</th><th>Live acc.</th><th>Needed</th>
+          <th>Claimed</th><th>Net R</th></tr></thead><tbody id="bandLive"></tbody></table>
       </div>
     </div>
   </section>
@@ -156,20 +163,38 @@
   <!-- ----------------------------------------------------------------- bands -->
   <section id="t-bands" hidden>
     <div class="panel">
+      <h2>Reward : risk — where the money is</h2>
+      <p class="sub">Accuracy on its own decides nothing. What decides is <b>accuracy against the
+      accuracy you need</b>, and the accuracy you need falls as the reward grows:</p>
+      <div class="callout good" style="font-family:var(--mono);font-size:12.5px">
+        break-even accuracy  =  (1 + fee in R) / (1 + reward : risk)
+      </div>
+      <p class="sub">A 1 : 2 trade with a ~0.06 R fee needs <b>35.2 %</b>. A 1 : 4 needs <b>21.1 %</b>.
+      A 1 : 5 needs <b>17.7 %</b>. The same model that was hopeless at 1 : 2 is profitable at 1 : 4,
+      because it only has to be right <i>once in five</i> instead of once in three — and the fee stops
+      eating the prize: at a 1 ATR stop it is <b>1.4 %</b> of the reward, against <b>28 %</b> at the
+      0.5 ATR stop the old build used.</p>
+      <table>
+        <thead><tr><th>TF</th><th>Stop</th><th>Risk : reward</th><th>Break-even</th>
+          <th>Base rate</th><th>Model cut</th><th>Trades</th><th>Accuracy</th>
+          <th>Fees</th><th>Worst fold</th><th>Mean fold</th></tr></thead>
+        <tbody id="rrTable"><tr><td colspan="11" class="empty">loading…</td></tr></tbody>
+      </table>
+      <p class="note">Each row is the best probability cut for that geometry, measured on
+      non-overlapping trades in three expanding-window folds (2022, 2023, 2024–26). "Worst fold" is
+      the whole test: a configuration only counts if its <i>worst</i> period is still positive after fees.</p>
+    </div>
+
+    <div class="panel">
       <h2>What accuracy is actually reproducible</h2>
-      <p class="sub">Target <b>2 ATR</b>, stop <b>4 ATR</b> (0.50 R:R), 60-bar horizon, fees 5 bp round
-      trip, one open trade per stream. Trained on everything before the fold, scored only on the fold.
-      "Signals" counts non-overlapping trades, not bars.</p>
+      <p class="sub" id="bandGeometry">—</p>
       <table>
         <thead><tr><th>Band</th><th>Cut</th><th>Signals</th><th>Accuracy</th><th>95 % CI</th>
-          <th>EV pre-fee</th><th>EV after fees</th><th>2022</th><th>2023</th><th>2024–26</th></tr></thead>
+          <th>EV pre-fee</th><th>EV after fees</th><th>R / trade</th><th>2022</th><th>2023</th>
+          <th>2024–26</th></tr></thead>
         <tbody id="bandTable"><tr><td colspan="10" class="empty">loading…</td></tr></tbody>
       </table>
-      <div class="callout warn" style="margin-top:16px">
-        <b>This is the ceiling that survived.</b> Roughly <b>73–75 %</b> of these trades reach +2 ATR
-        before −4 ATR, worth <b>+0.08 R to +0.12 R</b> each after fees. It is not 98 %. On this data it
-        cannot be, and the next tab shows why — with the rules that <i>do</i> hit 100 %.
-      </div>
+      <div class="callout good" style="margin-top:16px" id="bandVerdict">—</div>
     </div>
   </section>
 
@@ -307,6 +332,44 @@ function claimedFor(band) {
 
 async function loadMeta() {
   META = await (await fetch("/api/meta")).json();
+  // ---- reward:risk sweep
+  if (META.rr) {
+    const pick = META.rr.rows.filter(r => r.n >= 60);
+    $("rrTable").innerHTML = pick.map(r => {
+      const chosen = META.rr.chosen && META.rr.chosen.tf === r.tf && META.rr.chosen.stop === r.stop
+        && +META.rr.chosen.rr === +r.rr;
+      return `<tr${chosen ? ' style="background:#0d1a16"' : ''}>
+        <td class="mono">${r.tf}</td><td>${r.stop} ATR</td>
+        <td><b>1 : ${r.rr}</b></td>
+        <td class="dim">${pct(r.break_even)}</td>
+        <td class="dim">${pct(r.base)}</td>
+        <td class="mono dim">p ≥ ${r.cut.toFixed(2)}</td>
+        <td>${r.n}</td>
+        <td class="${r.win > r.break_even ? "up" : "down"}"><b>${pct(r.win)}</b></td>
+        <td class="dim">${r.fee_r.toFixed(3)} R</td>
+        <td class="${r.worst > 0 ? "up" : "down"}"><b>${money(r.worst)} R</b></td>
+        <td class="${r.mean > 0 ? "up" : "dim"}">${money(r.mean)} R</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="11" class="empty">no configuration cleared the bar</td></tr>`;
+  }
+
+  // ---- geometry sentence + verdict, straight from bands.json
+  const geo = META.bands;
+  $("bandGeometry").innerHTML =
+    `Reward : risk <b>1 : ${geo.rr.toFixed(0)}</b> — target <b>${geo.target} ATR</b>, stop ` +
+    `<b>${geo.stop} ATR</b>, ${geo.horizon}-bar horizon, ${geo.fee_bp.toFixed(0)} bp round trip, ` +
+    `one open trade per symbol at a time. Trained only on data before each fold, scored only on the ` +
+    `fold. "Signals" counts non-overlapping trades, never bars.`;
+  const rec = geo.bands.find(b => Math.abs(b.cut - (geo.recommended_cut || 0)) < 1e-9)
+           || geo.bands.filter(b => b.cut > 0).sort((a, b) => b.cut - a.cut)[0];
+  $("bandVerdict").innerHTML =
+    `<b>What this buys.</b> At 1 : ${geo.rr.toFixed(0)} a trade has to be right only ` +
+    `<b>${pct(rec.ev_pre === null ? null : (1 + 0.0285) / (1 + geo.rr))}</b> of the time to break even. ` +
+    `The model at p ≥ ${rec.cut.toFixed(2)} is right <b>${pct(rec.win)}</b> of the time on ` +
+    `${rec.n} out-of-sample trades (95 % CI ${pct(rec.ci[0])}–${pct(rec.ci[1])}), which is ` +
+    `<b>${money(rec.ev_post)} R per trade</b> after fees. Low accuracy is the <i>point</i> of a 1 : 4 ` +
+    `trade, not a weakness — one win pays four losses.`;
+
   // ---- bands table
   const cuts = META.bands.bands.filter(b => b.cut > 0).sort((a, b) => b.cut - a.cut);
   $("bandTable").innerHTML = cuts.map((b, i) => {
@@ -316,10 +379,11 @@ async function loadMeta() {
       <td><span class="band ${L}">${L}</span></td>
       <td class="mono">p ≥ ${b.cut.toFixed(2)}</td>
       <td>${b.n.toLocaleString()}</td>
-      <td class="${b.win > 0.7 ? "up" : ""}"><b>${pct(b.win)}</b></td>
+      <td class="${b.ev_post > 0 ? "up" : "down"}"><b>${pct(b.win)}</b></td>
       <td class="dim mono">${pct(b.ci[0])}–${pct(b.ci[1])}</td>
       <td>${money(b.ev_pre)} R</td>
       <td class="${b.ev_post > 0 ? "up" : "down"}"><b>${money(b.ev_post)} R</b></td>
+      <td class="dim">${b.n ? ((geo.target * b.win) - geo.stop * (1 - b.win)).toFixed(2) : "—"}</td>
       <td>${folds}</td></tr>`;
   }).join("");
 
@@ -367,6 +431,15 @@ async function loadMeta() {
   $("mGeom").textContent = META.method.geometry + " · " + META.method.fees + " · " + META.method.non_overlap;
   $("mModel").textContent = META.method.model;
 
+  // cut buttons: the trade-off this whole round is about
+  const cutRows = META.bands.bands.filter(b => b.cut > 0).sort((a, b) => b.cut - a.cut);
+  $("cutBtns").innerHTML = cutRows.map(b =>
+    `<button data-c="${b.cut}" title="${pct(b.win)} accuracy on ${b.n} trades, ${money(b.ev_post)} R after fees each">p ≥ ${b.cut.toFixed(2)}</button>`).join("");
+  $("cutBtns").querySelectorAll("button").forEach(b => b.onclick = () => {
+    fetch("/api/cut", {method: "POST", headers: {"content-type": "application/json"},
+      body: JSON.stringify({value: +b.dataset.c})});
+  });
+
   // speed buttons
   $("speed").innerHTML = [10, 25, 60, 150].map(v => `<button data-v="${v}">${v}×</button>`).join("");
   $("speed").querySelectorAll("button").forEach(b => b.onclick = () => {
@@ -390,10 +463,16 @@ async function tick() {
     $("mode").className = "badge " + s.mode;
     $("clock").textContent = utc(s.clock_ms) + " UTC";
     $("model").textContent = s.model || "";
+    $("rr").textContent = "risk : reward " + (s.geometry.label || "—");
     document.querySelectorAll("#speed button").forEach(b =>
       b.classList.toggle("on", +b.dataset.v === Math.round(s.speed)));
+    document.querySelectorAll("#cutBtns button").forEach(b =>
+      b.classList.toggle("on", Math.abs(+b.dataset.c - s.cut) < 1e-9));
 
     const a = s.stats.all;
+    const feeR = a.fee_r ?? (META.rr && META.rr.chosen ? META.rr.chosen.fee_r : null);
+    $("fee").textContent = feeR === null ? "" :
+      `fee ${feeR.toFixed(3)} R = ${(100 * feeR / s.geometry.rr).toFixed(1)} % of the reward`;
     $("kSignals").textContent = a.n;
     $("kSignalsSub").textContent = `${a.won} won · ${a.lost} lost · ${a.expired} expired`;
     const acc = a.won + a.lost ? a.won / (a.won + a.lost) : null;
@@ -403,14 +482,15 @@ async function tick() {
       $("kAccSub").textContent = `${pct(lo)}–${pct(hi)} · n=${a.won + a.lost}`;
     } else $("kAccSub").textContent = "no resolved trades yet";
     const bands = Object.keys(s.stats.bands);
-    let claimNum = 0, claimDen = 0;
-    bands.forEach(b => {
-      const c = claimedFor(b);
-      if (c) { claimNum += c.win * s.stats.bands[b].n; claimDen += s.stats.bands[b].n; }
-    });
-    $("kClaim").textContent = claimDen ? pct(claimNum / claimDen) : "—";
+    const be = a.break_even ?? (META.rr ? META.rr.chosen.break_even : null);
+    $("kBE").textContent = pct(be);
+    $("kBESub").textContent = be === null ? "" :
+      `at ${s.geometry.label} with a ${(a.fee_r || 0).toFixed(3)} R fee — ${acc !== null && acc >= be ? "run is above it" : "run must clear it"}`;
     $("kNet").textContent = money(a.net_r) + " R";
     $("kNet").className = "v " + (a.net_r >= 0 ? "up" : "down");
+    if (a.expectancy !== null && a.expectancy !== undefined) {
+      $("kNetSub").textContent = `${money(a.expectancy)} R per trade · ${a.won + a.lost} resolved`;
+    }
     $("kOpen").textContent = s.open.length + s.pending.length;
     $("kOpenSub").textContent = (s.open.length ? s.open.map(o => o.symbol + " " + o.tf).join(", ") : "flat");
 
@@ -440,7 +520,8 @@ async function tick() {
       const st = s.stats.bands[b], c = claimedFor(b);
       const lacc = st.won + st.lost ? st.won / (st.won + st.lost) : null;
       return `<tr><td><span class="band ${b}">${b}</span></td><td>${st.n}</td>
-        <td><b>${pct(lacc)}</b></td><td class="dim">${c ? pct(c.win) : "—"}</td>
+        <td><b>${pct(lacc)}</b></td><td class="dim">${pct(st.break_even)}</td>
+        <td class="dim">${c ? pct(c.win) : "—"}</td>
         <td class="${st.net_r >= 0 ? "up" : "down"}">${money(st.net_r)} R</td></tr>`;
     }).join("") || `<tr><td colspan="5" class="empty">no signals yet</td></tr>`;
   } catch (e) { /* the next poll will pick it up */ }

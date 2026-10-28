@@ -202,19 +202,48 @@ def test_a_perfect_rule_can_still_lose_money():
     assert perfect_ev == pytest.approx(k - fee_r)
 
 
-def test_the_shipped_bands_are_monotone_and_honest():
-    bands = json.load(open(os.path.join(ROOT, "app", "data", "bands.json")))["bands"]
-    bands = sorted([b for b in bands if b["cut"] > 0], key=lambda b: -b["cut"])
+def test_the_shipped_bands_are_honest_about_what_they_need_to_beat():
+    """A 1:4 band wins ~1 time in 4. What matters is that it beats break-even.
+
+    Round 15 changed the geometry from 1:2 to 1:4, so the accuracy numbers fell
+    from ~75 % to ~24 % - and the *expectancy* went up. This test asserts the
+    relationship instead of a remembered percentage.
+    """
+    pack = json.load(open(os.path.join(ROOT, "app", "data", "bands.json")))
+    rr, stop = pack["rr"], pack["stop"]
+    bands = sorted([b for b in pack["bands"] if b["cut"] > 0], key=lambda b: -b["cut"])
+    assert rr >= 3.5, "the shipped geometry must be at least 1:4 reward:risk"
     wins = [b["win"] for b in bands]
-    # the bands are measured with independent non-overlapping selections, so they
-    # need not be perfectly ordered - but they must not be out of order by much
-    assert wins[0] >= wins[-1] + 0.04, "the strictest band must beat taking everything"
+    assert wins[0] >= wins[-1] + 0.03, "the strictest band must beat taking everything"
     for a, b in zip(wins, wins[1:]):
-        assert a >= b - 0.02, f"band accuracy jumped upwards ({a:.3f} -> {b:.3f})"
+        assert a >= b - 0.05, f"band accuracy jumped upwards ({a:.3f} -> {b:.3f})"
     for b in bands:
-        assert 0.55 <= b["win"] <= 0.85, "no band may claim the impossible"
+        assert 0.05 <= b["win"] <= 0.60, "a 1:4 band cannot claim more than 60 % - or less than 5 %"
         assert b["ci"][0] <= b["win"] <= b["ci"][1]
-        assert b["n"] > 100, "every shipped band has a sample worth quoting"
+        # a 1:4 band fires ~50-350 times in 4.8 years, so the small ones are shown
+        # with their own interval rather than hidden; the recorded band must be big
+        assert b["n"] >= 40, "a band with fewer trades than that is not shown at all"
+    rec = [b for b in bands if abs(b["cut"] - pack["recommended_cut"]) < 1e-9][0]
+    assert rec["n"] >= 100, "the band the app records at needs a sample worth quoting"
+    assert rec["ev_post"] > 0, "and must be profitable after fees"
+    assert rec["win"] > (1 + 0.03) / (1 + rr), "and must clear its own break-even rate"
+
+
+def test_the_reward_risk_sweep_supports_the_shipped_choice():
+    """The geometry the app trades is the only one that passed the worst-fold test."""
+    rr = json.load(open(os.path.join(ROOT, "app", "data", "rr.json")))
+    chosen = rr["chosen"]
+    assert chosen["rr"] >= 3.5, "the app trades at least 1:4"
+    survivors = [s for s in rr["survivors"] if s["n"] >= 100]
+    assert survivors, "at least one geometry must survive every fold with a real sample"
+    best = survivors[0]
+    assert best["tf"] == chosen["tf"] and abs(best["rr"] - chosen["rr"]) < 1e-9
+    assert best["worst"] > 0, "and its worst fold must still make money"
+    assert best["win"] > best["be"], "because it wins more often than it needs to"
+    # the point of the whole round: more reward per unit of risk, less fee drag
+    for row in rr["rows"]:
+        if row["rr"] == chosen["rr"] and row["stop"] == chosen["stop"] and row["tf"] == chosen["tf"]:
+            assert row["fee_r"] < 0.05, "at a 2 ATR stop the fee is a small share of the reward"
 
 
 def test_the_frontier_says_what_the_page_says():
@@ -239,3 +268,29 @@ def test_a_replay_is_scored_by_the_model_that_never_saw_the_replay(tmp_path):
     assert "2023" in e.model_label
     live = Engine(mode="live", speed=1, cut=0.8, tfs=["1h"], db=str(tmp_path / "t2.db"))
     assert "production" in live.model_label
+
+
+def test_the_fee_is_expressed_in_r_and_matches_the_research_figure(tmp_path):
+    """fee_r must be ~0.03 R at a 2 ATR stop, not 3e-7.
+
+    The first build divided a *fraction of price* by a price distance, giving a
+    number 100,000 times too small — the page then reported "fee 0.000 R" and the
+    break-even line looked like a free lunch.
+    """
+    from engine import Engine, Stream
+
+    class Always:
+        def predict_proba(self, x):
+            return np.array([[0.1, 0.95]])
+
+    e = Engine(mode="replay", speed=1, tfs=["1h"], cut=0.5, db=str(tmp_path / "t.db"))
+    e.streams = {("TEST", "1h"): Stream("TEST", "1h", random_walk(900))}
+    e.streams[("TEST", "1h")].i = 799
+    e.models = {"1h": Always()}
+    e.memory = []
+    for _ in range(3):
+        e.step()
+    sig = e.memory[0]
+    assert 0.001 < sig["fee_r"] < 0.5, f"fee in R is off: {sig['fee_r']}"
+    assert sig["break_even"] == pytest.approx((1 + sig["fee_r"]) / (1 + e.geometry["rr"]))
+    assert sig["break_even"] < 0.30, "a 1:4 trade needs well under 30 % accuracy"

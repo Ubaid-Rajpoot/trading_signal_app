@@ -130,31 +130,26 @@ pools), and [`tdigm-live/docs/book-coverage.md`](tdigm-live/docs/book-coverage.m
 audits each book concept: implemented or not, which test proves it, and what it
 measured on real BTC data. See [`tdigm-live/README.md`](tdigm-live/README.md).
 
-## SignalLab — the 100 % question, answered with 9.6 M bars (separate app)
+## SignalLab — reward : risk, measured on 9.6 M bars (separate app)
 
-`signal-lab/` is a second, independent app. It exists because "98–100 % accuracy"
-deserves a measurement, not an opinion. It downloads 9,647,677 one-minute bars
-(BTC + ETH, 2017-08 → 2026-10), builds 59 causal features, and searches for patterns
-that never lost.
+`signal-lab/` is a second, independent app. Round 14 used it to answer "can a pattern
+win 98–100 % of the time?" — yes, 480 of them, and they lose money because the prize
+was smaller than the fee. Round 15 turns that around: give the trade a reward worth
+having and the accuracy you need collapses.
 
-**It finds them.** 480 rules won every single time in sample; the largest fired 596
-times without a loss. Then:
+| geometry | accuracy needed | fee share of reward | model | net per trade |
+|---|---|---|---|---|
+| 1 : 2 | 67 % | 12 % | 75.4 % on 142 trades | +0.120 R |
+| **1 : 4 (shipped)** | **20.6 %** | **0.7 %** | **25.5 % on 184 trades** | **+0.268 R** |
 
-| | |
-|---|---|
-| their pooled accuracy on 2024–2026 (never searched) | **98.48 %** (42,641 / 43,300) — i.e. the base rate |
-| what a *literal* 100 % rule returns at that geometry, after 5 bp | **−0.0016 R per trade** (prize 0.0125 R < fee 0.0141 R) |
-| of 240 timeframe × target × stop configurations, how many are ≥98 % accurate | **4** — and **none** of them makes money after fees |
-| the configurations that do make money | 6, at **50.7 %–81.0 %** accuracy |
-
-What ships instead is the part that survived three walk-forward folds and a
-non-overlap filter: **75.4 % accuracy (95 % CI 67.7–81.7) at +0.120 R per trade**,
-at a 0.50 R:R where one loss costs two wins, every fold positive.
+Shipped: target 8 ATR, stop 2 ATR, 1h, p ≥ 0.50, one trade at a time. Positive in **all
+six** walk-forward slices (2 symbols × 3 periods), worst +0.104 R, 10 of 12 symbol-years
+above break-even.
 
 ```bash
 cd signal-lab
 ../.venv/bin/python tools/build_dataset.py          # build the archive
-../.venv/bin/python app/server.py --replay --speed 40 --port 8811
+../.venv/bin/python app/server.py --replay --speed 150 --port 8811
 ```
 
 Full method, every table and every caveat: [`signal-lab/REPORT.md`](signal-lab/REPORT.md).

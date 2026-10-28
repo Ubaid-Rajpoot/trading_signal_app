@@ -88,18 +88,39 @@ def health():
             "error": e.error if e else None}
 
 
+def _summary_rr(rr: dict) -> dict:
+    """The reward:risk sweep, compact enough for the page."""
+    rows = []
+    for r in rr["rows"]:
+        best = None
+        for c, v in r["cuts"].items():
+            cand = dict(cut=float(c), n=v["n"], win=v["win"], worst=v["worst"], mean=v["mean"],
+                        folds=v["folds"])
+            if best is None or cand["worst"] > best["worst"]:
+                best = cand
+        if not best:
+            continue
+        rows.append(dict(tf=r["tf"], stop=r["stop"], rr=r["rr"], base=r["base"],
+                         break_even=r["be"], fee_r=r["fee_r"], timeout=r["timeout"], **best))
+    rows.sort(key=lambda r: -r["worst"])
+    return {"rows": rows, "survivors": rr["survivors"], "horizon": rr["horizon"],
+            "fee_bp": rr["fee_bp"], "folds": rr["folds"], "chosen": rr.get("chosen")}
+
+
 @app.get("/api/meta")
 def meta():
     bands = _load("bands.json")
     hundred = _summary_hundred(_load("hundred.json"))
     frontier = _summary_frontier(_load("frontier.json"))
-    return {"bands": bands, "hundred": hundred, "frontier": frontier,
+    rr = _summary_rr(_load("rr.json")) if os.path.exists(os.path.join(HERE, "data", "rr.json")) else None
+    return {"bands": bands, "hundred": hundred, "frontier": frontier, "rr": rr,
             "method": {
                 "data": "Binance 1-minute archive, BTCUSDT + ETHUSDT, 2017-08-17 -> 2026-10-24",
                 "bars": 9647677,
                 "train": "expanding window; the years 2022, 2023 and 2024-2026 are only ever scored",
-                "geometry": "target 2 ATR / stop 4 ATR (0.50 R:R), 60-bar horizon, long side",
-                "fees": "5 bp round trip (MEXC futures taker 2 bp x2 + 1 bp slippage)",
+                "geometry": "reward:risk 1:4 - target 8 ATR, stop 2 ATR, 240-bar horizon, long side",
+                "fees": "5 bp round trip (MEXC futures taker 2 bp x2 + 1 bp slippage); "
+                        "at a 2 ATR stop on 1h that is ~0.03 R, about 0.7 % of the reward",
                 "non_overlap": "one open trade per symbol and timeframe at a time",
                 "model": "replay scores with a validation model trained until 2023-12-31; "
                          "live scores with the production model trained through 2026-10",
@@ -111,6 +132,14 @@ def state():
     if ENGINE is None:
         return JSONResponse({"error": "engine not started"}, status_code=503)
     return ENGINE.snapshot()
+
+
+@app.post("/api/cut")
+def set_cut(body: dict):
+    """Change the recording cut live: fewer signals, each more reliable."""
+    if ENGINE:
+        ENGINE.cut = max(0.05, min(0.95, float(body.get("value", ENGINE.cut))))
+    return {"cut": ENGINE.cut if ENGINE else None}
 
 
 @app.post("/api/speed")
@@ -151,14 +180,15 @@ def main() -> None:
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--replay", action="store_true")
     ap.add_argument("--speed", type=float, default=25.0)
-    ap.add_argument("--cut", type=float, default=0.80)
+    ap.add_argument("--cut", type=float, default=0.0, help="probability cut; 0 = from the bands")
     ap.add_argument("--port", type=int, default=8811)
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT")
-    ap.add_argument("--tfs", default="4h,1h")
+    ap.add_argument("--tfs", default="1h")
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
 
-    ENGINE = Engine(mode="live" if args.live else "replay", speed=args.speed, cut=args.cut,
+    ENGINE = Engine(mode="live" if args.live else "replay", speed=args.speed,
+                    cut=(args.cut or None),
                     symbols=[s for s in args.symbols.split(",") if s],
                     tfs=[s for s in args.tfs.split(",") if s])
     ENGINE.prepare()

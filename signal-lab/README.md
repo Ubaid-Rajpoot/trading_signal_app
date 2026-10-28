@@ -2,8 +2,9 @@
 
 A second, separate app — built because the first one could not honestly promise what
 was asked of it. It answers the question **"can a pattern be found that wins 98–100 %
-of the time?"** with 9.6 million one-minute bars instead of an opinion, and then ships
-the best system that survived the attempt.
+of the time?"** with 9.6 million one-minute bars instead of an opinion — and, when the
+answer turned out to be "yes, and it loses money", it reframed the search around
+reward : risk and shipped the system that survived that instead.
 
 It does **not** touch `smc-radar/` or `tdigm-live/`. Nothing was deleted.
 
@@ -31,7 +32,21 @@ cd signal-lab
 The page has four tabs: the signal tape, the measured accuracy per band, **the 100 %
 club** (the rules that never lost, and what happened to them next), and the method.
 
-## The three numbers to take away
+## The numbers to take away
+
+**Accuracy is only half the question.** At reward : risk `x` with a fee `f` (in R), the
+hit rate you need is `(1 + f) / (1 + x)`. That single formula decides everything:
+
+| geometry | accuracy needed | fee share of the reward | what the model does | net per trade |
+|---|---|---|---|---|
+| 1 : 2 (round 14) | 67 % | 12 % | 75.4 % on 142 trades | +0.120 R |
+| **1 : 4 (round 15, shipped)** | **20.6 %** | **0.7 %** | **25.5 % on 184 trades** | **+0.268 R** |
+
+The shipped system: **target 8 ATR, stop 2 ATR, 1h, p ≥ 0.50**, one trade at a time.
+Positive expectancy in **all six** walk-forward slices (2 symbols × 3 periods), +0.104 R
+in the worst of them, and 10 of 12 symbol-years above break-even.
+
+And the 100 % question, answered for the record:
 
 | claim | value |
 |---|---|
@@ -39,14 +54,9 @@ club** (the rules that never lost, and what happened to them next), and the meth
 | their pooled accuracy on 2024–2026, which the search never saw | **98.48 %** (42,641 / 43,300) |
 | what a literal 100 % rule returns at that geometry, after fees | **−0.0016 R per trade** |
 
-The 100 % is real and it is worthless: the target (0.0125 R) is smaller than the
-round-trip fee (0.0141 R). Of 240 timeframe × target × stop configurations on the whole
-archive, 4 reach ≥ 98 % accuracy and **none of them makes money after fees**; the 6
-that do are 50.7 %–81.0 % accurate.
-
-What the app actually trades, measured on three walk-forward folds with non-overlapping
-trades: **75.4 % accuracy (95 % CI 67.7–81.7) at +0.120 R per trade, every fold
-positive**, at a 0.50 R:R where one loss costs two wins.
+Of 240 timeframe × target × stop configurations on the whole archive, 4 reach ≥ 98 %
+accuracy and **none of them makes money after fees**. The 6 that do are 50.7–81.0 %
+accurate.
 
 ## Reproduce
 

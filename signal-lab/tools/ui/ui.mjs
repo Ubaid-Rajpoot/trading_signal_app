@@ -18,6 +18,7 @@ const ok = (c, label) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const pageErrors = [];
 const dom = new JSDOM(html, {
   url: BASE,
   runScripts: "dangerously",
@@ -27,11 +28,14 @@ const dom = new JSDOM(html, {
     window.HTMLElement.prototype.scrollIntoView = () => {};
   },
 });
+dom.virtualConsole.on("jsdomError", (e) => pageErrors.push(e.message + (e.detail ? `: ${e.detail.message}` : "")));
 const { window } = dom;
 const doc = window.document;
 const $ = (id) => doc.getElementById(id);
 
 await sleep(4500);
+
+ok(pageErrors.length === 0, `the page's own script ran without an exception (${pageErrors.join(" | ") || "clean"})`);
 
 // ---- header & KPIs -----------------------------------------------------------
 ok(/replay|live/.test($("mode").textContent), `mode badge says what it is (${$("mode").textContent})`);
@@ -52,8 +56,18 @@ ok(rows.every((r) => r.querySelectorAll("td").length === 12), "every row has 12 
 const bandRows = [...doc.querySelectorAll("#bandTable tr")];
 ok(bandRows.length >= 6, `every measured band is on the page (${bandRows.length})`);
 const accs = bandRows.map((r) => parseFloat(r.children[3].textContent));
-ok(accs.every((a) => a >= 60 && a <= 80), `band accuracies are in the measured range (${accs.join(", ")})`);
+ok(accs.every((a) => a >= 5 && a <= 60),
+   `band accuracies are in the range a 1:4 trade can produce (${accs.join(", ")})`);
 ok(accs[0] >= accs[accs.length - 1], "the strictest band is not less accurate than the loosest");
+
+// ---- reward : risk framing ---------------------------------------------------
+ok(/risk : reward 1 : [45]/.test($("rr").textContent), `the header states the ratio (${$("rr").textContent})`);
+const be = parseFloat($("kBE").textContent);
+ok(be > 5 && be < 30, `break-even accuracy is a low number, as a 1:4 trade should be (${$("kBE").textContent})`);
+ok(/fee [\d.]+ R = \d/.test($("fee").textContent), `the fee is priced against the reward (${$("fee").textContent})`);
+ok(/of the reward/.test($("fee").textContent), "the fee is expressed as a share of the prize");
+const verdict = $("bandVerdict").textContent;
+ok(/one win pays four losses/.test(verdict), "the page explains why low accuracy is expected here");
 
 // ---- the 100 % club ----------------------------------------------------------
 const perfect = parseInt($("clubCount").textContent.replace(/,/g, ""), 10);
@@ -74,6 +88,19 @@ ok(fHigh.every((r) => r.children[8].textContent.trim().startsWith("-")),
 const fPos = [...doc.querySelectorAll("#frontierPos tr")];
 ok(fPos.length >= 3, `the profitable configurations are on the page too (${fPos.length})`);
 ok(fPos.every((r) => parseFloat(r.children[5].textContent) < 98), "none of the profitable ones is 98 %+");
+
+// ---- the cut control -----------------------------------------------------------
+const cutBtns = [...doc.querySelectorAll("#cutBtns button")];
+ok(cutBtns.length >= 5, `there is a recording-cut control with every band (${cutBtns.length})`);
+const cutBefore = (await (await fetch(BASE + "/api/state")).json()).cut;
+const b55 = cutBtns.find((b) => b.dataset.c === "0.55");
+b55.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await sleep(400);
+const mid = (await (await fetch(BASE + "/api/state")).json()).cut;
+ok(Math.abs(mid - 0.55) < 1e-9, `clicking a cut changes the recording cut (${cutBefore} -> ${mid})`);
+const back = cutBtns.find((b) => Math.abs(+b.dataset.c - cutBefore) < 1e-9);
+if (back) back.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await sleep(300);
 
 // ---- tabs --------------------------------------------------------------------
 const tabs = [...doc.querySelectorAll(".tab")];

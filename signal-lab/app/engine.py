@@ -58,6 +58,8 @@ class Signal:
     target: float | None = None
     atr: float | None = None
     status: str = "pending"
+    fee_r: float | None = None
+    break_even: float | None = None
     bars_held: int = 0
     pnl_r: float | None = None
     exit_ms: int | None = None
@@ -80,13 +82,13 @@ class Stream:
 
 
 class Engine:
-    def __init__(self, mode: str = "replay", speed: float = 25.0, cut: float = 0.80,
+    def __init__(self, mode: str = "replay", speed: float = 25.0, cut: float | None = None,
                  symbols: list[str] | None = None, tfs: list[str] | None = None,
-                 horizon: int = 60, start_ms: int = START_MS, db: str | None = None):
+                 horizon: int | None = None, start_ms: int = START_MS, db: str | None = None):
         self.mode = mode
         self.speed = speed
         self.cut = cut
-        self.horizon = horizon
+        self.horizon = horizon  # replaced by the model's own horizon below
         self.lock = threading.RLock()
         self.db_path = db or os.path.join(HERE, "data", "signals.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -108,15 +110,24 @@ class Engine:
             self.models = pack["models"]
             self.model_label = "production model, trained through 2026-10"
         self.features = pack["features"]
-        self.geometry = {"target": pack["target"], "stop": pack["stop"], "rr": pack["target"] / pack["stop"]}
+        self.geometry = {"target": pack["target"], "stop": pack["stop"],
+                         "rr": pack["target"] / pack["stop"],
+                         "label": f"1 : {pack['target'] / pack['stop']:.0f}"}
+        self.horizon = int(pack.get("horizon", 240))
+        self.fee_rt = float(pack.get("fee_rt", 0.0005))
         self.model_features = sorted(self.features)
         with open(os.path.join(HERE, "data", "bands.json")) as fh:
             self.bands_meta = json.load(fh)
         ordered = sorted(self.bands_meta["bands"], key=lambda b: -b["cut"])
         self.band_cuts = [(b["cut"], "ABCDEFGH"[min(i, 7)]) for i, b in enumerate(ordered) if b["cut"] > 0]
+        # a 1:4 model lives around p = 0.25-0.55, so the recording cut must come from
+        # the measured bands, never from a number remembered from another geometry
+        if self.cut is None:
+            self.cut = float(self.bands_meta.get(
+                "recommended_cut", min(c for c, _ in self.band_cuts)))
 
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT"]
-        self.tfs = tfs or ["4h", "1h"]
+        self.tfs = tfs or ["1h"]
         self.streams: dict[tuple[str, str], Stream] = {}
         self.clock_ms = start_ms
         self.steps = 0
@@ -207,6 +218,13 @@ class Engine:
             # barriers belong to the price the trade is actually filled at
             sig.stop = o - self.geometry["stop"] * sig.atr
             sig.target = o + self.geometry["target"] * sig.atr
+            # what the round trip costs, in R, and the accuracy this trade needs
+            # the round trip costs `fee_rt` of the *price*; in R that is
+            # fee_rt * price / (stop in price)
+            risk_r = self.geometry["stop"] * sig.atr
+            sig.fee_r = self.fee_rt * o / risk_r if risk_r > 0 else None
+            if sig.fee_r is not None:
+                sig.break_even = (1 + sig.fee_r) / (1 + self.geometry["rr"])
             st.pending = None
             st.open.append(sig)
             self._persist(sig)
@@ -305,7 +323,7 @@ class Engine:
                 "mode": self.mode, "clock_ms": self.clock_ms, "steps": self.steps,
                 "speed": self.speed, "finished": self.finished, "error": self.error,
                 "symbols": self.symbols, "tfs": self.tfs, "cut": self.cut,
-                "model": self.model_label,
+                "model": self.model_label, "fee_bp": self.fee_rt * 1e4,
                 "geometry": self.geometry, "horizon": self.horizon,
                 "streams": [{"symbol": st.symbol, "tf": st.tf,
                              "time_ms": int(st.s.t[st.i]) * 60000 if st.i >= 0 else None,
@@ -314,22 +332,29 @@ class Engine:
             }
 
     def _stats(self) -> dict:
-        out = {"all": _agg(self.memory)}
+        out = {"all": _agg(self.memory, self.geometry["rr"])}
         by_band: dict[str, list[dict]] = {}
         for r in self.memory:
             by_band.setdefault(r["band"], []).append(r)
-        out["bands"] = {b: _agg(v) for b, v in sorted(by_band.items())}
+        out["bands"] = {b: _agg(v, self.geometry["rr"]) for b, v in sorted(by_band.items())}
         return out
 
 
-def _agg(rows: list[dict]) -> dict:
+def _agg(rows: list[dict], rr: float = 0.0) -> dict:
     won = sum(1 for r in rows if r["status"] == "won")
     lost = sum(1 for r in rows if r["status"] == "lost")
     exp = sum(1 for r in rows if r["status"] == "expired")
     res = won + lost
+    fees = [r["fee_r"] for r in rows if r.get("fee_r") is not None]
+    bes = [r["break_even"] for r in rows if r.get("break_even") is not None]
+    net = float(sum((r["pnl_r"] or 0) - (r.get("fee_r") or 0) * (1 if r["status"] in ("won", "lost") else 0)
+                    for r in rows))
     return {"n": len(rows), "won": won, "lost": lost, "expired": exp,
             "accuracy": (won / res) if res else None,
-            "net_r": float(sum(r["pnl_r"] or 0 for r in rows)),
+            "break_even": (sum(bes) / len(bes)) if bes else None,
+            "fee_r": (sum(fees) / len(fees)) if fees else None,
+            "expectancy": (net / res) if res else None,
+            "net_r": net, "rr": rr,
             "open": sum(1 for r in rows if r["status"] in ("open", "pending"))}
 
 
