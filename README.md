@@ -148,9 +148,13 @@ replay: 144 signals, 23.7 % accuracy, +19.9 R.
 
 ```bash
 cd signal-lab
-../.venv/bin/python tools/build_dataset.py          # build the archive
-../.venv/bin/python app/server.py --replay --speed 150 --port 8811
+python3 -m venv ../.venv && ../.venv/bin/pip install -r requirements.txt
+../.venv/bin/python tools/build_dataset.py                  # build the archive
+../.venv/bin/python app/server.py --replay --loop --speed 150 --port 8811
 ```
+
+How to run it (flags, live mode, Windows, troubleshooting):
+[`signal-lab/RUNNING.md`](signal-lab/RUNNING.md).
 
 Full method, every table and every caveat: [`signal-lab/REPORT.md`](signal-lab/REPORT.md).
 

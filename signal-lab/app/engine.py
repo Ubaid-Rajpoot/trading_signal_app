@@ -35,7 +35,7 @@ for p in (ROOT, HERE):
 
 from lab import data as labdata  # noqa: E402
 from lab import features as labfeatures  # noqa: E402
-from lab.outcomes import atr_series  # noqa: E402
+from lab.outcomes import atr_series, first_touch  # noqa: E402
 
 DATA_DIR = os.path.join(ROOT, "data")
 START_MS = 1704067200000     # 2024-01-01 - the years the model never trained on
@@ -83,6 +83,7 @@ class Stream:
         # position: a trade that resolves in 3 bars must not let the next one in
         # immediately, or the sample is 4x larger than the one that was measured
         self.next_ok_bar = 0
+        self.last_t: int = 0
 
 
 class Engine:
@@ -133,9 +134,12 @@ class Engine:
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT"]
         self.tfs = tfs or ["1h"]
         self.streams: dict[tuple[str, str], Stream] = {}
-        self.clock_ms = start_ms
+        # replay starts at the first recorded bar; live starts now (otherwise the
+        # page would show 2024-01-01 until the first poll succeeds)
+        self.clock_ms = int(time.time() * 1000) if mode == "live" else start_ms
         self.steps = 0
         self.finished = False
+        self.adopted = 0
         self.error: str | None = None
         self.started = time.time()
         if mode == "replay":
@@ -299,19 +303,80 @@ class Engine:
         import httpx
         import feed
 
-        self.client = httpx.Client()
+        self.client = httpx.Client(timeout=20.0)
         for sym in self.symbols:
+            pair = mexc_symbol(sym)
             for tf in self.tfs:
                 try:
-                    rows = feed.klines(self.client, sym, tf, bars=WARMUP)
+                    rows = feed.klines(self.client, pair, tf, bars=WARMUP)
                 except Exception as exc:  # a bad symbol must not kill the app
-                    self.error = f"{sym} {tf}: {exc}"
+                    self.error = f"{pair} {tf}: {exc}"
                     continue
                 if len(rows) < 250:
+                    self.error = f"{pair} {tf}: only {len(rows)} candles came back"
                     continue
-                self.streams[(sym, tf)] = Stream(sym, tf, _series_from_rows(sym, tf, rows))
+                st = Stream(pair, tf, _series_from_rows(pair, tf, rows))
+                st.i = len(st.s) - 2          # the newest bar is still forming
+                st.last_t = int(st.s.t[st.i])
+                self.streams[(pair, tf)] = st
+                self.clock_ms = max(self.clock_ms, int(st.s.t[st.i]) * 60000)
+        self._adopt_live()
+
+    def _adopt_live(self) -> None:  # pragma: no cover - needs the exchange
+        """Re-open the trades that were still running when the app was stopped.
+
+        A restart must not lose a live trade: the row is in SQLite, so it is looked
+        up, its barriers are replayed over the candles that have arrived since, and
+        whatever is still open is put back under supervision.
+        """
+        open_rows = [m for m in self.memory if m["status"] in ("open", "pending")]
+        for row in open_rows:
+            st = self.streams.get((row["symbol"], row["tf"]))
+            if st is None:
+                continue
+            s = st.s
+            if row["entry_ms"] is None:
+                self._persist_row({**row, "status": "canceled", "pnl_r": 0.0})
+                continue
+            j = int(np.searchsorted(s.t, row["entry_ms"] // 60000))
+            if j >= len(s) or row["target"] is None or row["stop"] is None:
+                continue
+            out = first_touch(s.h, s.l, np.array([j]), np.array([row["target"]]),
+                              np.array([row["stop"]]), max(1, int(self.horizon)))
+            if out[0] != 0:
+                self._persist_row({**row, "status": "won" if out[0] == 1 else "lost",
+                                   "pnl_r": self.geometry["rr"] if out[0] == 1 else -1.0,
+                                   "bars_held": int(len(s) - 1 - j),
+                                   "exit_ms": int(s.t[len(s) - 2]) * 60000})
+                continue
+            sig = Signal(key=row["key"], symbol=row["symbol"], tf=row["tf"], side=row["side"],
+                         band=row["band"], prob=row["prob"], signal_ms=row["signal_ms"],
+                         entry_ms=row["entry_ms"], entry=row["entry"], stop=row["stop"],
+                         target=row["target"], atr=row["atr"], status="open",
+                         fee_r=row.get("fee_r"), break_even=row.get("break_even"),
+                         bars_held=int(len(s) - 1 - j))
+            st.open.append(sig)
+            self.adopted += 1
+
+    def _persist_row(self, row: dict) -> None:
+        self.memory = [m for m in self.memory if m["key"] != row["key"]]
+        self.memory.append(row)
+        self._db.execute(
+            "INSERT OR REPLACE INTO signals(key, symbol, tf, side, band, prob, signal_ms, entry_ms,"
+            " entry, stop, target, atr, status, bars_held, pnl_r, exit_ms, mode)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row["key"], row["symbol"], row["tf"], row["side"], row["band"], row["prob"],
+             row["signal_ms"], row["entry_ms"], row["entry"], row["stop"], row["target"],
+             row["atr"], row["status"], row["bars_held"], row["pnl_r"], row["exit_ms"], self.mode))
+        self._db.commit()
 
     def tick_live(self) -> None:  # pragma: no cover - needs the exchange
+        """Poll every stream and walk the bars that closed since the last poll.
+
+        The old loop scored only the newest closed bar, so a stop touched in a bar
+        that closed between two 45-second polls was never seen, and the horizon
+        counted polls instead of bars.
+        """
         import feed
         for key, st in list(self.streams.items()):
             try:
@@ -319,13 +384,22 @@ class Engine:
             except Exception as exc:
                 self.error = f"{key[0]} {key[1]}: {exc}"
                 continue
-            if not rows:
+            if len(rows) < 2:
+                self.error = f"{key[0]} {key[1]}: no candles returned"
                 continue
             s = _series_from_rows(key[0], key[1], rows)
             st.s = s
-            st.i = len(s) - 2  # the last bar is still forming
-            self.clock_ms = int(s.t[st.i]) * 60000
-            self._on_bar(st, st.i)
+            newest = len(s) - 2                      # the last bar is still forming
+            start = int(np.searchsorted(s.t, st.last_t, side="right")) if st.last_t else newest
+            start = min(max(start, st.i + 1 if st.i >= 0 else newest), newest)
+            for i in range(start, newest + 1):
+                st.i = i
+                st.last_t = int(s.t[i])
+                self.clock_ms = max(self.clock_ms, int(s.t[i]) * 60000)
+                try:
+                    self._on_bar(st, i)
+                except Exception as exc:          # one bad bar must not stop the app
+                    self.error = f"{key[0]} {key[1]} bar {i}: {exc}"
 
     # ------------------------------------------------------------------- view
     def snapshot(self, limit: int = 300) -> dict:
@@ -338,6 +412,7 @@ class Engine:
                 "mode": self.mode, "clock_ms": self.clock_ms, "steps": self.steps,
                 "speed": self.speed, "finished": self.finished, "error": self.error,
                 "symbols": self.symbols, "tfs": self.tfs, "cut": self.cut,
+                "adopted": self.adopted,
                 "model": self.model_label, "fee_bp": self.fee_rt * 1e4,
                 "geometry": self.geometry, "horizon": self.horizon,
                 "streams": [{"symbol": st.symbol, "tf": st.tf,
@@ -371,6 +446,13 @@ def _agg(rows: list[dict], rr: float = 0.0) -> dict:
             "expectancy": (net / res) if res else None,
             "net_r": net, "rr": rr,
             "open": sum(1 for r in rows if r["status"] in ("open", "pending"))}
+
+
+def mexc_symbol(sym: str) -> str:
+    """`BTCUSDT` -> `BTC_USDT`, the name MEXC futures uses. Anything else is left alone."""
+    if "_" in sym or not sym.endswith("USDT") or len(sym) <= 4:
+        return sym
+    return sym[:-4] + "_USDT"
 
 
 def _series_from_rows(symbol: str, tf: str, rows: list[list[float]]):

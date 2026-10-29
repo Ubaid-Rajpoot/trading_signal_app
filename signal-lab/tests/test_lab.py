@@ -330,7 +330,14 @@ def test_a_second_signal_waits_out_the_horizon(tmp_path):
     assert len(e.memory) == 1, "no second signal inside the horizon, even if the trade closed"
 
 
+def archive_available() -> bool:
+    d = os.path.join(ROOT, "data")
+    return os.path.exists(os.path.join(d, "BTCUSDT_1m.npy"))
+
+
 def test_rewinding_a_replay_starts_clean(tmp_path):
+    if not archive_available():
+        pytest.skip("the 9.6 M bar archive is not built (run tools/build_dataset.py)")
     from engine import Engine
 
     e = Engine(mode="replay", speed=1, tfs=["1h"], db=str(tmp_path / "t.db"))
@@ -342,3 +349,84 @@ def test_rewinding_a_replay_starts_clean(tmp_path):
     assert e.steps == 0 and e.memory == [] and not e.finished
     assert n_before > 0
     assert e._db.execute("SELECT count(*) FROM signals").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------- live mode
+def _live_engine(tmp_path, symbols=("BTC_USDT",), tfs=("1h",)):
+    from engine import Engine
+
+    e = Engine(mode="live", speed=1, tfs=list(tfs), symbols=list(symbols),
+               db=str(tmp_path / "live.db"))
+    e.client = None
+    return e
+
+
+def test_mexc_names():
+    from engine import mexc_symbol
+
+    assert mexc_symbol("BTCUSDT") == "BTC_USDT"
+    assert mexc_symbol("1000PEPEUSDT") == "1000PEPE_USDT"
+    assert mexc_symbol("BTC_USDT") == "BTC_USDT"
+    assert mexc_symbol("TEST") == "TEST"
+
+
+def test_live_walks_every_bar_that_closed_between_polls(tmp_path, monkeypatch):
+    """A stop touched in a skipped bar must still be seen.
+
+    The first live loop scored only the newest closed bar every 45 s, so anything
+    that happened in a bar which opened and closed between two polls was invisible,
+    and the holding period counted polls instead of bars.
+    """
+    import feed
+    from lab import data as labdata
+
+    s = random_walk(400)
+    rows = [[float(t) * 60, float(o), float(c), float(h), float(l), 1.0]
+            for t, o, c, h, l in zip(s.t, s.o, s.c, s.h, s.l)]
+    monkeypatch.setattr(feed, "klines", lambda *a, **k: rows)
+
+    e = _live_engine(tmp_path)
+    e.streams = {("BTC_USDT", "1h"): __import__("engine").Stream("BTC_USDT", "1h",
+                                                               labdata.Series(
+        "BTC_USDT", "1h", s.t[:300], s.o[:300], s.h[:300], s.l[:300], s.c[:300],
+        s.v[:300], s.qv[:300], s.n[:300], s.tb[:300]))}
+    st = e.streams[("BTC_USDT", "1h")]
+    st.i, st.last_t = 298, int(s.t[298])
+    e.tick_live()
+    assert st.last_t == int(s.t[398]), "the stream caught up to the newest closed bar"
+    assert st.i == 398
+
+
+def test_a_trade_still_open_across_a_restart_is_adopted_and_resolved(tmp_path, monkeypatch):
+    """Signals must survive a restart - the round-12 requirement, in live mode."""
+    import feed
+    from lab import data as labdata
+
+    s = random_walk(600)
+    rows = [[float(t) * 60, float(o), float(c), float(h), float(l), 1.0]
+            for t, o, c, h, l in zip(s.t, s.o, s.c, s.h, s.l)]
+    monkeypatch.setattr(feed, "klines", lambda *a, **k: rows)
+
+    e = _live_engine(tmp_path)
+    e.streams = {("BTC_USDT", "1h"): __import__("engine").Stream("BTC_USDT", "1h",
+                                                                labdata.Series("BTC_USDT", "1h", s.t, s.o, s.h, s.l, s.c, s.v, s.qv, s.n, s.tb))}
+    entry_i, entry = 150, float(s.o[150])
+    target, stop = entry + 5.0, entry - 5.0
+    key = "BTC_USDT:1h:test"
+    e._db.execute("INSERT INTO signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (key, "BTC_USDT", "1h", "long", "C", 0.4, int(s.t[149]) * 60000,
+                   int(s.t[150]) * 60000, entry, stop, target, 2.5, "open", 0, None, None, "live"))
+    e._db.commit()
+    e.memory = [dict(key=key, symbol="BTC_USDT", tf="1h", side="long", band="C", prob=0.4,
+                     signal_ms=int(s.t[149]) * 60000, entry_ms=int(s.t[150]) * 60000,
+                     entry=entry, stop=stop, target=target, atr=2.5, status="open",
+                     bars_held=0, pnl_r=None, exit_ms=None)]
+    e._adopt_live()
+
+    row = [m for m in e.memory if m["key"] == key][0]
+    assert row["status"] in ("won", "lost", "expired", "open")
+    st = e.streams[("BTC_USDT", "1h")]
+    if row["status"] == "open":
+        assert any(x.key == key for x in st.open), "an unresolved trade is back under supervision"
+    else:
+        assert st.open == [] or all(x.key != key for x in st.open)

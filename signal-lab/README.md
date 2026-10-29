@@ -23,11 +23,16 @@ signal-lab/
 
 ```bash
 cd signal-lab
-../.venv/bin/python tools/build_dataset.py          # ~700 MB download, ~2 min
-../.venv/bin/python app/server.py --replay --speed 40 --port 8811
-#  -> http://localhost:8811          (replay of 2024-01 → 2026-10, in arrival order)
-#  -> python app/server.py --live    (polls MEXC futures instead)
+python3 -m venv ../.venv && ../.venv/bin/pip install -r requirements.txt
+../.venv/bin/python tools/build_dataset.py                  # ~700 MB download, ~3 min
+../.venv/bin/python app/server.py --replay --loop --speed 150 --port 8811
+#  -> http://localhost:8811   (replay of 2024-01 → 2026-10, in arrival order)
+
+../.venv/bin/python app/server.py --live --port 8811        # real MEXC futures
 ```
+
+Every flag, the Windows commands and the troubleshooting table:
+**[RUNNING.md](RUNNING.md)**.
 
 The page has four tabs: the signal tape, the measured accuracy per band, **the 100 %
 club** (the rules that never lost, and what happened to them next), and the method.
