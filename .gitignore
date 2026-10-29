@@ -26,8 +26,10 @@ frontend/dist/
 .DS_Store
 *.log
 
-# Downloaded market data (real candles are fetched, never committed)
-data/
+# Downloaded market data (real candles are fetched, never committed).
+# Anchored so the small JSON the app ships in signal-lab/app/data stays trackable.
+/data/
+signal-lab/data/
 tdigm-live/data/
 smc-radar/data/
 smc-radar/study-data/

@@ -21,7 +21,12 @@ from typing import Any
 import httpx
 
 BASE = "https://contract.mexc.com"
-TF_TO_INTERVAL = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60", "4h": "Hour4"}
+# MEXC serves these intervals directly. Everything else (3m, 10m, 45m, 2h, 3h) is
+# built by aggregating the nearest native interval below it.
+TF_TO_INTERVAL = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30",
+                  "1h": "Min60", "4h": "Hour4"}
+NATIVE_FOR = {"1m": "1m", "3m": "1m", "5m": "5m", "10m": "5m", "15m": "15m", "30m": "15m",
+              "45m": "15m", "1h": "1h", "2h": "1h", "3h": "1h", "4h": "4h"}
 
 
 def decode_body(raw: bytes, encoding: str = "") -> bytes:
@@ -69,6 +74,34 @@ def klines(client: httpx.Client, symbol: str, tf: str, bars: int = 400) -> list[
         if isinstance(r, (list, tuple)) and len(r) >= 6:
             out.append([float(x) for x in r[:6]])
     return out[-bars:]
+
+
+def native_intervals(tfs: list[str]) -> list[str]:
+    """The distinct exchange intervals needed to build `tfs`."""
+    out = []
+    for tf in tfs:
+        n = NATIVE_FOR.get(tf, tf)
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def klines_raw(client: httpx.Client, symbol: str, interval: str, bars: int = 2000) -> list[list[float]]:
+    """Most recent `bars` candles of an exchange interval, oldest first."""
+    span = bars * {"Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
+                   "Min60": 3600, "Hour4": 14400}.get(interval, 3600) * 2
+    now = int(time.time())
+    data = get_json(client, f"/api/v1/contract/kline/{symbol}",
+                    {"interval": interval, "start": now - span, "end": now})
+    d = data.get("data")
+    rows: list[list[float]] = []
+    if isinstance(d, dict) and "time" in d:
+        rows = list(zip(d["time"], d["open"], d["close"], d["high"], d["low"], d["vol"]))
+    elif isinstance(d, list):
+        for r in d:
+            if isinstance(r, (list, tuple)) and len(r) >= 6:
+                rows.append(r[:6])
+    return [[float(x) for x in r] for r in rows][-bars:]
 
 
 def symbols(client: httpx.Client, top: int = 60) -> list[str]:

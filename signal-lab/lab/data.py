@@ -19,7 +19,8 @@ import numpy as np
 COLS = ("open", "high", "low", "close", "volume", "quote_volume", "trades", "taker_buy")
 DATA_DIR = os.environ.get("SIGNAL_LAB_DATA", os.path.join(os.path.dirname(__file__), "..", "data"))
 
-TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30, "45m": 45,
+              "1h": 60, "2h": 120, "3h": 180, "4h": 240, "1d": 1440}
 
 
 @dataclass

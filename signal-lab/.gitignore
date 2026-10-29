@@ -3,3 +3,8 @@
 /results/*.log
 __pycache__/
 /app/data/signals.db
+# the shipped model artefacts are committed; only the runtime db and the raw
+# candles are local. `data/` in the root .gitignore was meant for the download
+# cache, so re-include the small JSON the app loads at start-up.
+!/app/data/geoms.json
+!/app/data/bands_tf.json

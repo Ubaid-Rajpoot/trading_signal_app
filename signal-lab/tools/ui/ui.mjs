@@ -108,12 +108,42 @@ const back = cutBtns.find((b) => Math.abs(+b.dataset.c - cutBefore) < 1e-9);
 if (back) back.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await sleep(300);
 
+// ---- act-now panel -------------------------------------------------------------
+ok($("candBox").textContent.trim().length > 0, `the act-now box says something (${$("candBox").textContent.trim().slice(0, 60)})`);
+const tfRows = [...doc.querySelectorAll("#tfTable tr")];
+ok(tfRows.length >= 1, `the scan shows each timeframe's geometry (${tfRows.length} rows)`);
+ok(/next scan|replay clock/.test($("nextScan").textContent),
+   `the header counts down to the next scan (${$("nextScan").textContent})`);
+const scanResp = await (await fetch(BASE + "/api/scan", { method: "POST" })).json();
+ok(scanResp && (scanResp.ok || scanResp.note), `a scan can be requested without an error (${JSON.stringify(scanResp).slice(0, 80)})`);
+
+// ---- config editor -----------------------------------------------------------------
+const cfgBefore = await (await fetch(BASE + "/api/config")).json();
+ok(!!cfgBefore.config && cfgBefore.path, `the settings panel knows where config.json is (${cfgBefore.path})`);
+ok(Array.isArray(cfgBefore.config.timeframes) && cfgBefore.config.timeframes.length > 0,
+   `the configured timeframes come back (${(cfgBefore.config.timeframes || []).join(",")})`);
+const pollBefore = cfgBefore.config.poll_seconds;
+await fetch(BASE + "/api/config", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ poll_seconds: 61 }) });
+const cfgAfter = await (await fetch(BASE + "/api/config")).json();
+ok(cfgAfter.config.poll_seconds === 61, `a setting is written to config.json and read back (${pollBefore} -> ${cfgAfter.config.poll_seconds})`);
+await fetch(BASE + "/api/config", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ poll_seconds: pollBefore }) });
+$("cfgPoll").value = 75;
+$("cfgSave").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await sleep(600);
+ok(/saved to /.test($("cfgMsg").textContent), `the Save button reports where it wrote (${$("cfgMsg").textContent.slice(0, 70)})`);
+await fetch(BASE + "/api/config", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ poll_seconds: pollBefore }) });
+
 // ---- tabs --------------------------------------------------------------------
 const tabs = [...doc.querySelectorAll(".tab")];
-ok(tabs.length === 4, "four tabs");
-tabs[2].dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+ok(tabs.length === 5, `five tabs (${tabs.length})`);
+tabs[3].dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await sleep(150);
-ok(!$("t-club").hidden && $("t-signals").hidden, "clicking a tab switches the panel");
+ok(!$("t-club").hidden && $("t-scan").hidden, "clicking a tab switches the panel");
+tabs[0].dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await sleep(100);
 
 // ---- persistence across a reload --------------------------------------------
 const before = parseInt($("kSignals").textContent, 10);

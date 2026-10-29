@@ -413,7 +413,9 @@ def test_a_trade_still_open_across_a_restart_is_adopted_and_resolved(tmp_path, m
     entry_i, entry = 150, float(s.o[150])
     target, stop = entry + 5.0, entry - 5.0
     key = "BTC_USDT:1h:test"
-    e._db.execute("INSERT INTO signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    e._db.execute("INSERT INTO signals(key, symbol, tf, side, band, prob, signal_ms, entry_ms,"
+                  " entry, stop, target, atr, status, bars_held, pnl_r, exit_ms, mode)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (key, "BTC_USDT", "1h", "long", "C", 0.4, int(s.t[149]) * 60000,
                    int(s.t[150]) * 60000, entry, stop, target, 2.5, "open", 0, None, None, "live"))
     e._db.commit()
@@ -430,3 +432,154 @@ def test_a_trade_still_open_across_a_restart_is_adopted_and_resolved(tmp_path, m
         assert any(x.key == key for x in st.open), "an unresolved trade is back under supervision"
     else:
         assert st.open == [] or all(x.key != key for x in st.open)
+
+
+# ------------------------------------------------- round 16: config & the scanner
+def test_config_json_is_the_source_of_truth(tmp_path):
+    """A long symbol list and every setting live in a file, not in argv."""
+    import config as appconfig
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({
+        "_comment": ["kept as-is"],
+        "mode": "live", "port": 8811, "timeframes": ["1m", "1h", "bogus"],
+        "symbols": ["btcusdt", "BTCUSDT", "ethusdt"], "auto_top": 50,
+        "poll_seconds": "45", "workers": 6,
+    }))
+    cfg = appconfig.load(str(p))
+    assert cfg.poll_seconds == 45.0 and cfg.workers == 6
+    assert cfg.symbols_final == ["BTCUSDT", "ETHUSDT"], "names are normalised and de-duplicated"
+    assert cfg.timeframes == ["1m", "1h"], "an unknown timeframe is dropped, not passed on"
+    cfg.poll_seconds = 30
+    appconfig.save(cfg, str(p))
+    again = json.loads(p.read_text())
+    assert again["_comment"] == ["kept as-is"], "the hand-written comment survives a save"
+    assert again["poll_seconds"] == 30
+    assert appconfig.load(str(p)).poll_seconds == 30
+
+
+def test_timeframes_mexc_does_not_serve_are_aggregated():
+    """3m/10m/45m/2h/3h are built from the nearest native interval."""
+    from engine import NATIVE_FOR, build_series
+
+    assert NATIVE_FOR["3m"] == "1m" and NATIVE_FOR["45m"] == "15m" and NATIVE_FOR["2h"] == "1h"
+    # six 5-minute candles -> two 15-minute candles
+    rows = []
+    for i in range(6):
+        o, c = 100.0 + i, 100.5 + i
+        rows.append([i * 300, o, c, c + 1, o - 1, 10.0])
+    s = build_series("X", "5m", "15m", rows)
+    assert len(s) == 2 and s.tf == "15m"
+    assert s.o[0] == 100.0 and s.c[0] == 102.5      # first three candles
+    assert s.h[0] == 103.5 and s.l[0] == 99.0
+    assert s.o[1] == 103.0 and s.c[1] == 105.5
+    assert s.v[0] == 30.0, "volume is summed across the aggregated candles"
+
+
+def _fake_exchange(monkeypatch, symbols, minutes=1200, seed=7):
+    """Serve synthetic candles for every native interval without a network."""
+    import feed
+
+    def rows_for(symbol, tf, bars):
+        step = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30, "45m": 45,
+                "1h": 60, "2h": 120, "3h": 180, "4h": 240}[tf]
+        # 900 bars: enough history for the 500-bar feature windows, so a scored
+        # bar is a real row and not a NaN
+        n = max(900, min(bars, 900))
+        s = random_walk(n, seed=seed + sum(map(ord, symbol)) % 97)
+        return [[float(t) * 60 * step, float(o), float(c), float(h), float(l), float(v)]
+                for t, o, c, h, l, v in zip(s.t, s.o, s.c, s.h, s.l, s.v)]
+
+    monkeypatch.setattr(feed, "klines", lambda client, sym, tf, bars=400: rows_for(sym, tf, bars))
+    monkeypatch.setattr(feed, "symbols", lambda client, top=60: list(symbols))
+
+
+def test_many_symbols_and_timeframes_are_scanned_in_parallel_without_hanging(tmp_path, monkeypatch):
+    """The round-16 complaint: a long universe must scan, not hang.
+
+    Eight symbols x four timeframes, one of which the exchange does not serve
+    natively (10m from 5m, 3h from 1h). The poll must finish, build a stream for
+    every pair, and record what it found - including on a single fast poll.
+    """
+    import time as _time
+    from engine import Engine
+
+    symbols = [f"COIN{i}_USDT" for i in range(8)]
+    _fake_exchange(monkeypatch, symbols)
+    cfg = _cfg(tmp_path, symbols=symbols, tfs=["1m", "5m", "10m", "1h", "3h"], scan_bars=20)
+    e = Engine(mode="live", tfs=cfg.timeframes, symbols=symbols, config=cfg,
+               db=str(tmp_path / "scan.db"))
+    e.universe = symbols
+    _multi_tf(e, cfg.timeframes)
+    e.cut = 0.10                     # synthetic candles: score them all
+    t0 = _time.time()
+    out = e.poll_live(first=True)
+    took = _time.time() - t0
+    assert took < 60, f"a 40-stream poll took {took:.1f}s"
+    assert out["ok"] == len(symbols) and out["failed"] == 0
+    assert len(e.streams) == len(symbols) * len(cfg.timeframes)
+    assert out["bars"] > 0, "the start-up scan walked back over closed bars"
+    assert e.error is None
+    snap = e.snapshot()
+    assert snap["universe"] == len(symbols)
+    assert any(s["tf"] == "3h" for s in snap["streams"]), "the aggregated timeframe is live"
+
+
+def test_a_signal_is_available_on_the_first_poll_not_after_hours(tmp_path, monkeypatch):
+    """Start-up scans the last `scan_bars` closed bars, so the page is never empty."""
+    from engine import Engine
+
+    symbols = ["AAA_USDT", "BBB_USDT"]
+    _fake_exchange(monkeypatch, symbols)
+    cfg = _cfg(tmp_path, symbols=symbols, tfs=["15m", "1h"], scan_bars=30)
+    e = Engine(mode="live", tfs=cfg.timeframes, symbols=symbols, config=cfg,
+               db=str(tmp_path / "scan.db"))
+    e.universe = symbols
+    _multi_tf(e, cfg.timeframes)
+    e.cut = 0.10
+    e.poll_live(first=True)
+    assert e.memory, "the first poll recorded signals from the bars it walked back over"
+    assert all(m["signal_ms"] for m in e.memory)
+    assert any(m["origin"] == "scan" for m in e.memory), "they are marked as a start-up scan"
+    cands = e.candidates(10)
+    assert all(c["status"] in ("pending", "open") for c in cands)
+    if cands:
+        # what the page prints on the card: size at the configured risk, and the
+        # price the trade will be filled at (open of the next bar)
+        c = cands[0]
+        assert c["size"] is not None
+        assert c["size"]["risk_usd"] == pytest.approx(
+            cfg.equity_usd * cfg.risk_per_trade_pct / 100)
+        if c["status"] == "pending":
+            assert c["size"]["estimated_entry"] is True
+        else:
+            assert c["size"]["estimated_entry"] is False
+
+
+class _Always:
+    """A stand-in model: it always says yes, so the plumbing is what is tested."""
+
+    def predict_proba(self, x):
+        return np.array([[0.05, 0.95]] * len(x))
+
+
+def _multi_tf(engine, tfs):
+    """Give an engine a model for every timeframe the test wants to watch."""
+    engine.models = {tf: _Always() for tf in tfs}
+    engine.tfs = list(tfs)
+    engine.missing_tfs = []
+    # score on features a candle feed can actually produce (see lab.features.live_safe)
+    engine.model_features = features.live_safe()
+
+
+def _cfg(tmp_path, symbols=("BTC_USDT",), tfs=("1h",), scan_bars=40):
+    import config as appconfig
+
+    cfg = appconfig.Config()
+    cfg.path = str(tmp_path / "config.json")
+    cfg.db = str(tmp_path / "signals.db")
+    cfg.symbols = list(symbols)
+    cfg.timeframes = list(tfs)
+    cfg.scan_bars = scan_bars
+    cfg.workers = 4
+    return cfg

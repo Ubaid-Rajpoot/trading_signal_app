@@ -1,5 +1,68 @@
 # SignalLab — accuracy against the accuracy you need
 
+> **Round 16 (current build) — config, many instruments, fast signals.**
+>
+> The complaint was: *"sometimes no signals for hours, too many coins make the command
+> line hang, and I want to trade now."* Three things changed.
+>
+> **1. Settings moved into `config.json`.** 120 instruments, 11 timeframes, the poll
+> interval, the risk per trade and the database all live in one file. The command line
+> only overrides it, and the page writes back to it. A long universe can no longer hang
+> the app: fetches go through a bounded pool of `workers` with a per-request timeout, a
+> failing symbol is counted and skipped, and the symbol list is capped by `auto_top`.
+>
+> **2. Every timeframe was measured before it was shipped.** The fee is a fixed 5 bp of
+> *price*; in R it is `5 bp / (stop in ATR × ATR/price)`, so the same 2 ATR stop is
+> 0.03 R on 1h and 0.5 R on 1m. Per-clock stops were therefore mandatory, not cosmetic.
+> Measured on 2024-2026, non-overlapping, BTCUSDT + ETHUSDT, 57 features a live candle
+> feed can actually produce:
+>
+> | TF | stop / target | fee | break-even | win | EV after fees | n | /day/sym |
+> |---|---|---|---|---|---|---|---|
+> | **45m** | 1 / 4 ATR | 0.066 R | 21.3 % | 24.5 % | **+0.127 R** | 192 | 0.19 |
+> | **1h** | 1 / 4 ATR | 0.056 R | 21.1 % | 25.7 % | **+0.206 R** | 144 | 0.14 |
+> | **2h** | 1 / 4 ATR | 0.039 R | 20.8 % | 21.8 % | **+0.037 R** | 257 | 0.25 |
+> | 3h | 2 / 8 ATR | 0.016 R | 20.3 % | 20.0 % | −0.022 R | 100 | 0.10 |
+> | 4h | 1 / 4 ATR | 0.027 R | 20.5 % | 19.7 % | −0.052 R | 117 | 0.11 |
+> | 30m | 1 / 4 ATR | 0.077 R | 21.5 % | 19.1 % | −0.120 R | 298 | 0.29 |
+> | 15m | 2 / 8 ATR | 0.056 R | 21.1 % | 19.2 % | −0.097 R | 480 | 0.53 |
+> | 10m | 2 / 8 ATR | 0.073 R | 21.5 % | 19.7 % | −0.087 R | 142 | 0.65 |
+> | 5m | 2 / 8 ATR | 0.100 R | 22.0 % | 19.0 % | −0.150 R | 742 | 1.17 |
+> | 3m | 2 / 8 ATR | 0.191 R | 23.8 % | 20.6 % | −0.159 R | 412 | 0.34 |
+> | 1m | 4 / 16 ATR | 0.192 R | 23.8 % | 17.5 % | −0.318 R | 2 524 | 1.42 |
+>
+> 45m, 1h and 2h are on by default; the rest are shipped as measured, marked `off`, and
+> can be enabled per clock. **The fast timeframes fail for an arithmetic reason, not a
+> model reason:** on 1m a 4 ATR stop is ~0.19 % of price, so the round trip costs 0.19 R
+> before the trade starts, and no stop/target pair tested overcame it.
+>
+> **3. Signals are on the page at start-up.** The first poll walks back `scan_bars` (40)
+> closed bars on every stream and scores them in one pass (features computed once per
+> window, not once per bar), so setups that are still in play appear within seconds
+> instead of after an hour. With 120 instruments × 3 timeframes the scan produces
+> ~50–60 signals a day in total, and **Scan now** polls on demand.
+>
+> **Also fixed, and it mattered more than any of the above:** MEXC candles carry no
+> trade count and no taker-buy split, so the features built on those two columns are
+> always NaN in live mode - and the engine drops any bar with a NaN feature. A model
+> trained on all 59 features could therefore *never* emit a live signal; it waited
+> forever. The feature list is now derived from what a candle feed can produce
+> (`lab.features.live_safe()`, 57 features) and a test pins it.
+>
+> **The running app reproduces it.** `tools/replay_check.py` walks the app's own engine
+> over the whole 2024-2026 archive with the validation model (trained to 2023-12-31) and
+> the shipped per-timeframe geometry: **651 signals, 158 won / 491 lost, 24.3 % accuracy
+> against a 21.6 % break-even, +0.137 R per trade, +88.9 R net**, in 100 seconds of wall
+> clock. Per clock: 1h 229 signals at 27.1 % (+0.277 R), 2h 123 at 23.8 % (+0.136 R),
+> 45m 299 at 22.5 % (+0.030 R). Those are the numbers the page will show you if you run
+> the replay; they are not copied from the research table.
+>
+> **What is not claimed:** nothing makes price move to the target immediately. At 1 : 4
+> the honest expectation is one win in four, with a measured edge of +0.04 to +0.21 R
+> per trade on 100–260 trades per clock — small samples with wide intervals. The
+> "no signals for hours" complaint is answered by breadth (120 instruments) and by the
+> 45m/2h clocks, not by pretending the 1-minute chart works.
+
 Round 14 hunted 100 % accuracy and found it, 480 times over, along with the arithmetic
 that makes it worthless: at a 0.05 ATR target the prize (0.0125 R) is smaller than the
 round trip (0.0141 R), so even a flawless record returns −0.0016 R per trade.
@@ -148,9 +211,15 @@ Two bugs were found by insisting on that check, and both are pinned by tests now
 
 ## 5. Frequency
 
-260 signals across the three test periods for two symbols on one hour is roughly
-**0.15 per symbol per day** — selective but tradeable. Scaled to the 60 most liquid MEXC
-contracts that is ~9 a day; on a single chart it is about one every three days.
+Round 15, on one hour and two symbols: 260 signals across the three test periods, about
+**0.15 per symbol per day** — one every three days on a single chart, which is what the
+user saw as "no signals for hours".
+
+Round 16 answers it with breadth instead of a lower bar: three clocks (45m, 1h, 2h) and
+120 instruments. At the measured rates that is 0.19 + 0.14 + 0.25 = 0.58 signals per
+symbol per day, i.e. **~70 a day across 120 contracts, ~3 an hour**, and the start-up
+scan shows whatever is already in play. The 1m–30m clocks would add far more signals,
+but every geometry tested there loses the fee (table at the top), so they are off.
 
 ## 6. The 100 % club (kept, still instructive)
 
@@ -166,7 +235,9 @@ None of that changed. What changed is which side of the trade-off the app sits o
 
 ## 7. The app
 
-`app/server.py` — FastAPI + one page + SQLite, four tabs:
+`app/server.py` — FastAPI + one page + SQLite, five tabs (round 16 adds **Act now**,
+which lists the setups you can trade this minute with size, levels and the per-timeframe
+table, plus the `config.json` editor):
 
 * **Signals** — live tape: probability, band, entry / stop / target, status, R. Rows are
   written to SQLite as they are created and resolved; a refresh never loses them. The
@@ -197,10 +268,25 @@ cd signal-lab
 ../.venv/bin/python research/04_hundred.py --tf 1h --target 0.05 --stop 4
 ../.venv/bin/python research/07_rr.py --rrs 2,3,4,5,6 --stops 0.5,1,2 --horizon 240
 ../.venv/bin/python research/06_bands.py --tfs 1h --target 8 --stop 2 --horizon 240
-../.venv/bin/python -m pytest tests -q                          # 18 tests
+
+# round 16: all eleven timeframes, then ship the ones that paid
+../.venv/bin/python research/08_timeframes.py \
+    --tfs 1m,3m,5m,10m,15m,30m,45m,1h,2h,3h,4h \
+    --stops 1,2,4,7,12,20 --rrs 4 --horizon 200 --stride 3   # -> results/timeframes.json
+../.venv/bin/python tools/train_scanner.py --tfs 45m,1h,2h,3h,4h
+                                                             # -> app/model.pkl,
+                                                             #    app/data/geoms.json,
+                                                             #    app/data/bands_tf.json
+../.venv/bin/python -m pytest tests -q                          # 26 tests
 ../.venv/bin/python app/server.py --replay --speed 400 --port 8811
 cd tools/ui && npm install && node ui.mjs                       # page checks
 ```
+
+The sweep keeps every `stride`-th test bar (that is what the non-overlap lock-out would
+select anyway) because a dense 59-feature matrix for a 1-minute archive is 700 MB per
+symbol and the machine has 3 GB. The screen used all 59 features; the shipped model is
+retrained by `tools/train_scanner.py` on the 57 a live feed can produce, and every
+number in the table above is that retrain's measurement, not the screen's.
 
 Every figure on the page comes from `app/data/*.json`, which those scripts write. No
 number is typed into the HTML.
@@ -212,8 +298,12 @@ number is typed into the HTML.
   periods, so the choice sits on a plateau, not a spike — and the plateau is shown.
 * **The edge is small in absolute terms.** 24.6 % against a 20.6 % break-even. The
   confidence interval, 19.8–30.2 %, contains outcomes you would not want to trade.
-* **Two symbols, one timeframe, long only.** The short side is the same pipeline on
-  mirrored bars; it is not shipped until it passes the same three periods.
+* **Two symbols, several timeframes, long only.** The short side is the same pipeline on
+  mirrored bars; it is not shipped until it passes the same periods.
+* **The round-16 samples are small.** 100–257 trades per clock on 45m–4h, one
+  out-of-sample model per clock. 4h once measured +0.466 R in the screen and −0.052 R
+  after the feature list was made live-safe; that swing is the noise level, and it is
+  why only the clocks that stayed positive are on by default.
 * **Funding is not modelled.** At 1 : 4 the hold can be up to 240 hours. Funding on a
   ten-day position is material and missing. This is the largest unmodelled cost, and it
   is why the page promises a measured record, not a live edge.

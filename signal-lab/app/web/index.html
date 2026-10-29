@@ -76,6 +76,19 @@
     padding:5px 9px;font:600 11px/1 var(--mono);cursor:pointer}
   .speed button.on{color:var(--txt);border-color:#2d3c50;background:#1a2430}
   .empty{padding:34px;text-align:center;color:var(--faint)}
+  .cta{background:#12331f;border:1px solid #1d4d3c;color:#8ff0c4;border-radius:7px;
+    padding:7px 13px;font:600 12px/1 var(--sans);cursor:pointer}
+  .cta:hover{background:#164027}
+  .cta:disabled{opacity:.5;cursor:default}
+  .fld{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--dim);letter-spacing:.04em;text-transform:uppercase}
+  .fld input{background:#0d131b;border:1px solid var(--line);color:var(--txt);border-radius:7px;
+    padding:7px 9px;font:600 12px/1 var(--mono);width:120px}
+  .card{border:1px solid var(--line);border-radius:10px;padding:13px 15px;background:#0c1219;margin-bottom:10px}
+  .card.fresh{border-color:#1d4d3c;box-shadow:0 0 0 1px #12331f inset}
+  .card .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  .card .sym{font:700 14px/1 var(--mono);letter-spacing:.03em}
+  .card .lvl{display:flex;gap:18px;font:12px/1.6 var(--mono);color:var(--dim);flex-wrap:wrap}
+  .card .lvl b{color:var(--txt);font-weight:600}
   .scroll{max-height:520px;overflow:auto}
   .note{font-size:11.5px;color:var(--faint);margin-top:10px}
   @media(max-width:1100px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
@@ -91,6 +104,8 @@
       </div>
     </div>
     <div class="spacer"></div>
+    <button id="scanNow" class="cta" title="poll every configured instrument and timeframe right now">Scan now</button>
+    <div class="clock" id="nextScan" title="time to the next automatic scan">—</div>
     <div class="badge" id="rr" title="risk : reward of every trade">—</div>
     <div class="clock" id="fee" title="round-trip cost, in R and as a share of the prize">—</div>
     <div class="clock" id="model" title="which model the engine is scoring with">—</div>
@@ -113,14 +128,78 @@
   </div>
 
   <div class="tabs" id="tabs">
-    <div class="tab on" data-t="signals">Signals</div>
+    <div class="tab on" data-t="scan">Act now</div>
+    <div class="tab" data-t="signals">Signals</div>
     <div class="tab" data-t="bands">Measured accuracy</div>
     <div class="tab" data-t="club">The 100 % club</div>
     <div class="tab" data-t="method">Method &amp; limits</div>
   </div>
 
+  <!-- ------------------------------------------------------------------- scan -->
+  <section id="t-scan">
+    <div class="panel">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <h2 style="margin:0">Signals you can act on now</h2>
+        <div class="spacer" style="flex:1"></div>
+        <span class="dim" id="scanSummary" style="font-size:11.5px">—</span>
+        <button id="scanNow2" class="cta">Scan now</button>
+      </div>
+      <p class="sub">Every card is a setup the model just scored on a closed bar. <b>Enter at the
+      next bar's open</b> — the entry, stop and target on the card are the levels the trade will
+      use. Size is printed for <span id="riskLine">1 % risk</span> from <code>config.json</code>.
+      Cards drop off as soon as the trade is resolved.</p>
+      <div id="candBox"><div class="empty">scanning…</div></div>
+    </div>
+
+    <div class="grid2">
+      <div class="panel">
+        <h2>What is being watched</h2>
+        <p class="sub">The scan covers this many instruments × timeframes on every poll. Timeframes
+        whose stop cannot absorb the fee were measured as losing and are marked below — you can
+        still enable them, but the page will not pretend they are profitable.</p>
+        <table><thead><tr><th>TF</th><th>Stop</th><th>Target</th><th>R:R</th><th>Fee</th>
+          <th>Cut</th><th>Win 2024–26</th><th>EV</th></tr></thead>
+          <tbody id="tfTable"></tbody></table>
+        <p class="note" id="watchLine">—</p>
+      </div>
+      <div class="panel">
+        <h2>How to follow a signal</h2>
+        <ol class="sub" style="padding-left:18px;line-height:1.9">
+          <li><b>Entry:</b> the open of the next bar after the card appears — or market at once if
+              the card is younger than one bar. If price already ran past the target, skip it.</li>
+          <li><b>Size:</b> risk the printed 1 % only. Quantity = risk ÷ (entry − stop).</li>
+          <li><b>Stop and target:</b> exactly the two numbers on the card. No widening, no
+              averaging down.</li>
+          <li><b>Invalidation:</b> if the bar after entry closes beyond the stop, get out even if
+              the wick did not touch it.</li>
+          <li><b>Concurrency:</b> at most three trades at once, so one bad hour cannot take the
+              account.</li>
+          <li><b>When to stop:</b> if the live window's accuracy CI falls below the break-even
+              line shown on the card, stop trading this model and re-measure.</li>
+        </ol>
+        <div class="callout warn" id="honest">—</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Settings — <code>config.json</code></h2>
+      <p class="sub">These write straight back to <code>config.json</code>. Mode, symbols,
+      timeframes and the worker count take effect on restart.</p>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+        <label class="fld">poll seconds<input id="cfgPoll" type="number" min="10" step="5"></label>
+        <label class="fld">workers<input id="cfgWorkers" type="number" min="1" max="48"></label>
+        <label class="fld">scan bars at start<input id="cfgScanBars" type="number" min="0" max="500"></label>
+        <label class="fld">risk %<input id="cfgRisk" type="number" min="0.1" max="10" step="0.1"></label>
+        <label class="fld">equity $<input id="cfgEquity" type="number" min="10" step="50"></label>
+        <button id="cfgSave" class="cta">Save</button>
+        <span class="dim" id="cfgMsg" style="font-size:11.5px"></span>
+      </div>
+      <p class="note" id="cfgPath">—</p>
+    </div>
+  </section>
+
   <!-- ---------------------------------------------------------------- signals -->
-  <section id="t-signals">
+  <section id="t-signals" hidden>
     <div class="panel">
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <h2 style="margin:0">Live signal tape</h2>
@@ -313,13 +392,87 @@ const pct = (x) => x === null || x === undefined ? "—" : (100 * x).toFixed(1) 
 const money = (x) => x === null || x === undefined ? "—" : (x > 0 ? "+" : "") + Number(x).toFixed(2);
 const utc = (ms) => ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) : "—";
 
-let META = null, TAB = "signals";
+let META = null, TAB = "scan", CFG = null, LAST = null;
 
 document.querySelectorAll(".tab").forEach((el) => el.onclick = () => {
   TAB = el.dataset.t;
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === el));
-  ["signals", "bands", "club", "method"].forEach((k) => $("t-" + k).hidden = (k !== TAB));
+  ["scan", "signals", "bands", "club", "method"].forEach((k) => $("t-" + k).hidden = (k !== TAB));
 });
+
+// ---------------------------------------------------------------- act now panel
+const scanNow = () => fetch("/api/scan", {method: "POST"})
+  .then(r => r.json()).then((r) => { $("scanSummary").textContent = "scan requested…"; return r; })
+  .catch((e) => { $("scanSummary").textContent = "scan failed: " + e.message; });
+$("scanNow").onclick = scanNow;
+$("scanNow2").onclick = scanNow;
+
+function candCard(c, now, staleMs) {
+  const fresh = c.signal_ms && (now - c.signal_ms) < staleMs;
+  const p = c.prob === null || c.prob === undefined ? "—" : c.prob.toFixed(3);
+  const size = c.size;
+  return `<div class="card ${fresh ? "fresh" : ""}">
+    <div class="top">
+      <span class="sym">${c.symbol}</span>
+      <span class="dim mono">${c.tf}</span>
+      <span class="band ${c.band}">${c.band}</span>
+      <span class="mono">p ${p}</span>
+      <span class="dim" style="font-size:11.5px">${utc(c.signal_ms)} · ${c.origin || "live"}</span>
+      ${fresh ? '<span class="pill open">new</span>' : ""}
+      <span class="spacer" style="flex:1"></span>
+      <span class="pill ${c.status}">${c.status}</span>
+    </div>
+    <div class="lvl">
+      <span>entry <b>${fmt(c.entry || c.stop, 2)}</b></span>
+      <span>stop <b class="down">${fmt(c.stop, 2)}</b></span>
+      <span>target <b class="up">${fmt(c.target, 2)}</b></span>
+      <span>R:R <b>1 : ${fmt(c.rr, 1)}</b></span>
+      ${size ? `<span>size <b>${size.qty.toFixed(3)}</b> → $${size.notional.toFixed(0)} notional</span>
+                <span>risk <b>$${size.risk_usd.toFixed(2)}</b> → pays $${size.reward_usd.toFixed(2)}</span>` : ""}
+    </div>
+  </div>`;
+}
+
+function drawScan(s) {
+  const now = Date.now();
+  const poll = (s.config && s.config.poll_seconds) || 60;
+  const stale = poll * 1000 + 120000;
+  const cands = (s.candidates || []);
+  const tfKeys0 = ["1m","3m","5m","10m","15m","30m","45m","1h","2h","3h","4h"];
+  $("scanSummary").textContent = `${s.universe} instruments × ${s.tfs.length} timeframes · ` +
+    `${cands.length} live setup${cands.length === 1 ? "" : "s"} · last scan ${s.last_poll ? utc(s.last_poll * 1000) + " UTC" : "—"}`;
+  const fresh = cands.filter(c => c.signal_ms && (now - c.signal_ms) < stale);
+  const rest = cands.filter(c => !(c.signal_ms && (now - c.signal_ms) < stale));
+  $("candBox").innerHTML = (fresh.concat(rest).slice(0, 40).map(c => candCard(c, now, stale)).join("")) ||
+    `<div class="empty">no live setup right now${s.signals && s.signals.length
+      ? ` — ${s.signals.length} signals recorded so far, latest ${utc(s.signals[0].signal_ms)} UTC`
+      : ""}. Press <b>Scan now</b>, or widen the timeframes in <code>config.json</code>.
+     Nothing is invented to fill this box.</div>`;
+
+  // per-timeframe table: the measured geometry, straight from the model pack
+  const geoms = s.geoms_all || s.geoms || {}, cuts = s.cuts || {};
+  const tfKeys = ["1m","3m","5m","10m","15m","30m","45m","1h","2h","3h","4h"]
+    .filter(t => geoms[t]).concat(Object.keys(geoms).filter(t => !tfKeys0.includes(t)));
+  $("tfTable").innerHTML = tfKeys.map(tf => {
+    const g = geoms[tf], fee = g.fee_r;
+    const ev = g.ev_post;
+    const off = g.scanned === false;
+    return `<tr class="${off ? "dim" : ""}"><td class="mono">${tf}${off ? ' <span class="dim">off</span>' : ""}</td><td>${g.stop} ATR</td><td>${g.target} ATR</td>
+      <td><b>1 : ${g.rr.toFixed(0)}</b></td>
+      <td class="dim">${fee === undefined ? "—" : fee.toFixed(3) + " R"}</td>
+      <td class="mono">p ≥ ${(cuts[tf] ?? g.cut ?? 0).toFixed(2)}</td>
+      <td class="${ev > 0 ? "up" : "down"}">${g.win === undefined || g.win === null ? "—" : pct(g.win)}</td>
+      <td class="${ev > 0 ? "up" : "down"}">${ev === undefined || ev === null ? "—" : money(ev) + " R"}${g.viable === false ? ' <span class="dim">(fee-dead)</span>' : ""}</td></tr>`;
+  }).join("") || `<tr><td colspan="8" class="empty">no model loaded</td></tr>`;
+  const miss = (s.missing_tfs || []);
+  $("watchLine").textContent = `${s.streams ? s.streams.length : 0} streams warm · ` +
+    (miss.length ? `no model yet for ${miss.join(" ")} · ` : "") +
+    `next scan in ${Math.max(0, Math.round(poll - (Date.now() / 1000 - (s.last_poll || 0))))} s` +
+    (s.error ? ` · error: ${s.error}` : "");
+  const cfg = s.config || {};
+  if (cfg.risk_per_trade_pct) $("riskLine").textContent =
+    `${cfg.risk_per_trade_pct} % of $${cfg.equity_usd}`;
+}
 
 function bandLetter(cut) {
   const cuts = META.bands.bands.filter(b => b.cut > 0).sort((a, b) => b.cut - a.cut);
@@ -442,6 +595,30 @@ async function loadMeta() {
       body: JSON.stringify({value: +b.dataset.c})});
   });
 
+  // config editor: values come from the server, edits are written back to config.json
+  try {
+    CFG = await (await fetch("/api/config")).json();
+    const c = CFG.config;
+    $("cfgPoll").value = c.poll_seconds;
+    $("cfgWorkers").value = c.workers;
+    $("cfgScanBars").value = c.scan_bars;
+    $("cfgRisk").value = c.risk_per_trade_pct;
+    $("cfgEquity").value = c.equity_usd;
+    $("cfgPath").textContent = "file: " + CFG.path + " · mode " + c.mode + " · " +
+      (c.symbols && c.symbols.length ? c.symbols.length + " listed symbols" : "auto " + c.auto_top + " by volume") +
+      " · timeframes " + c.timeframes.join(" ") + " · workers " + c.workers;
+    $("cfgSave").onclick = async () => {
+      const body = {poll_seconds: +$("cfgPoll").value, workers: +$("cfgWorkers").value,
+                    scan_bars: +$("cfgScanBars").value, risk_per_trade_pct: +$("cfgRisk").value,
+                    equity_usd: +$("cfgEquity").value};
+      const r = await (await fetch("/api/config", {method: "POST",
+        headers: {"content-type": "application/json"}, body: JSON.stringify(body)})).json();
+      $("cfgMsg").textContent = r.error ? ("not saved: " + r.error)
+        : ("saved to " + r.saved_to + (r.restart_required && r.restart_required.length
+            ? " · restart to apply: " + r.restart_required.join(", ") : ""));
+    };
+  } catch (e) { $("cfgMsg").textContent = "settings unavailable: " + e.message; }
+
   // speed buttons
   $("speed").innerHTML = [10, 25, 60, 150].map(v => `<button data-v="${v}">${v}×</button>`).join("");
   $("speed").querySelectorAll("button").forEach(b => b.onclick = () => {
@@ -461,6 +638,11 @@ async function tick() {
   try {
     const s = await (await fetch("/api/state")).json();
     if (s.error && !s.signals) return;
+    LAST = s;
+    drawScan(s);
+    const poll = (s.config && s.config.poll_seconds) || 60;
+    const left = Math.max(0, Math.round(poll - (Date.now() / 1000 - (s.last_poll || 0))));
+    $("nextScan").textContent = s.mode === "live" ? `next scan ${left}s` : "replay clock";
     $("mode").textContent = s.mode + (s.finished ? " · finished" : "");
     $("mode").className = "badge " + s.mode;
     $("clock").textContent = utc(s.clock_ms) + " UTC";

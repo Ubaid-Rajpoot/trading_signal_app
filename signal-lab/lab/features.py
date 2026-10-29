@@ -152,3 +152,61 @@ def feature_matrix(f: dict[str, np.ndarray], names: list[str] | None = None) -> 
     for j, n in enumerate(names):
         m[:, j] = f[n]
     return m, names
+
+
+def feature_segments(s: Series, seg: int = 250_000, pad: int = 700,
+                     keep_mask: np.ndarray | None = None):
+    """Yield (start_index, {name: values}) for the rows of `keep_mask`, in chunks.
+
+    A 1-minute archive is 4.8 M bars: building all 59 features for all of them at
+    once is ~1.1 GB per symbol and takes the machine down. Rolling windows never
+    look further back than 500 bars, so the series can be cut into overlapping
+    segments and only the rows the caller needs are kept.
+    """
+    n = len(s)
+    start = 0
+    while start < n:
+        a = max(0, start - pad)
+        b = min(n, start + seg)
+        sub = s.slice(a, b)
+        f = features(sub)
+        if keep_mask is None:
+            lo = start - a
+            yield start, {k: v[lo:lo + (b - start)] for k, v in f.items()}
+        else:
+            local = np.flatnonzero(keep_mask[start:b])
+            if len(local):
+                idx = local + (start - a)
+                yield start + int(local[0]), {k: v[idx] for k, v in f.items()}
+        start = b
+
+
+def live_safe(names=None) -> list[str]:
+    """The subset of features that can be computed from exchange candles alone.
+
+    MEXC's kline endpoint returns time/open/close/high/low/volume and nothing else:
+    no trade count, no taker-buy split. Those two columns are therefore constant in
+    live mode, and every feature built on them (their z-scores, the taker-buy ratio,
+    the CVD) comes out NaN. The engine drops any bar with a NaN feature, so a model
+    trained on all 59 features can never emit a live signal - it silently waits
+    forever. This function is what `tools/train_scanner.py` uses to pick the feature
+    list, so training and live scoring see exactly the same inputs.
+
+    It is measured, not hand-listed: build a series that looks like an exchange
+    candle feed (n = 1, taker-buy = half the volume) and keep the features that
+    come out finite.
+    """
+    rng = np.random.default_rng(0)
+    n = 900
+    c = 100 + np.cumsum(rng.normal(0, 1, n))
+    o = np.r_[c[0], c[:-1]]
+    h = np.maximum(o, c) + np.abs(rng.normal(0, 1, n))
+    l = np.minimum(o, c) - np.abs(rng.normal(0, 1, n))
+    v = np.abs(rng.normal(10, 2, n))
+    s = Series(symbol="LIVE", tf="1h", t=np.arange(n, dtype=np.int64) * 60,
+               o=o, h=h, l=l, c=c, v=v, qv=v * c, n=np.ones(n), tb=v * 0.5)
+    f = features(s)
+    keep = [k for k, arr in f.items() if np.isfinite(arr[-1])]
+    if names is not None:
+        keep = [k for k in keep if k in set(names)]
+    return sorted(keep)
