@@ -359,7 +359,7 @@ class Engine:
         cell.tmap_state = cell.tmap.add(bar, atr=cell.regime_point.atr)
         return point
 
-    async def warm_symbol(self, feed, symbol: str, attempts: int = 3) -> int:
+    async def warm_symbol(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
         """Load enough history for one instrument, then read the setups it holds.
 
         Returns the number of cells that still came back empty. Two things matter
@@ -376,7 +376,7 @@ class Engine:
         empty = 0
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
-            if cell is None or len(cell.candles) >= 120:
+            if cell is None or (len(cell.candles) >= 120 and not force):
                 continue
             candles: list[dict] = []
             for attempt in range(attempts):
@@ -512,12 +512,14 @@ class Engine:
         self.setup_events.clear()
         self.by_cell.clear()
 
-    async def rescan(self, feed, only_missing: bool = False) -> dict[str, Any]:
+    async def rescan(self, feed, only_missing: bool = False, reset: bool = False) -> dict[str, Any]:
         """Re-read history and re-run the scan.
 
         This is what the rescans button does, and what a filter change needs: the
         setups you are looking at must be the ones the *current* rules find.
         """
+        if reset:
+            self.forget_setups()
         found = 0
         warmed = 0
         gate = asyncio.Semaphore(4)
@@ -527,11 +529,12 @@ class Engine:
             async with gate:
                 cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
                 missing = any(c is None or len(c.candles) < 120 for c in cells)
-                if missing:
-                    await self.warm_symbol(feed, symbol)
+                if missing or not only_missing:
+                    # re-fetch the full window: a cell only *keeps* 180 bars, so
+                    # re-scanning the buffer would look at half the history the
+                    # first scan saw and quietly lose setups that are still alive
+                    await self.warm_symbol(feed, symbol, force=True)
                     warmed += 1
-                elif not only_missing:
-                    found += len(await self.backfill(symbol))
 
         await asyncio.gather(*(one(symbol) for symbol in self.symbols))
         await self._emit_state(force=True)

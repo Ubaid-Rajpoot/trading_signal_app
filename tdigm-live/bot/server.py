@@ -247,11 +247,14 @@ def create_app(
             return {"ok": True, "message": "a re-scan is already running"}
         rescan_state["running"] = True
         rescan_state["result"] = None
+        # by default a re-scan *adds* to what you are watching: it re-reads the
+        # history, finds the setups in it, and does not throw away a live record
+        # of one you already have on screen
+        reset = bool((payload or {}).get("reset"))
 
         async def run() -> None:
             try:
-                engine.forget_setups()
-                rescan_state["result"] = await engine.rescan(feed)
+                rescan_state["result"] = await engine.rescan(feed, reset=reset)
                 await hub.send_all(
                     {
                         "type": "log",
@@ -363,8 +366,7 @@ def create_app(
                 return {"ok": True, "filters": filters, "warning": f"could not write config: {exc}"}
         await engine._emit_state(force=True)  # noqa: SLF001
         # the rules changed, so the setups on screen have to be re-derived
-        engine.forget_setups()
-        asyncio.create_task(engine.rescan(feed))
+        asyncio.create_task(engine.rescan(feed, reset=True))
         return {"ok": True, "filters": filters, "summary": engine.filters.summary()}
 
     @app.post("/api/tdi")
