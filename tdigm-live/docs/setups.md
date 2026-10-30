@@ -147,7 +147,7 @@ sweep retries anything that fails.
 cd tdigm-live
 python run.py check                 # contract REST + websocket reachable?
 python run.py serve                 # LIVE perps, 7 timeframes
-python -m pytest tests -q           # 122 tests
+python -m pytest tests -q           # 123 tests
 ```
 
 The setup rules themselves are unchanged from round 17 and still measured in
