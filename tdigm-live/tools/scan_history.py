@@ -74,11 +74,34 @@ async def main() -> int:
     ap.add_argument("--centre", default="mbl", choices=["mbl", "fifty"], help="which line is the centre band")
     ap.add_argument("--hvb-speed", type=float, default=1.5,
                     help="this candle's step must be this many times the price line's average step")
-    ap.add_argument("--no-regime", action="store_true", help="switch the trend-only gate off")
+    ap.add_argument("--no-regime", action="store_true", help="switch the ADX/ER trend gate off")
+    # ---- round 17: the swing-structure trend rules
+    ap.add_argument("--no-trend-context", dest="trend_context", action="store_false",
+                    help="do NOT require the external structure to agree (HH+HL / LH+LL)")
+    ap.add_argument("--no-hh-hl", dest="require_hh_hl", action="store_false",
+                    help="require only the direction, not the clean swing sequence")
+    ap.add_argument("--no-bos", dest="require_bos", action="store_false",
+                    help="do not require a recent break of structure")
+    ap.add_argument("--bos-age", type=int, default=240,
+                    help="how many bars back a break of structure still counts (0 = forever)")
+    ap.add_argument("--max-depth", type=int, default=2,
+                    help="1 = external only, 2 = one level of internal (default), 3+ allows nesting")
+    ap.add_argument("--volume-break", action="store_true",
+                    help="the signal candle must be a high-volume bar")
+    ap.add_argument("--volume-mult", type=float, default=1.5, help="how many x the average volume")
+    ap.add_argument("--volume-period", type=int, default=20)
+    ap.add_argument("--confirm", default="all", choices=["all", "score"],
+                    help="all = every condition must hold; score = weighted confluence >= --confirm-min")
+    ap.add_argument("--confirm-min", type=float, default=60.0, help="the confluence score needed")
+    ap.add_argument("--macro-len", type=int, default=80, help="bars each side of the macro swing")
     ap.add_argument("--adx-min", type=float, default=20.0, help="ADX(14) needed for a trending market")
     ap.add_argument("--er-min", type=float, default=0.10, help="efficiency ratio (50) needed for a trending market")
     ap.add_argument("--regime-dir", default="any", choices=["any", "with"], help="also demand the EMA direction")
     ap.add_argument("--horizon", type=int, default=300, help="bars to look ahead when scoring a signal")
+    ap.add_argument("--score-target", default="structure", choices=["structure", "fixed"],
+                    help="score against the setup's own target, or a fixed multiple of the risk "
+                         "(the structure target is often absent, which leaves trades unscored)")
+    ap.add_argument("--score-r", type=float, default=2.0, help="the fixed target, in R (risk units)")
     ap.add_argument("--no-score", action="store_true", help="skip the win/loss walk-forward")
     ap.add_argument("--major-len", type=int, default=20, help="bars each side of a MAJOR swing (MS)")
     ap.add_argument("--premium", action="store_true",
@@ -142,8 +165,19 @@ async def main() -> int:
             "pool_count": args.pool_count,
             "structure_atr_min": args.structure_atr_min,
             "structure_atr_max": args.structure_atr_max,
+            "trend_context": args.trend_context,
+            "require_hh_hl": args.require_hh_hl,
+            "require_bos": args.require_bos,
+            "bos_max_age": args.bos_age,
+            "max_internal_depth": args.max_depth,
+            "volume_break": args.volume_break,
+            "volume_mult": args.volume_mult,
+            "volume_period": args.volume_period,
+            "confirm_mode": args.confirm,
+            "confirm_min_score": args.confirm_min,
         },
         structure={"pivot_len": args.pivot_len, "major_len": args.major_len,
+                   "macro_len": args.macro_len,
                    "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target},
     )
 
@@ -170,6 +204,15 @@ async def main() -> int:
         kinds = Counter((a.get("break_kind") or "?") for a in got)
         zones = Counter(((a.get("book") or {}).get("zone") or "?") for a in got)
         print(f"       break kinds {dict(kinds)} · zones {dict(zones)}")
+        depths = Counter(str((a.get("depth") or {}).get("value", "?")) for a in got)
+        ext = Counter((str(((a.get("context") or {}).get("external") or {}).get("direction"))
+                       + "/" + str(((a.get("context") or {}).get("external") or {}).get("source")))
+                      for a in got)
+        vols = [a.get("volume_ratio") for a in got if a.get("volume_ratio")]
+        scores = [a.get("score") for a in got if a.get("score") is not None]
+        print(f"       depth {dict(sorted(depths.items()))} · external trend {dict(ext)}"
+              + (f" · median volume {sorted(vols)[len(vols)//2]:.2f}x" if vols else "")
+              + (f" · median score {sorted(scores)[len(scores)//2]:.0f}" if scores else ""))
         print(f"{tf:>4}: {len(got):>4} signals  ({len(got) / max(days, 1):.2f}/day)  "
               f"long {sides.get('LONG', 0)} short {sides.get('SHORT', 0)}  "
               f"hvb {hvb}  median RR {sorted(rrs)[len(rrs) // 2] if rrs else '-'}")
@@ -183,7 +226,8 @@ async def main() -> int:
         print(f"signals written to {args.json}")
 
     if not args.no_score:
-        report = score(captured, candles, engine.timeframes, args.horizon)
+        report = score(captured, candles, engine.timeframes, args.horizon,
+                       target_mode=args.score_target, fixed_r=args.score_r)
         print()
         print("does it work? every signal walked forward on its own timeframe")
         print(f"{'group':<26}{'n':>5}{'win':>6}{'loss':>6}{'open':>6}{'win%':>7}{'totalR':>8}{'R/trade':>9}")
@@ -212,7 +256,8 @@ def _bars_by_timeframe(candles: list[dict], timeframes: list[str]) -> dict[str, 
     return out
 
 
-def _outcome(alert: dict, bars: list[dict], horizon: int) -> tuple[str, float]:
+def _outcome(alert: dict, bars: list[dict], horizon: int, target_mode: str = "structure",
+             fixed_r: float = 2.0) -> tuple[str, float]:
     """Walk forward: did the target or the stop get hit first?
 
     Stop wins ties (the conservative reading of a candle that touched both).
@@ -220,7 +265,12 @@ def _outcome(alert: dict, bars: list[dict], horizon: int) -> tuple[str, float]:
     """
     setup = alert.get("setup") or {}
     entry, stop, target = setup.get("entry"), setup.get("stop"), setup.get("target")
-    if not entry or not stop or not target:
+    if not entry or not stop:
+        return "open", 0.0
+    risk = abs(entry - stop)
+    if target_mode == "fixed" and risk > 0:
+        target = entry + fixed_r * risk if str(alert.get("side")).upper() == "LONG" else entry - fixed_r * risk
+    if not target:
         return "open", 0.0
     end = alert["time"]
     risk = abs(entry - stop)
@@ -263,16 +313,25 @@ def _bucket(rows: list[tuple[str, float]]) -> dict:
     }
 
 
-def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizon: int) -> list[tuple[str, dict]]:
+def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizon: int,
+          target_mode: str = "structure", fixed_r: float = 2.0) -> list[tuple[str, dict]]:
     """Break the results down by timeframe and by the regime the setup formed in."""
     bars = _bars_by_timeframe(candles, timeframes)
     by_tf: dict[str, list[tuple[str, float]]] = defaultdict(list)
     by_regime: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    by_depth: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    by_volume: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for alert in alerts:
-        result, r = _outcome(alert, bars[alert["timeframe"]], horizon)
+        result, r = _outcome(alert, bars[alert["timeframe"]], horizon, target_mode, fixed_r)
         by_tf[alert["timeframe"]].append((result, r))
         regime = (alert.get("regime") or {}).get("state") or "unknown"
         by_regime[regime].append((result, r))
+        depth = (alert.get("depth") or {}).get("label") or "unknown"
+        by_depth[str((alert.get("depth") or {}).get("value") or depth)].append((result, r))
+        ratio = alert.get("volume_ratio")
+        bucket = "?" if ratio is None else ("<1.0x" if ratio < 1 else "1-1.5x" if ratio < 1.5
+                                           else "1.5-2.5x" if ratio < 2.5 else "2.5x+")
+        by_volume[bucket].append((result, r))
 
     out: list[tuple[str, dict]] = []
     for tf in timeframes:
@@ -281,6 +340,10 @@ def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizo
     out.append(("all timeframes", _bucket([row for rows in by_tf.values() for row in rows])))
     for state, rows in sorted(by_regime.items()):
         out.append((f"formed in {state}", _bucket(rows)))
+    for depth, rows in sorted(by_depth.items()):
+        out.append((f"depth {depth}", _bucket(rows)))
+    for bucket, rows in sorted(by_volume.items()):
+        out.append((f"volume {bucket}", _bucket(rows)))
     return out
 
 

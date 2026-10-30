@@ -187,6 +187,8 @@
   .cell.cold { opacity: .45; }
   .cell.flat { border-color: #2b3242; background: rgba(255,255,255,.02); }
   .book-line { display: block; font-size: 10.5px; color: #9fb0c9; letter-spacing: .01em; }
+  .book-line b.ok { color: var(--green); }
+  .book-line b.warn { color: var(--amber); }
   .book-tag {
     display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 9px; font-weight: 700;
     letter-spacing: .07em; text-transform: uppercase; background: rgba(180,135,255,.14); color: #c9a9ff;
@@ -425,6 +427,59 @@
     </div>
 
     <div class="group">
+      <h4>Trend &amp; structure — where the setup sits</h4>
+      <p class="mini" style="margin:0 0 8px">The setup only counts <b>inside a trend</b>: higher highs and higher lows
+      for a long, lower highs and lower lows for a short. A setup buried inside internal structure that is itself
+      inside internal structure is skipped. Measured effect and limits: <b>docs/trend-rules.md</b>.</p>
+      <div class="row">
+        <label>Trade only with the external structure
+          <span class="hint">the big swings must agree with the trade (HH+HL / LH+LL)</span></label>
+        <div class="switch"><input type="checkbox" id="f-trendctx" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Demand the clean HH+HL sequence
+          <span class="hint">off: only the direction matters, not that every swing extended</span></label>
+        <div class="switch"><input type="checkbox" id="f-hhhl" /><span></span></div>
+      </div>
+      <div class="row">
+        <label>Require a break of structure
+          <span class="hint">a close through the last swing in the trade's direction — a wick is a sweep, not a break</span></label>
+        <div class="switch"><input type="checkbox" id="f-bos" /><span></span></div>
+      </div>
+      <div class="fields">
+        <div class="field"><span>break still counts (bars)</span><input type="number" step="10" min="0" id="f-bosage" /></div>
+        <div class="field"><span>max internal depth</span><input type="number" step="1" min="1" max="5" id="f-depth" /></div>
+      </div>
+      <p class="mini" style="margin:8px 2px 0">depth 1 = an external break · 2 = the first internal break inside the trend
+      (allowed) · 3+ = internal within internal (skipped).</p>
+    </div>
+
+    <div class="group">
+      <h4>Confirm the break: HVB, volume, or both</h4>
+      <p class="mini" style="margin:0 0 8px">The TDIGM <b>HVB</b> is the price line breaking the centre band.
+      A <b>high-volume bar</b> is the candle doing it on real participation. In <b>all</b> mode every switched-on
+      condition must hold; in <b>score</b> mode they are added up and the total has to reach the threshold.</p>
+      <div class="row">
+        <label>High-volume signal candle
+          <span class="hint">volume ≥ N× the average of the previous bars</span></label>
+        <div class="switch"><input type="checkbox" id="f-volbrk" /><span></span></div>
+      </div>
+      <div class="fields">
+        <div class="field"><span>volume ×</span><input type="number" step="0.1" min="0" id="f-volmult" /></div>
+        <div class="field"><span>average over (bars)</span><input type="number" step="1" min="2" id="f-volperiod" /></div>
+      </div>
+      <div class="fields">
+        <div class="field"><span>confirmation mode</span>
+          <select id="f-confirm">
+            <option value="all">all conditions must hold</option>
+            <option value="score">confluence score ≥</option>
+          </select>
+        </div>
+        <div class="field"><span>score threshold (0-100)</span><input type="number" step="5" min="0" max="100" id="f-confirmmin" /></div>
+      </div>
+    </div>
+
+    <div class="group">
       <h4>The book's confluences</h4>
       <p class="mini" style="margin:0 0 8px">Each one is a rule from the PDF. The measured effect of every switch is in <b>docs/book-coverage.md</b>, so nothing here is on by faith.</p>
       <div class="row">
@@ -503,6 +558,9 @@
         <div class="field"><span>swing length (bars)</span><input type="number" step="1" min="1" id="s-pivot" /></div>
         <div class="field"><span>max wait after sweep</span><input type="number" step="1" min="1" id="s-wait" /></div>
         <div class="field"><span>level memory (bars)</span><input type="number" step="1" min="10" id="s-age" /></div>
+        <div class="field"><span>major swing (bars)</span><input type="number" step="1" min="1" id="s-major" /></div>
+        <div class="field"><span>macro swing (bars)</span><input type="number" step="1" min="1" id="s-macro" /></div>
+        <div class="field"><span>HH tolerance (ATR)</span><input type="number" step="0.05" min="0" id="s-hhtol" /></div>
         <div class="field"><span>target</span>
           <select id="s-target">
             <option value="range">range extreme (drawing)</option>
@@ -513,6 +571,8 @@
     </div>
     <p class="mini" style="margin: 4px 2px 0">
       Swing length changes how big a swing has to be to count as liquidity. Longer = fewer, bigger levels.
+      <b>major</b>/<b>macro</b> are the two outer degrees that decide the external trend — major ≥ 3× the swing
+      length, macro well beyond it, or the outer degrees see no swings at all.
       Filters are saved to <code>config.json</code> and applied live.
     </p>
   </div>
@@ -769,6 +829,35 @@
         if (b.structure_atr) line += ` · structure ${b.structure_atr} ATR`;
         detail.append(html(`<span class="book-line">${line}</span>`));
       }
+      if (a.context || a.depth) {
+        const ext = (a.context || {}).external || {};
+        const dep = a.depth || {};
+        const bits = [];
+        if (ext.direction) {
+          bits.push(`external <b>${ext.direction > 0 ? "bullish (HH+HL)" : "bearish (LH+LL)"}</b>`
+            + ` <span class="mini">${ext.source === "macro" ? "from the macro degree" : "major degree"}`
+            + `${ext.clean ? "" : ", not a clean sequence"}</span>`);
+        } else {
+          bits.push(`external <b>no trend</b>`);
+        }
+        if (ext.bos_direction) {
+          bits.push(`last break of structure <b>${ext.bos_direction > 0 ? "up" : "down"}</b>`
+            + ` <span class="mini">${ext.bos_age} bars ago</span>`);
+        }
+        if (dep.value) {
+          const cls = dep.value <= 2 ? "ok" : "warn";
+          bits.push(`depth <b class="${cls}">${dep.value}</b> <span class="mini">${dep.label}</span>`);
+        }
+        if (a.volume_ratio !== undefined && a.volume_ratio !== null) {
+          bits.push(`volume <b>${a.volume_ratio.toFixed(2)}×</b>`);
+        }
+        if (a.score !== undefined) {
+          const parts = a.score_parts || {};
+          const have = Object.keys(parts).filter((k) => parts[k]).join(" ");
+          bits.push(`score <b>${a.score}</b> <span class="mini">${have || "—"}</span>`);
+        }
+        detail.append(html(`<span class="book-line">${bits.join(" · ")}</span>`));
+      }
       if (a.regime) {
         const r = a.regime;
         detail.append(html(`market <b>${r.state === "trend" ? "trending" : r.state === "range" ? "ranging" : "?"}</b>`
@@ -961,6 +1050,16 @@
     if (!state) return;
     const f = state.filters.config, s = state.structure_settings || {};
     $("f-structure").checked = !!f.structure;
+    $("f-trendctx").checked = f.trend_context !== false;
+    $("f-hhhl").checked = f.require_hh_hl !== false;
+    $("f-bos").checked = f.require_bos !== false;
+    $("f-bosage").value = f.bos_max_age ?? 240;
+    $("f-depth").value = f.max_internal_depth ?? 2;
+    $("f-volbrk").checked = !!f.volume_break;
+    $("f-volmult").value = f.volume_mult ?? 1.5;
+    $("f-volperiod").value = f.volume_period ?? 20;
+    $("f-confirm").value = f.confirm_mode || "all";
+    $("f-confirmmin").value = f.confirm_min_score ?? 60;
     $("f-hvb").checked = !!f.hvb;
     $("f-break").checked = !!f.break;
     $("f-hvbpts").value = f.hvb_min_points || 0;
@@ -989,12 +1088,25 @@
     $("s-wait").value = s.sweep_max_wait || 60;
     $("s-age").value = s.level_max_age || 180;
     $("s-target").value = s.target_mode || "range";
+    $("s-major").value = s.major_len ?? 20;
+    $("s-macro").value = s.macro_len ?? 80;
+    $("s-hhtol").value = s.hh_tolerance_atr ?? 0.1;
   }
 
   async function applyFilters() {
     const sides = $("f-sides").value;
     const payload = {
       structure: $("f-structure").checked,
+      trend_context: $("f-trendctx").checked,
+      require_hh_hl: $("f-hhhl").checked,
+      require_bos: $("f-bos").checked,
+      bos_max_age: Number($("f-bosage").value) || 0,
+      max_internal_depth: Number($("f-depth").value) || 2,
+      volume_break: $("f-volbrk").checked,
+      volume_mult: Number($("f-volmult").value) || 0,
+      volume_period: Number($("f-volperiod").value) || 20,
+      confirm_mode: $("f-confirm").value,
+      confirm_min_score: Number($("f-confirmmin").value) || 0,
       hvb: $("f-hvb").checked,
       break_filter: $("f-break").checked,
       hvb_min_points: Number($("f-hvbpts").value) || 0,
@@ -1024,6 +1136,9 @@
     const tdi_payload = { hvb_reference: $("t-centre").value };
     const structure = {
       pivot_len: Number($("s-pivot").value) || 5,
+      major_len: Number($("s-major").value) || 20,
+      macro_len: Number($("s-macro").value) || 80,
+      hh_tolerance_atr: Number($("s-hhtol").value) || 0,
       sweep_max_wait: Number($("s-wait").value) || 60,
       level_max_age: Number($("s-age").value) || 180,
       target_mode: $("s-target").value,

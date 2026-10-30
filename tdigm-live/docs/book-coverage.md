@@ -25,6 +25,17 @@ data · **no** = not implemented, and here is what it would need.
 | p.88 | **Breaker block / LTF "algo candle"** | **no** | needs an LTF order-block detector (last down candle before the up move, etc.) and an LTF feed per symbol; that is a second engine, and it is not in the drawing the strategy came from | – |
 | p.100–103 | **Divergence / Stoch RSI** | **no** | the TDIGM already gates momentum; adding a second oscillator would need its own measured case | – |
 
+> **Round 17 — trend, depth, break of structure, volume.** Four further gates
+> live outside the book: trade with the external trend (HH+HL / LH+LL), skip
+> internal-within-internal structure, require a break of structure, and
+> optionally require a high-volume bar, combinable as hard AND rules or as a
+> weighted score. What they reject and what they measured — including the two
+> this sample does not confirm — is in
+> [`trend-rules.md`](trend-rules.md). The book's own "follow the external
+> structure" row above (p.53) is the ancestor of the first of them; the round-17
+> version reads the full swing sequence at three degrees rather than just the
+> last major break.
+
 ## What this means in one sentence
 
 The **setup shape** the book draws — liquidity taken, strong/weak levels, a SHIFT

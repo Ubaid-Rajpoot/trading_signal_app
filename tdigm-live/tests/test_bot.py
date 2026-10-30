@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import sys
 from pathlib import Path
@@ -157,7 +158,10 @@ def fast_engine(**filters):
         timeframes=["5m"],
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         break_lookback=5,
-        filters={"structure": True, "hvb": True, **filters},
+        # the trend/depth gates have their own file of tests; these fixtures are
+        # monotone ramps that contain no swing structure at all
+        filters={"structure": True, "hvb": True, "trend_context": False,
+                 "require_bos": False, **filters},
         structure={"pivot_len": 2, "sweep_max_wait": 60},
     )
 
@@ -341,8 +345,21 @@ def test_target_ignores_levels_printed_after_the_sweep():
 
 
 # ----------------------------------------------------------------- filters
+# A long setup that satisfies the round-17 trend rules, so a filter test that is
+# about something *else* (sides, sessions, RR) is not silently blocked by them.
+# The trend gates themselves are tested in tests/test_trend_gates.py.
+TREND_OK = {
+    "external": {"direction": 1, "clean": True, "bos_direction": 1, "bos_age": 12,
+                 "source": "major", "bos_level": 100.0},
+    "internal": {"direction": 1, "bos_direction": 1, "bos_age": 3},
+}
+
+
 def candidate(**kwargs):
-    base = {"structure": True, "hvb": "up", "hvb_points": 3.0, "break": "high", "side": "LONG", "rr": 2.0}
+    base = {"structure": True, "hvb": "up", "hvb_points": 3.0, "break": "high", "side": "LONG",
+            "rr": 2.0, "context": json.loads(json.dumps(TREND_OK)),
+            "depth": {"value": 2, "label": "internal", "internal_shifts": 0},
+            "volume_ratio": 1.8}
     base.update(kwargs)
     return base
 
@@ -376,7 +393,7 @@ def test_min_rr_filters_small_targets():
 
 
 def test_sides_filter():
-    f = Filters({"sides": ["short"]})
+    f = Filters({"sides": ["short"], "trend_context": False, "require_bos": False})
     assert not f.apply(candidate())[0]
     assert f.apply(candidate(side="SHORT", hvb="down"))[0]
 
@@ -483,7 +500,8 @@ def make_engine(**filters):
         symbols=["BTCUSDT"],
         timeframes=["5m"],
         tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185},
-        filters={"structure": True, "hvb": False, "break": False, **filters},
+        filters={"structure": True, "hvb": False, "break": False,
+                 "trend_context": False, "require_bos": False, **filters},
         structure={"pivot_len": 2, "sweep_max_wait": 60},
     )
 

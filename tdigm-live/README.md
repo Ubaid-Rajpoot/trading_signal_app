@@ -126,6 +126,45 @@ next to them, so you can see *why* it is quiet instead of guessing.
 Both thresholds are sliders in ⚙ and are saved to `config.json`. Set them low
 to see more, high to see only the strongest trends.
 
+### Where the setup sits: trend, depth, break of structure (round 17)
+
+Liquidity taken on its own is not a trade. The setup now has to sit somewhere
+sensible, and each part of that is a switch in ⚙ **Trend & structure**:
+
+| what the rule demands | config key | default |
+|---|---|---|
+| the trade agrees with the **external** trend (HH+HL for a long, LH+LL for a short) | `trend_context` | **on** |
+| the whole visible swing sequence is clean, not just the last leg | `require_hh_hl` | **on** |
+| a **break of structure** happened in the trade's direction | `require_bos` | **on** |
+| …within the last N bars | `bos_max_age` | 240 |
+| the setup is no deeper than **internal inside one trend** | `max_internal_depth` | 2 |
+
+Depth is counted in degrees of structure: **1** the break is itself the external
+break · **2** the first internal break inside an external trend (allowed) ·
+**3+** internal within internal (**skipped**). Read from three degrees of
+pivots — minor 5, major 20, macro 80 — with a 0.10 ATR tolerance so one flat
+swing does not flip the label.
+
+### Confirming the break: HVB, volume, or both
+
+The HVB (price line through the centre band) and a **high-volume bar** (candle
+volume ≥ N× the average of the previous bars) can be required separately or
+together:
+
+* `confirm_mode: "all"` — hard AND; every switch that is on must hold (default);
+* `confirm_mode: "score"` — each piece of evidence contributes a weight and the
+  total must reach `confirm_min_score`. The score and its parts are printed on
+  every card (`score 85`), so you can see exactly what it was worth.
+
+Every alert now shows its evidence: `external bullish (HH+HL) · last break of
+structure up, 42 bars ago · depth 2 internal · volume 1.81× · score 85`.
+
+**What it measured** — BTCUSDT 1m, 2024-07 → 2025-06, four timeframes, 2R
+target: the gates cut signals from 144 to **68** and moved R/trade from +0.20 to
++0.25. The honest breakdown, including the two gates this sample does *not*
+confirm, the noise floor (SE ≈ 0.17 R → no comparison reaches 2σ) and the
+reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
+
 ### The book's confluences (p.42, p.53, p.87)
 
 Every alert says where it sits in the book, and each of these is a switch:
@@ -141,7 +180,8 @@ Every alert says where it sits in the book, and each of these is a switch:
 | `structure 1.2 ATR` | how tall the swept→broken structure is | shown, gate off |
 
 The measured effect of **every** switch, page by page, is in
-[`docs/book-coverage.md`](docs/book-coverage.md) — including the two that
+[`docs/book-coverage.md`](docs/book-coverage.md) and, for the round-17 trend /
+structure / volume gates, [`docs/trend-rules.md`](docs/trend-rules.md) — including the two that
 measured *worse* and are therefore off by default. Nothing is on by faith.
 
 ---

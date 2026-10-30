@@ -41,6 +41,7 @@ from .filters import Filters
 from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
 from .regime import RegimePoint, RegimeTracker
 from .structure import Structure
+from .trend import TrendMap
 
 MAX_CANDLES = 180
 
@@ -56,6 +57,8 @@ class Cell:
     candles: deque = field(default_factory=lambda: deque(maxlen=MAX_CANDLES))
     tracker: TdiTracker = field(init=False)
     structure: Structure = field(init=False)
+    tmap: TrendMap = field(init=False)      # multi-degree structure (bot/trend.py)
+    tmap_state: dict = field(default_factory=dict)
     regime: RegimeTracker = field(init=False)
     regime_point: RegimePoint = field(init=False)
     regime_limits: tuple[float, float] = (22.0, 0.30)
@@ -82,8 +85,20 @@ class Cell:
             band_mult=float(self.settings.get("band_mult", 1.6185)),
         )
         self.structure = Structure(self.structure_settings)
+        self.tmap = TrendMap(self.trend_settings(self.structure_settings))
         self.regime = RegimeTracker()
         self.regime_point = RegimePoint(None, None, None, None, None, None, None)
+
+    @staticmethod
+    def trend_settings(structure_settings: dict[str, Any]) -> dict[str, Any]:
+        """One place maps the structure settings onto the three degrees."""
+        return {
+            "minor_len": int(structure_settings.get("pivot_len", 5) or 5),
+            "major_len": int(structure_settings.get("major_len", 20) or 20),
+            "macro_len": int(structure_settings.get("macro_len", 80) or 80),
+            "hh_tolerance_atr": float(structure_settings.get("hh_tolerance_atr", 0.10) or 0),
+            "external_degree": str(structure_settings.get("external_degree", "major") or "major"),
+        }
 
     # ------------------------------------------------------------ indicators
     def update_ema(self, close: float, period: int) -> None:
@@ -128,6 +143,7 @@ class Cell:
             "regime": self.regime_point.state(*self.regime_limits),
             "regime_dir": self.regime_point.direction,
             "armed": self.structure.armed(last["close"] if last else None),
+            "trend_context": self.tmap_state or None,
             "setups": self.structure.setups,
             "invalidated": self.structure.invalidated,
         }
@@ -270,9 +286,13 @@ class Engine:
         self.structure_settings = dict(settings or {})
         for cell in self.cells.values():
             fresh = Structure(self.structure_settings)
+            trend = TrendMap(Cell.trend_settings(self.structure_settings))
             for bar in cell.candles:
                 fresh.add(bar)
+                trend.add(bar)
             cell.structure = fresh
+            cell.tmap = trend
+            cell.tmap_state = trend.state()
 
     # -------------------------------------------------------------- warmup
     def seed(self, symbol: str, timeframe: str, candles: list[dict]) -> None:
@@ -291,6 +311,7 @@ class Engine:
         cell.update_ema(float(bar["close"]), int(self.filters.config.get("trend_ema", 50)))
         cell.regime_point = cell.regime.add(bar)
         cell.structure.add(bar)
+        cell.tmap_state = cell.tmap.add(bar, atr=cell.regime_point.atr)
         return point
 
     async def warm_symbol(self, feed, symbol: str) -> None:
@@ -435,6 +456,7 @@ class Engine:
         if brk:
             cell.last_break, cell.last_break_time = brk, int(bar["close_time"])
 
+        context = cell.tmap_state or cell.tmap.state()
         base = {
             "symbol": cell.symbol,
             "timeframe": cell.timeframe,
@@ -451,12 +473,16 @@ class Engine:
             "trend": cell.trend,
             "regime": self._regime_dict(cell),
             "armed": structure.armed(bar["close"]),
+            "context": context,
+            "volume_ratio": self._volume_ratio(cell),
         }
 
         if setup is not None:
             book = self._confluence(cell, setup, bar)
+            depth = cell.tmap.depth(setup.side, setup.break_kind, setup.index)
             candidate = {
                 **base,
+                "depth": depth,
                 "book": book.as_dict(),
                 "break_kind": book.break_kind,
                 "tdi_tail": self._tdi_tail(cell, point),
@@ -473,6 +499,7 @@ class Engine:
                 "bars_since_sweep": setup.index - setup.sweep.index,
                 "setup": setup.as_dict(),
             }
+            candidate["score"], candidate["score_parts"] = self.filters.score_of(candidate)
             ok, reasons = self._apply_filters(cell, candidate, bar)
             if ok:
                 candidate["filtered"] = []
@@ -526,6 +553,22 @@ class Engine:
             },
             bar,
         )
+
+    def _volume_ratio(self, cell: Cell) -> float | None:
+        """This candle's volume against the average of the bars before it.
+
+        The "high volume bar" reading: 1.0 is an average candle, 2.0 is twice the
+        normal participation. Only closed candles are in the deque.
+        """
+        period = int(self.filters.config.get("volume_period") or 20)
+        if period < 2 or len(cell.candles) < period + 1:
+            return None
+        window = list(cell.candles)[-(period + 1):-1]
+        volumes = [float(bar.get("volume") or 0.0) for bar in window]
+        average = sum(volumes) / len(volumes)
+        if average <= 0:
+            return None
+        return round(float(cell.candles[-1].get("volume") or 0.0) / average, 3)
 
     def _apply_filters(self, cell: Cell, candidate: dict, bar: dict) -> tuple[bool, list[str]]:
         cooldown = float(self.filters.config.get("cooldown_minutes") or 0)

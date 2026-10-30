@@ -5,6 +5,19 @@ filters. Nothing here invents a strategy - each filter either switches a
 condition on/off or narrows the same condition:
 
     structure        the sweep -> opposite-side break (the drawing). On by default.
+    trend_context    the external structure must agree: higher highs + higher lows
+                     for a long, lower highs + lower lows for a short (bot/trend.py)
+    require_hh_hl    demand the clean swing sequence, not just the last break
+    require_bos      a break of STRUCTURE in the trade direction, not older than
+                     bos_max_age bars (a close through a swing, never a wick)
+    max_internal_depth  how deep inside internal structure a setup may sit:
+                     1 = external only, 2 = one level of internal (default),
+                     3+ = "internal within internal" and is skipped
+    volume_break     the signal candle must be a high-volume bar (volume_mult x
+                     the average of the previous volume_period candles)
+    confirm_mode     "all" = every switched-on condition must hold;
+                     "score" = the weighted confluence score must reach
+                     confirm_min_score (bos + hvb + volume + fvg + trend + depth)
     hvb              the TDIGM price line crosses the CENTRE band on the signal bar
     hvb_min_points   and how far past the centre it closed, in RSI points
     hvb_min_speed    and how fast: this candle's step vs the line's average step
@@ -38,6 +51,17 @@ from typing import Any
 
 DEFAULT_FILTERS: dict[str, Any] = {
     "structure": True,
+    # --- the trader's trend / nesting rules (round 17) ---
+    "trend_context": True,
+    "require_hh_hl": True,
+    "require_bos": True,
+    "bos_max_age": 240,
+    "max_internal_depth": 2,
+    "volume_break": False,
+    "volume_mult": 1.5,
+    "volume_period": 20,
+    "confirm_mode": "all",
+    "confirm_min_score": 60,
     "hvb": True,
     "hvb_min_points": 1.0,
     "hvb_min_speed": 1.5,
@@ -64,6 +88,21 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "trend_ema": 50,
     "sessions": [],
     "cooldown_minutes": 0,
+}
+
+
+# What the confluence score is made of when ``confirm_mode = "score"``. The
+# weights add up to 100 and express how much each piece of evidence is worth in
+# the trader's own reading of the setup: the trend it sits in and the TDIGM break
+# are the two big ones, the volume and the imbalance confirm the displacement,
+# and being at external rather than nested depth is a small bonus.
+SCORE_WEIGHTS: dict[str, int] = {
+    "trend": 25,
+    "hvb": 25,
+    "bos": 20,
+    "volume": 15,
+    "fvg": 10,
+    "depth": 5,
 }
 
 
@@ -108,10 +147,55 @@ class Filters:
         cfg = self.config
         reasons: list[str] = []
 
+        context = candidate.get("context") or {}
+        depth = candidate.get("depth") or {}
+        side = str(candidate.get("side") or "").lower()
+        want = 1 if side == "long" else -1
+        score_mode = str(cfg.get("confirm_mode") or "all").lower() == "score"
+
+        if cfg.get("trend_context", True) and side:
+            external = context.get("external") or {}
+            direction = external.get("direction")
+            if direction is None:
+                reasons.append("no clear external trend (swings are not making higher highs + higher lows or the mirror)")
+            elif direction * want < 0:
+                which = "higher highs + higher lows" if direction > 0 else "lower highs + lower lows"
+                reasons.append(f"against the external trend ({which})")
+            elif cfg.get("require_hh_hl", True) and not external.get("clean"):
+                reasons.append("external structure is not a clean HH+HL / LH+LL sequence")
+
+        if cfg.get("require_bos", True) and side:
+            external = context.get("external") or {}
+            bos_direction = external.get("bos_direction")
+            age = external.get("bos_age")
+            limit = int(cfg.get("bos_max_age") or 0)
+            if bos_direction is None:
+                reasons.append("no break of structure yet in this trend")
+            elif bos_direction * want < 0:
+                reasons.append("the last break of structure is the other way")
+            elif limit > 0 and age is not None and age > limit:
+                reasons.append(f"the last break of structure was {age} bars ago (max {limit})")
+
+        if side and depth.get("value") is not None:
+            allowed = int(cfg.get("max_internal_depth") or 2)
+            if depth["value"] > allowed:
+                reasons.append(
+                    f"{depth.get('label')} (depth {depth['value']}, max {allowed}): the setup is "
+                    f"nested too deep inside the internal structure"
+                )
+
+        if cfg.get("volume_break") and side:
+            ratio = candidate.get("volume_ratio")
+            need = float(cfg.get("volume_mult") or 0)
+            if ratio is None:
+                reasons.append("volume not known yet")
+            elif need > 0 and ratio < need:
+                reasons.append(f"no high-volume bar ({ratio:.1f}x the average, needs {need:g}x)")
+
         if cfg.get("structure", True) and not candidate.get("structure"):
             reasons.append("no structure (needs a sweep, then the opposite side breaking)")
 
-        if cfg.get("hvb", True):
+        if cfg.get("hvb", True) and not score_mode:
             need = float(cfg.get("hvb_min_points") or 0)
             need_speed = float(cfg.get("hvb_min_speed") or 0)
             if candidate.get("hvb"):
@@ -132,8 +216,6 @@ class Filters:
                     reasons.append(f"HVB too slow ({speed:.1f}x its average step, needs {need_speed:g}x)")
                 else:
                     reasons.append("no HVB: the price line did not cross the centre band")
-
-        side = str(candidate.get("side") or "").lower()
 
         if cfg.get("regime", True) and regime:
             adx = regime.get("adx")
@@ -162,6 +244,13 @@ class Filters:
         if cfg.get("break"):
             if not candidate.get("break"):
                 reasons.append("no 20-bar high/low break on this candle")
+
+        if score_mode and side:
+            score, parts = self.score_of(candidate)
+            need = float(cfg.get("confirm_min_score") or 0)
+            if score < need:
+                have = ", ".join(f"{name} {'yes' if hit else 'no'}" for name, hit in parts.items())
+                reasons.append(f"confluence score {score:.0f} < {need:g} ({have})")
 
         if side and side not in self.sides:
             reasons.append(f"{side}s are switched off")
@@ -204,6 +293,33 @@ class Filters:
 
         self.passed += 1
         return True, []
+
+    @staticmethod
+    def score_of(candidate: dict) -> tuple[float, dict[str, bool]]:
+        """The weighted confluence score, and which parts of it were present.
+
+        Used by ``confirm_mode = "score"`` and shown on every card, so the trader
+        can see *why* one setup outranks another instead of comparing bands.
+        """
+        context = candidate.get("context") or {}
+        external = context.get("external") or {}
+        book = candidate.get("book") or {}
+        depth = candidate.get("depth") or {}
+        side = str(candidate.get("side") or "").lower()
+        want = 1 if side == "long" else -1
+        ratio = candidate.get("volume_ratio")
+        parts = {
+            "trend": bool(external.get("direction") is not None and external["direction"] * want > 0
+                          and external.get("clean")),
+            "hvb": bool(candidate.get("hvb")),
+            "bos": bool(external.get("bos_direction") is not None
+                        and external["bos_direction"] * want > 0),
+            "volume": bool(ratio is not None and float(ratio) >= 1.5),
+            "fvg": bool(book.get("fvgs_in_leg")),
+            "depth": bool(depth.get("value") is not None and depth["value"] <= 2),
+        }
+        score = float(sum(SCORE_WEIGHTS[name] for name, hit in parts.items() if hit))
+        return score, parts
 
     @staticmethod
     def _book_checks(side: str, cfg: dict, book: dict, candidate: dict) -> list[str]:

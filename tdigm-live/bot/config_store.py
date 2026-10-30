@@ -13,42 +13,32 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
-DEFAULT_FILTERS: dict[str, Any] = {
-    "structure": True,
-    "hvb": True,
-    "hvb_min_points": 1.0,
-    "hvb_min_speed": 1.5,
-    "regime": True,
-    "regime_adx_min": 20.0,
-    "regime_er_min": 0.10,
-    "regime_direction": "any",
-    "premium_discount": False,
-    "premium_level": 0.5,
-    "premium_on_entry": False,
-    "structure_direction": True,
-    "require_ms": False,
-    "require_fvg": False,
-    "block_liquidity_pool": True,
-    "pool_tolerance": 0.25,
-    "pool_count": 3,
-    "structure_atr_min": 0.0,
-    "structure_atr_max": 0.0,
-    "break": False,
-    "sides": ["long", "short"],
-    "min_rr": 0.0,
-    "max_bars_since_sweep": 0,
-    "trend": "off",
-    "trend_ema": 50,
-    "sessions": [],
-    "cooldown_minutes": 0,
-}
+# One source of truth: the defaults the gate actually uses (bot/filters.py).
+# A key that is missing here but present there would be silently dropped on the
+# first save from the page, which is exactly the kind of bug this avoids.
+from .filters import DEFAULT_FILTERS  # noqa: E402,F401  (re-exported)
 
 DEFAULT_STRUCTURE: dict[str, Any] = {
     "pivot_len": 5,
+    "major_len": 20,
+    "macro_len": 80,
+    "hh_tolerance_atr": 0.10,
     "sweep_max_wait": 60,
     "level_max_age": 180,
     "max_levels": 40,
 }
+
+# keys added after the first release: the file on disk may not have them yet
+_INT_KEYS = {"max_bars_since_sweep", "trend_ema", "cooldown_minutes", "bos_max_age",
+             "volume_period"}
+_FLOAT_KEYS = {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
+               "premium_level", "pool_tolerance", "pool_count", "structure_atr_min",
+               "structure_atr_max", "volume_mult", "confirm_min_score"}
+_BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
+              "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
+              "trend_context", "require_hh_hl", "require_bos", "volume_break"}
+# whole-number keys that must stay integers (they are counts of bars)
+_COUNT_KEYS = {"max_internal_depth"}
 
 
 def read(path: str | Path) -> dict[str, Any]:
@@ -94,11 +84,17 @@ def set_symbols(path: str | Path, config: dict[str, Any], symbols: Iterable[str]
 def validate_structure(payload: dict[str, Any]) -> dict[str, Any]:
     """Only known keys, clamped to sane ranges - this writes a user-facing file."""
     merged = dict(DEFAULT_STRUCTURE)
-    for key in ("pivot_len", "sweep_max_wait", "level_max_age", "max_levels"):
+    for key in ("pivot_len", "sweep_max_wait", "level_max_age", "max_levels",
+                "major_len", "macro_len"):
         if key not in payload:
             continue
         try:
             merged[key] = max(1, int(payload[key]))
+        except (TypeError, ValueError):
+            pass
+    if "hh_tolerance_atr" in payload:
+        try:
+            merged["hh_tolerance_atr"] = max(0.0, float(payload["hh_tolerance_atr"]))
         except (TypeError, ValueError):
             pass
     if "target_mode" in payload:
@@ -113,20 +109,25 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
         if key not in payload:
             continue
         value = payload[key]
-        if key in {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
-                   "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry"}:
+        if key in _BOOL_KEYS:
             merged[key] = bool(value)
-        elif key in {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
-                     "premium_level", "pool_tolerance", "pool_count", "structure_atr_min", "structure_atr_max"}:
+        elif key in _FLOAT_KEYS:
             try:
                 merged[key] = max(0.0, float(value))
             except (TypeError, ValueError):
                 pass
-        elif key in {"max_bars_since_sweep", "trend_ema", "cooldown_minutes"}:
+        elif key in _COUNT_KEYS:
+            try:
+                merged[key] = max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+        elif key in _INT_KEYS:
             try:
                 merged[key] = max(0, int(value))
             except (TypeError, ValueError):
                 pass
+        elif key == "confirm_mode":
+            merged[key] = value if value in {"all", "score"} else "all"
         elif key == "trend":
             merged[key] = value if value in {"off", "with", "against"} else "off"
         elif key == "regime_direction":
