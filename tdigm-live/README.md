@@ -206,6 +206,31 @@ python run.py serve --exchange mexc
 python run.py universe --exchange mexc --top 30     # list pairs by 24h turnover
 ```
 
+### Start-up: the page is up in a second, the history fills behind it
+
+Warm-up (600 candles per timeframe per instrument) runs **after** the server is
+accepting requests, in a small parallel pool. A 120-instrument universe no longer
+looks like a dead server while it loads: the page opens immediately, every row
+says *warming*, and rows fill in as their history lands.
+
+`python run.py replay data/btc 60` starts 7,800 minutes into the files and serves
+that prefix as history, so **all five timeframes are warm in the first seconds**
+— including 1h, which used to need two hours of real-time playback before it
+could produce anything. `--skip N` moves the start point.
+
+### If the page will not load
+
+* **The table is fed by a websocket, but it never needs one.** The page also
+  reads `/api/state` over plain HTTP at boot and keeps polling it every few
+  seconds whenever the socket has been quiet for more than 4 s. Behind an HTTPS
+  proxy, a VPN or a corporate gateway that will not carry `wss:`, the badge
+  reads `live · polling` and everything still works — matrix, setups, reasons.
+* **`live` + a red banner naming the exchange** means the bot is fine and the
+  exchange is not reachable from that machine. It retries on its own; reloading
+  will not help.
+* `curl -s localhost:8700/api/health` answers in milliseconds and says exactly
+  what is happening: feed status, frames received, cells still warming, signals.
+
 ### Instruments — from the page, written to `config.json`
 
 Open **＋ Instruments**:

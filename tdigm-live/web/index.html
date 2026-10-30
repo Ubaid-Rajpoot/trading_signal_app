@@ -654,13 +654,21 @@
   let configStructure = null;
 
   // ------------------------------------------------------------------- ws
-  let ws = null, backoff = 800, connectedAt = 0;
+  // The page is fed by a websocket, but it must never depend on one: behind a
+  // proxy that will not carry `wss:` (an https preview, a VPN, a corporate
+  // gateway) the socket can stay shut forever and the page would look dead.
+  // So it also loads `/api/state` over plain HTTP at boot and keeps polling it
+  // whenever the socket has gone quiet. Same endpoint, same renderer.
+  let ws = null, backoff = 800, connectedAt = 0, lastSeenAt = 0, mode = "ws", pollFailures = 0;
   function connect() {
     const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
-    ws = new WebSocket(url);
-    ws.onopen = () => { backoff = 800; connectedAt = Date.now(); setSource(state ? state.source : "live", false); };
+    try { ws = new WebSocket(url); } catch { mode = "poll"; return; }
+    ws.onopen = () => { backoff = 800; connectedAt = Date.now(); };
     ws.onmessage = (event) => {
       let msg; try { msg = JSON.parse(event.data); } catch { return; }
+      lastSeenAt = Date.now();
+      pollFailures = 0;
+      if (mode !== "ws") { mode = "ws"; setSource(state ? state.source : "live", false); }
       if (msg.type === "state") onState(msg);
       else if (msg.type === "alert") onAlert(msg.alert);
       else if (msg.type === "filtered") { filteredCount++; filtered.unshift(msg.alert); filtered = filtered.slice(0, 40); renderFilterReasons(); }
@@ -674,14 +682,54 @@
     ws.onerror = () => { try { ws.close(); } catch {} };
   }
 
+  // --------------------------------------------------------- http fallback
+  async function refresh() {
+    try {
+      const res = await fetch("/api/state", { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const next = await res.json();
+      const hadSignals = new Set(alerts.filter((a) => a.kind === "signal").map((a) => `${a.symbol}|${a.timeframe}|${a.time}`));
+      lastSeenAt = Date.now();
+      pollFailures = 0;
+      mode = "poll";
+      onState(next);
+      // a signal that arrived while we were polling still has to make a sound
+      for (const a of alerts) {
+        if (a.kind === "signal" && !hadSignals.has(`${a.symbol}|${a.timeframe}|${a.time}`)) {
+          beep(a.side);
+          toast(`${a.side} ${a.symbol} ${a.timeframe} — setup confirmed`, "ok");
+        }
+      }
+    } catch (err) {
+      pollFailures++;
+      if (pollFailures === 3) showFeedError("The bot is not answering on /api/state. Check the terminal window — the server may have stopped.");
+    }
+  }
+
+  function pollTick() {
+    // the socket is healthy: nothing to do. Quiet for >4s: ask over HTTP.
+    if (Date.now() - lastSeenAt > 4000) refresh();
+  }
+
   // ---------------------------------------------------------------- source
   function setSource(source, down) {
     const badge = $("source-badge"), text = $("source-text");
     badge.classList.remove("live", "replay", "down");
-    if (down) { badge.classList.add("down"); text.textContent = "disconnected"; return; }
-    if (source === "live") { badge.classList.add("live"); text.textContent = "live"; }
-    else if (source === "replay") { badge.classList.add("replay"); text.textContent = "replay · real recorded data"; }
-    else { badge.classList.add("live"); text.textContent = source || "live"; }
+    const how = mode === "poll" ? " · polling" : "";
+    if (down) {
+      // the HTTP fallback may still be delivering, so do not shout "dead"
+      if (Date.now() - lastSeenAt < 12000) {
+        badge.classList.add(state && state.source === "replay" ? "replay" : "live");
+        text.textContent = (state && state.source === "replay" ? "replay" : "live") + " · reconnecting…";
+      } else {
+        badge.classList.add("down");
+        text.textContent = "disconnected";
+      }
+      return;
+    }
+    if (source === "live") { badge.classList.add("live"); text.textContent = "live" + how; }
+    else if (source === "replay") { badge.classList.add("replay"); text.textContent = "replay · real recorded data" + how; }
+    else { badge.classList.add("live"); text.textContent = (source || "live") + how; }
   }
 
   // ----------------------------------------------------------------- state
@@ -696,8 +744,13 @@
     const age = next.last_candle_age;
     const stale = age > 180;
     $("m-age").innerHTML = `<span style="color:${stale ? "var(--red)" : "var(--green)"}">${stale ? "stale " : ""}${Math.round(age)}s</span>`;
-    if (stale && next.source === "live") showFeedError(`No candle from ${next.exchange} for ${Math.round(age)}s. The stream is silent — check the terminal window.`);
-    else hideFeedError();
+    const feed = next.feed || {};
+    if (next.source === "live" && feed.connected === false) {
+      // the page is fine; the exchange is not - say which
+      showFeedError(`The bot is running and this page is live, but it cannot reach ${next.exchange}: ${feed.status || "no connection"}. It retries on its own — nothing to reload.`);
+    } else if (stale && next.source === "live") {
+      showFeedError(`No candle from ${next.exchange} for ${Math.round(age)}s. The stream is silent — check the terminal window.`);
+    } else hideFeedError();
 
     // alert history comes from the server, then we keep it fresh from pushes;
     // complete setups are also kept separately so they never scroll away
@@ -1288,7 +1341,9 @@
   }
 
   // ------------------------------------------------------------------ boot
-  connect();
+  refresh();                                   // paint from HTTP at once
+  connect();                                   // ...and upgrade to the socket
+  setInterval(pollTick, 3000);
   setInterval(() => { if (state) { const age = state.last_candle_age + (Date.now() - connectedAt) / 1000; if (age > 180 && state.source === "live") showFeedError(`No candle for ${Math.round(age)}s — the stream is silent.`); } }, 5000);
 })();
 </script>

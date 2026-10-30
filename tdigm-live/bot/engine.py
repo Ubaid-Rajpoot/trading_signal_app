@@ -20,6 +20,7 @@ universe of instruments would otherwise melt the process.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -356,7 +357,9 @@ class Engine:
         if cell is None:
             return False
         minutes = int(TIMEFRAMES[tf] / 60_000)
-        need = min(1000, (self.min_bars + 5) * minutes)
+        # enough 1m bars to fill this timeframe's window - a 1h cell needs
+        # 120 hours of minutes, not 1,000 bars (that was 16 candles)
+        need = min(60_000, (self.min_bars + 5) * minutes)
         try:
             bars = await feed.history(symbol, "1m", need)
         except Exception:
@@ -369,11 +372,42 @@ class Engine:
                 self._append(cell, done)
         return True
 
-    async def warmup(self, feed) -> None:
-        """History for every instrument. One bad symbol must not kill the bot."""
-        for symbol in list(self.symbols):
-            await self.warm_symbol(feed, symbol)
+    async def warmup(self, feed, concurrency: int = 6) -> None:
+        """History for every instrument, in parallel, one bad symbol at a time.
+
+        Serial warm-up is what made a 120-instrument universe look dead for
+        minutes: 5 timeframes x 120 symbols of REST calls, one after another.
+        Here a small pool fetches them at once and the table is pushed after
+        each instrument, so rows appear as they land instead of at the end.
+        """
+        symbols = list(self.symbols)
+        if not symbols:
+            return
+        limit = max(1, min(int(concurrency), len(symbols)))
+        gate = asyncio.Semaphore(limit)
+
+        async def one(symbol: str) -> None:
+            async with gate:
+                try:
+                    await self.warm_symbol(feed, symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # one bad symbol must not stop the rest
+                    await self._emit(
+                        {"type": "log", "level": "warn", "message": f"warm-up {symbol}: {exc}"}
+                    )
+                await self._emit_state()
+
+        await asyncio.gather(*(one(symbol) for symbol in symbols))
         await self._emit_state(force=True)
+
+    def warming(self) -> int:
+        """Cells that still have no usable history - shown while the bot boots."""
+        return sum(
+            1
+            for cell in self.cells.values()
+            if cell.tracker.last is None or len(cell.candles) < 120
+        )
 
     def _prime_partial(self, cell: Cell, minutes: list[dict]) -> None:
         """Feed only the 1m bars of the period in progress into the rollup."""

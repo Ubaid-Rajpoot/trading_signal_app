@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.gzip import GZipMiddleware
 
 from . import config_store
 from .engine import Engine
@@ -107,12 +108,31 @@ def create_app(
             await hub.send_all({"type": "log", "level": "error", "message": f"feed stopped: {exc}"})
             raise
 
+    async def boot() -> None:
+        """Warm in the background, then start reading candles.
+
+        Warming used to run *before* uvicorn accepted a single connection, so a
+        big universe meant the page looked dead (or "not running") for minutes.
+        Now the server is up instantly, the page shows every cell as warming,
+        and rows fill in as their history lands.
+        """
+        try:
+            await engine.warmup(feed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never take the page down over warm-up
+            await hub.send_all(
+                {"type": "log", "level": "error", "message": f"warm-up failed: {exc}"}
+            )
+        await pump()
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        await engine.warmup(feed)
-        tasks.append(asyncio.create_task(pump()))
+        tasks.append(asyncio.create_task(boot()))
         tasks.append(asyncio.create_task(warmer()))
         try:
+            # a first table immediately, so the browser paints something at once
+            await engine._emit_state(force=True)  # noqa: SLF001 - same module boundary
             yield
         finally:
             for task in tasks:
@@ -122,6 +142,9 @@ def create_app(
             tasks.clear()
 
     app = FastAPI(title="TDIGM liquidity scanner", lifespan=lifespan)
+    # the table is ~90 kB of JSON and the page asks for it every few seconds
+    # when it has to fall back to HTTP; over a proxy that is worth compressing
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     # ------------------------------------------------------------------ page
     @app.get("/")
@@ -138,6 +161,7 @@ def create_app(
             "connected": getattr(feed, "connected", None),
             "frames": getattr(feed, "frames", 0),
             "clients": len(hub.clients),
+            "warming": engine.warming(),
             "candles_seen": engine.candles_seen,
             "signals": engine.kinds.get("signal", 0),
             "symbols": len(engine.symbols),
@@ -146,7 +170,18 @@ def create_app(
 
     @app.get("/api/state")
     async def state() -> JSONResponse:
-        return JSONResponse(engine.snapshot())
+        body = engine.snapshot()
+        # the page must be able to say "the bot is fine, the exchange is not"
+        body["feed"] = {
+            "status": getattr(feed, "status", ""),
+            "connected": getattr(feed, "connected", None),
+            "source": getattr(feed, "source", "live"),
+        }
+        # never cache: a stale table looks exactly like a frozen bot
+        return JSONResponse(
+            body,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:

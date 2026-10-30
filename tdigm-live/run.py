@@ -6,6 +6,7 @@
     python run.py serve --exchange mexc     # LIVE from MEXC
     python run.py serve --symbols BTCUSDT,ETHUSDT
     python run.py replay data/btc 40        # replay real recorded candles at 40 bars/s
+    python run.py replay data/btc 40 --skip 20000   # start 20,000 minutes in
     python run.py universe --exchange mexc  # list the exchange's pairs, biggest first
 
 The page is served on http://localhost:8700 (configurable in config.json).
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 import uvicorn  # noqa: E402
 
 from bot import config_store  # noqa: E402
+from bot.buckets import TIMEFRAMES  # noqa: E402
 from bot.engine import Engine  # noqa: E402
 from bot.feed import FeedError, ReplayFeed, make_feed  # noqa: E402
 from bot.server import create_app  # noqa: E402
@@ -115,7 +117,7 @@ def serve(config: dict, feed, source: str, config_path: Path) -> None:
     host = server.get("host", "0.0.0.0")
     port = int(server.get("port", 8700))
     print(f"source={source}  exchange={engine.exchange}  symbols={len(engine.symbols)}  timeframes={engine.timeframes}")
-    print(f"open http://localhost:{port}")
+    print(f"open http://localhost:{port}   (the page is up now; history warms in the background)")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
@@ -128,6 +130,12 @@ def main() -> int:
     ap.add_argument("--symbols", default="", help="comma-separated override, e.g. BTCUSDT,ETHUSDT")
     ap.add_argument("--exchange", default="", help="binance (default) or mexc")
     ap.add_argument("--top", type=int, default=20, help="universe: how many to print")
+    ap.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="replay: minutes to start in (0 = enough to warm every timeframe)",
+    )
     args = ap.parse_args()
 
     config_path = Path(args.config)
@@ -156,8 +164,17 @@ def main() -> int:
     data_dir = Path(args.data)
     if not data_dir.is_absolute():
         data_dir = ROOT / data_dir
+    # Start deep enough into the files that every timeframe can be warmed from
+    # history: a 1h cell needs 120 closed hours before it can signal, and those
+    # 7,200 one-minute bars would otherwise have to be *played* first.
+    skip = args.skip
+    if skip <= 0:
+        minutes = max(TIMEFRAMES.get(tf, 60_000) for tf in config["timeframes"]) // 60_000
+        skip = int(minutes * 130)
     try:
-        feed = ReplayFeed(data_dir, config["symbols"], speed=args.speed, loop=True)
+        feed = ReplayFeed(
+            data_dir, config["symbols"], speed=args.speed, loop=True, skip_bars=skip
+        )
     except FeedError as exc:
         print(f"replay error: {exc}")
         return 2

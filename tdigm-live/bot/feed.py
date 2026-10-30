@@ -34,6 +34,8 @@ from typing import AsyncIterator, Iterable
 
 import httpx
 
+from .buckets import TIMEFRAMES, Rollup
+
 try:  # websockets is required for live mode only
     import websockets
 except Exception:  # pragma: no cover
@@ -429,11 +431,19 @@ class MexcFeed(BaseFeed):
 
 # ------------------------------------------------------------------- replay
 class ReplayFeed(BaseFeed):
-    """Real recorded candle files played back at ``speed`` bars per second."""
+    """Real recorded candle files played back at ``speed`` bars per second.
+
+    A replay used to warm up "by playing", which meant the 1h row needed 120
+    hours of 1-minute bars before it could show a single signal - two hours of
+    wall clock at 60 bars/s. The feed now starts ``skip_bars`` minutes in and
+    serves the rows it skipped as ordinary history, so every timeframe is warm
+    in the first second and the replay still only ever sees data from its own
+    files.
+    """
 
     source = "replay"
     name = "replay"
-    supports_history = False
+    supports_history = True
 
     def __init__(
         self,
@@ -441,6 +451,7 @@ class ReplayFeed(BaseFeed):
         symbols: list[str] | None = None,
         speed: float = 20.0,
         loop: bool = True,
+        skip_bars: int = 0,
         **kwargs: object,
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -449,9 +460,17 @@ class ReplayFeed(BaseFeed):
         self.files = self._discover(symbols)
         if not self.files:
             raise FeedError(f"no CSV files found in {self.data_dir}")
+        self.skip_bars = max(0, int(skip_bars))
+        # _cursor = rows read from the files so far; _played = how deep the play
+        # head is, i.e. how much history the engine is allowed to see. The
+        # skipped prefix is history from the first moment, so the higher
+        # timeframes are warm before a single bar is paced out.
+        self._cursor: dict[str, int] = {symbol: 0 for symbol, _ in self.files}
+        self._played: dict[str, int] = {symbol: self.skip_bars for symbol, _ in self.files}
+        self._prefix: dict[str, list[dict]] = {}
         super().__init__([symbol for symbol, _ in self.files], **kwargs)
         self.connected = True
-        self.status = f"replay {self.speed:g} bars/s"
+        self.status = f"replay {self.speed:g} bars/s" + (f", from +{self.skip_bars} bars" if self.skip_bars else "")
 
     def _discover(self, symbols: list[str] | None) -> list[tuple[str, Path]]:
         found: list[tuple[str, Path]] = []
@@ -463,8 +482,52 @@ class ReplayFeed(BaseFeed):
             found.append((symbol, path))
         return found
 
+    def _rows(self, symbol: str, upto: int) -> list[dict]:
+        """The first ``upto`` 1m rows of one symbol, read from its own files."""
+        cached = self._prefix.get(symbol)
+        if cached is not None and len(cached) >= upto:
+            return cached[:upto]
+        rows: list[dict] = []
+        for sym, path in self.files:
+            if sym != symbol:
+                continue
+            with path.open(newline="") as handle:
+                for row in csv.reader(handle):
+                    if len(row) < 6:
+                        continue
+                    if len(rows) >= upto:
+                        break
+                    rows.append(_replay_row(symbol, row))
+            if len(rows) >= upto:
+                break
+        if not self._prefix.get(symbol) or len(rows) >= len(self._prefix.get(symbol, [])):
+            self._prefix[symbol] = rows
+        return rows[:upto]
+
     async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
-        return []  # the replay warms up by playing
+        """History = the bars this replay has already passed, aggregated.
+
+        Never data from the future: only rows at or before the play head.
+        """
+        symbol = symbol.upper()
+        upto = max(self._played.get(symbol, 0), self.skip_bars)
+        if upto <= 0:
+            return []
+        rows = self._rows(symbol, upto)
+        if interval in ("1m", None):
+            return rows[-limit:]
+        if interval not in TIMEFRAMES:
+            return []
+        rollup = Rollup(interval)
+        bars: list[dict] = []
+        for row in rows:
+            for done in rollup.add(row):
+                bars.append(done)
+        return bars[-limit:]
+
+    def exchange_interval(self, timeframe: str) -> str | None:
+        # a replay can build any timeframe from its 1m rows
+        return timeframe if timeframe in TIMEFRAMES else None
 
     async def universe(self) -> list[dict]:
         raise FeedError(
@@ -479,25 +542,35 @@ class ReplayFeed(BaseFeed):
                     for row in csv.reader(handle):
                         if len(row) < 6:
                             continue
-                        raw_time = int(row[0])
-                        open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
-                        if open_time < 10**12:  # seconds
-                            open_time *= 1000
-                        yield {
-                            "symbol": symbol,
-                            "open_time": open_time,
-                            "close_time": open_time + 59_999,
-                            "open": float(row[1]),
-                            "high": float(row[2]),
-                            "low": float(row[3]),
-                            "close": float(row[4]),
-                            "volume": float(row[5]),
-                            "trades": 0,
-                            "closed": True,
-                        }
+                        self._cursor[symbol] = self._cursor.get(symbol, 0) + 1
+                        if self._cursor[symbol] <= self.skip_bars:
+                            continue  # the warm-up prefix is history, not a tick
+                        self._played[symbol] = self._cursor[symbol]
+                        candle = _replay_row(symbol, row)
+                        yield candle
                         await asyncio.sleep(1.0 / self.speed)
             if not self.loop:
                 return
+
+
+def _replay_row(symbol: str, row: list[str]) -> dict:
+    """One CSV row -> one closed 1m candle (the layout the engine expects)."""
+    raw_time = int(row[0])
+    open_time = raw_time // 1000 if raw_time > 10**14 else raw_time
+    if open_time < 10**12:  # seconds
+        open_time *= 1000
+    return {
+        "symbol": symbol,
+        "open_time": open_time,
+        "close_time": open_time + 59_999,
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
+        "volume": float(row[5]),
+        "trades": 0,
+        "closed": True,
+    }
 
 
 FEEDS = {"binance": BinanceFeed, "mexc": MexcFeed}
