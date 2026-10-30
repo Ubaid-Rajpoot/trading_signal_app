@@ -1019,11 +1019,32 @@
     return rows.sort(by).slice(0, 200);
   }
 
+  // in a replay the candles are from the past: "3h ago" must mean 3h of market
+  // time, not 31,707 hours of wall clock
+  function nowMs() {
+    if (state && state.source === "replay") {
+      let last = 0;
+      for (const cell of state.cells || []) {
+        if (cell.last_close_time > last) last = cell.last_close_time;
+      }
+      if (last) return last;
+    }
+    return Date.now();
+  }
+
   function stateClass(row) {
     if (row.state === "pending" || row.state === "active") return "valid";
     if (row.state === "win") return "win";
     if (row.state === "stopped") return "stopped";
     return "dead";
+  }
+
+  function marketAgo(ms) {
+    const seconds = Math.max(0, (nowMs() - ms) / 1000);
+    if (seconds < 90) return Math.round(seconds) + "s";
+    if (seconds < 5400) return Math.round(seconds / 60) + "m";
+    if (seconds < 172800) return Math.round(seconds / 3600) + "h";
+    return Math.round(seconds / 86400) + "d";
   }
 
   function renderSetups() {
@@ -1062,7 +1083,7 @@
       l1.className = "l1";
       l1.append(span("sym", row.symbol), span("tf", row.timeframe),
                 span("side " + (row.side === "SHORT" ? "short" : "long"), row.side),
-                span(`state ${stateClass(row)}`, row.state), span("tf", ago(row.created_ms) + " ago"),
+                span(`state ${stateClass(row)}`, row.state), span("tf", marketAgo(row.created_ms) + " ago"),
                 span("tf", row.mitigated ? "mitigated" : "not mitigated"));
       if (row.hvb_side) l1.append(span("tag on", "HVB"));
       if (row.break_kind === "MS") l1.append(span("tag", "MS"));
@@ -1072,8 +1093,10 @@
       nums.append(
         document.createTextNode(`entry ${fmt(row.entry)}`),
         document.createTextNode(`stop ${fmt(row.stop)}`),
-        document.createTextNode(`target ${row.target === null ? "–" : fmt(row.target)}`),
-        document.createTextNode(`2R ${fmt(row.target_2r)}`),
+        document.createTextNode(row.target === null
+          ? `target 2R ${fmt(row.target_2r)} (no liquidity left)`
+          : `target ${fmt(row.target)}`),
+        document.createTextNode(`stop at 2R ${fmt(row.target_2r)}`),
         document.createTextNode(`R:R ${row.rr === null || row.rr === undefined ? "–" : row.rr.toFixed(2)}`),
         document.createTextNode(`score ${row.score === null || row.score === undefined ? "–" : Math.round(row.score)}`),
       );
