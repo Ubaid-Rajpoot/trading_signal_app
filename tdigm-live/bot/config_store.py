@@ -18,6 +18,8 @@ from typing import Any, Iterable
 # first save from the page, which is exactly the kind of bug this avoids.
 from .filters import DEFAULT_FILTERS  # noqa: E402,F401  (re-exported)
 
+DEFAULT_MARKET = "futures"
+
 DEFAULT_STRUCTURE: dict[str, Any] = {
     "pivot_len": 5,
     "major_len": 20,
@@ -38,7 +40,7 @@ _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "struct
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
               "trend_context", "require_hh_hl", "require_bos", "volume_break"}
 # whole-number keys that must stay integers (they are counts of bars)
-_COUNT_KEYS = {"max_internal_depth"}
+_COUNT_KEYS = {"max_internal_depth", "setup_max_bars"}
 
 
 def read(path: str | Path) -> dict[str, Any]:

@@ -57,6 +57,8 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "require_bos": True,
     "bos_max_age": 240,
     "max_internal_depth": 2,
+    # how long a published setup stays tradeable before it is "expired"
+    "setup_max_bars": 240,
     "volume_break": False,
     "volume_mult": 1.5,
     "volume_period": 20,

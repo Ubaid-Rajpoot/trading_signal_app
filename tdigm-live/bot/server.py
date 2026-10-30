@@ -70,6 +70,7 @@ def create_app(
     universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None}
     tasks: list[asyncio.Task] = []
     warm_queue: asyncio.Queue[str] = asyncio.Queue()
+    rescan_state: dict[str, Any] = {"running": False, "result": None}
     warm_pending: set[str] = set()
 
     def queue_warm(symbols: list[str]) -> None:
@@ -108,6 +109,32 @@ def create_app(
             await hub.send_all({"type": "log", "level": "error", "message": f"feed stopped: {exc}"})
             raise
 
+    async def setup_pusher() -> None:
+        """State changes (a pending setup fills, wins, or dies) go out at once."""
+        while True:
+            await asyncio.sleep(0.5)
+            while engine.setup_events:
+                payload = engine.setup_events.pop(0)
+                await hub.send_all({"type": "setup", "setup": payload})
+
+    async def retry_sweeper() -> None:
+        """Every minute, try again for any instrument whose history never came.
+
+        Without this, one rate-limited minute at start-up meant that instrument
+        was invisible for the whole session - which is how 500 symbols can sit
+        there producing nothing.
+        """
+        while True:
+            await asyncio.sleep(60)
+            try:
+                retried = await engine.retry_failed(feed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            if retried:
+                await engine._emit_state(force=True)  # noqa: SLF001
+
     async def boot() -> None:
         """Warm in the background, then start reading candles.
 
@@ -130,6 +157,8 @@ def create_app(
     async def lifespan(_app: FastAPI):
         tasks.append(asyncio.create_task(boot()))
         tasks.append(asyncio.create_task(warmer()))
+        tasks.append(asyncio.create_task(setup_pusher()))
+        tasks.append(asyncio.create_task(retry_sweeper()))
         try:
             # a first table immediately, so the browser paints something at once
             await engine._emit_state(force=True)  # noqa: SLF001 - same module boundary
@@ -162,6 +191,11 @@ def create_app(
             "frames": getattr(feed, "frames", 0),
             "clients": len(hub.clients),
             "warming": engine.warming(),
+            "failed": len(engine.warm_failures),
+            "market": str(config.get("market", "futures")),
+            "setups": len(engine.setup_payloads),
+            "rescanning": bool(rescan_state.get("running")),
+            "setups_valid": len(engine.open_setups(valid_only=True, limit=10_000)),
             "candles_seen": engine.candles_seen,
             "signals": engine.kinds.get("signal", 0),
             "symbols": len(engine.symbols),
@@ -176,12 +210,62 @@ def create_app(
             "status": getattr(feed, "status", ""),
             "connected": getattr(feed, "connected", None),
             "source": getattr(feed, "source", "live"),
+            "market": getattr(feed, "market", "futures"),
+            "name": getattr(feed, "name", ""),
         }
+        # the market the bot is configured for; `feed.market` may be "replay"
+        body["market"] = str(config.get("market", "futures"))
         # never cache: a stale table looks exactly like a frozen bot
         return JSONResponse(
             body,
             headers={"Cache-Control": "no-store, max-age=0"},
         )
+
+    @app.get("/api/setups")
+    async def setups(valid: int = 0, limit: int = 300) -> dict[str, Any]:
+        """Every setup the engine knows about, newest first, with its state."""
+        rows = engine.open_setups(valid_only=bool(valid), limit=max(1, min(1000, limit)))
+        return {
+            "setups": rows,
+            "counts": engine.setup_counts(),
+            "total": len(engine.setup_payloads),
+            "market": getattr(feed, "market", "futures"),
+        }
+
+    @app.get("/api/chart")
+    async def chart(symbol: str, timeframe: str, bars: int = 180) -> JSONResponse:
+        """Candles + the markers a setup is made of, for one instrument."""
+        return JSONResponse(
+            engine.chart(symbol, timeframe, bars),
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+    @app.post("/api/rescan")
+    async def rescan(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        """Re-read every instrument's history and re-run the setup scan."""
+        if rescan_state.get("running"):
+            return {"ok": True, "message": "a re-scan is already running"}
+        rescan_state["running"] = True
+        rescan_state["result"] = None
+
+        async def run() -> None:
+            try:
+                engine.forget_setups()
+                rescan_state["result"] = await engine.rescan(feed)
+                await hub.send_all(
+                    {
+                        "type": "log",
+                        "level": "info",
+                        "message": f"re-scan finished: {rescan_state['result']['setups']} setup(s) in history",
+                    }
+                )
+            except Exception as exc:  # a bad scan must not kill the app
+                await hub.send_all({"type": "log", "level": "error", "message": f"re-scan failed: {exc}"})
+            finally:
+                rescan_state["running"] = False
+
+        asyncio.create_task(run())
+        return {"ok": True, "message": f"re-scanning {len(engine.symbols)} instrument(s)…"}
 
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
@@ -278,6 +362,9 @@ def create_app(
             except Exception as exc:
                 return {"ok": True, "filters": filters, "warning": f"could not write config: {exc}"}
         await engine._emit_state(force=True)  # noqa: SLF001
+        # the rules changed, so the setups on screen have to be re-derived
+        engine.forget_setups()
+        asyncio.create_task(engine.rescan(feed))
         return {"ok": True, "filters": filters, "summary": engine.filters.summary()}
 
     @app.post("/api/tdi")

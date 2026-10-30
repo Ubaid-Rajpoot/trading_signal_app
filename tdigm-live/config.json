@@ -14,13 +14,16 @@
     "PEPEUSDT"
   ],
   "exchange": "mexc",
-  "max_symbols": 500,
+  "market": "futures",
+  "max_symbols": 600,
   "timeframes": [
     "1m",
     "5m",
     "15m",
     "30m",
-    "1h"
+    "1h",
+    "2h",
+    "4h"
   ],
   "tdi": {
     "rsi_period": 50,
@@ -80,7 +83,8 @@
     "trend": "off",
     "trend_ema": 50,
     "sessions": [],
-    "cooldown_minutes": 0
+    "cooldown_minutes": 0,
+    "setup_max_bars": 240
   },
   "break_lookback": 20,
   "hvb_min_points": 0,
@@ -88,5 +92,5 @@
     "host": "0.0.0.0",
     "port": 8700
   },
-  "preview_max_symbols": 200
+  "preview_max_symbols": 300
 }

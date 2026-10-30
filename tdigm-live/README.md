@@ -165,6 +165,29 @@ target: the gates cut signals from 144 to **68** and moved R/trade from +0.20 to
 confirm, the noise floor (SE ≈ 0.17 R → no comparison reaches 2σ) and the
 reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
 
+### What the page shows (round 18)
+
+* **Setups** on the left, newest first, each with entry / stop / target / 2R /
+  R:R / score and a **state**: `pending` (price has not come back into the order
+  block — still valid), `active` (filled), then `win` / `stopped` / `expired` /
+  `invalidated`. Nothing is deleted when it dies; the state and the bar are kept.
+* **Chart** on the right, drawn from real candles: every structure break (amber
+  `BOS`), every TDIGM HVB (purple dot), the **order block** (last opposite candle
+  before the displacement — the red box), the swept liquidity, entry, stop, 2R
+  and the structure target. Any matrix cell opens its chart.
+* **Filter bar** on top: symbol search, timeframe chips (1m … 4h), side, state,
+  sort, *valid only*, *HVB required*, **↻ rescan** (re-read every instrument's
+  history with the current rules), **+ top 500** contracts by turnover.
+* **Futures only by default** — MEXC/Binance USDT-M perpetuals, not spot.
+  `python run.py serve --market spot` if you ever want the other book.
+
+Every instrument is warmed by **replaying its history through the live engine**,
+so a setup that confirmed before you opened the page is found, not missed; and a
+history request that fails is retried three times, reported, and swept again every
+minute instead of leaving that instrument silently dead. How that works, and the
+exact definitions of the order block and of valid/invalid, are in
+[`docs/setups.md`](docs/setups.md).
+
 ### The book's confluences (p.42, p.53, p.87)
 
 Every alert says where it sits in the book, and each of these is a switch:

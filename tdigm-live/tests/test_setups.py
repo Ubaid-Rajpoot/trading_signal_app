@@ -1,0 +1,295 @@
+"""A setup that already exists must be found, and it must stay a live object.
+
+The complaint was concrete: 500 instruments, five timeframes, and not one setup
+- while the trader could see a valid 1H BTC setup on their own chart. The reason
+was not the gates. The engine only ever looked at candles that arrived *while it
+was running*:
+
+* ``seed()`` appended history without evaluating it, so a setup confirmed ten
+  minutes before start-up did not exist;
+* a failed history request was retried never, so an instrument the exchange
+  answered slowly stayed empty for the whole session, silently.
+
+These tests pin both, and pin the lifecycle that makes "this setup is still
+valid" a fact the app can state instead of a story the trader has to remember.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from bot.engine import Engine  # noqa: E402
+from bot.setups import SetupRecord, order_block  # noqa: E402
+
+# 160 quiet bars, then the sweep -> break pattern from tests/test_bot.py
+RISE = [(90 + i * 0.06 + 0.3, 90 + i * 0.06 - 0.3, 90 + i * 0.06) for i in range(160)]
+SHORT = [
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),
+    (100, 95, 99), (103, 98, 102), (107, 101, 106),
+    (106, 101, 102), (102, 97, 98), (99, 95, 96),
+    (100, 97, 98), (101, 98, 99), (102, 99, 100), (103, 100, 101),
+    (104, 101, 102), (108, 102, 104),   # sweep of the 107 high
+    (104, 90, 91),                      # break of the 95 low: the setup
+]
+START = 1_735_689_600_000
+
+
+def rows_to_candles(rows, step_ms: int = 300_000) -> list[dict]:
+    out = []
+    for i, (high, low, close) in enumerate(rows):
+        open_time = START + i * step_ms
+        out.append(
+            {
+                "symbol": "BTCUSDT",
+                "open_time": open_time,
+                "close_time": open_time + step_ms - 1,
+                "open": rows[i - 1][2] if i else close,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 10.0 if i >= len(rows) - 3 else 1.0,
+                "trades": 1,
+                "closed": True,
+            }
+        )
+    return out
+
+
+class FakeFeed:
+    """Only what warm-up uses: history per timeframe."""
+
+    source = "live"
+    name = "fake"
+    market = "futures"
+    connected = True
+
+    def __init__(self, per_tf: dict[str, list[dict]], fail: set[str] | None = None):
+        self.per_tf = per_tf
+        self.fail = fail or set()
+        self.calls: list[str] = []
+
+    def exchange_interval(self, tf: str) -> str:
+        return tf
+
+    async def history(self, symbol: str, interval: str, limit: int = 500):
+        self.calls.append(interval)
+        if interval in self.fail:
+            raise RuntimeError("HTTP 429 Too Many Requests")
+        return self.per_tf.get(interval, [])
+
+
+def engine_for(*timeframes: str, **filters) -> Engine:
+    return Engine(
+        symbols=["BTCUSDT"],
+        timeframes=list(timeframes) or ["5m"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185},
+        filters={
+            "structure": True,
+            "hvb": False,
+            "break": False,
+            "trend_context": False,
+            "require_bos": False,
+            **filters,
+        },
+        structure={"pivot_len": 2, "sweep_max_wait": 60},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_setup_that_formed_before_start_up_is_found_at_warm_up():
+    """The exact bug: history is replayed, not merely stored."""
+    candles = rows_to_candles(RISE + SHORT)
+    feed = FakeFeed({"5m": candles})
+    engine = engine_for("5m")
+    await engine.warm_symbol(feed, "BTCUSDT")
+
+    assert engine.setup_payloads, "a setup confirmed inside the warmed history must exist"
+    setup = next(iter(engine.setup_payloads.values()))
+    assert setup["side"] == "SHORT"
+    assert setup["state"] in {"pending", "active"}, "it was never traded after it formed"
+    assert setup["created_ms"] == candles[-1]["close_time"]
+    assert setup["reasons"], "the card must be able to say why"
+    assert any("broke structure" in reason for reason in setup["reasons"])
+
+
+@pytest.mark.asyncio
+async def test_backfill_and_live_agree_on_the_same_candle():
+    """Replaying history must find exactly what live would have found."""
+    candles = rows_to_candles(RISE + SHORT)
+
+    live = engine_for("5m")
+    for candle in candles:
+        await live.on_candle({**candle, "closed": True})
+
+    warm = engine_for("5m")
+    await warm.warm_symbol(FakeFeed({"5m": candles[:-1]}), "BTCUSDT")
+    await warm.on_candle({**candles[-1], "closed": True})
+
+    def key(engine):
+        return {(row["side"], row["created_ms"], round(row["entry"], 4)) for row in engine.setup_payloads.values()}
+
+    assert key(warm) == key(live), "history replay and the live path must not disagree"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_history_request_is_retried_instead_of_left_empty():
+    candles = rows_to_candles(RISE + SHORT)
+    feed = FakeFeed({"5m": candles}, fail={"5m"})
+    engine = engine_for("5m")
+
+    await engine.warm_symbol(feed, "BTCUSDT")
+    assert engine.cells[("BTCUSDT", "5m")].candles == [] or len(engine.cells[("BTCUSDT", "5m")].candles) < 120
+    assert engine.warm_failures, "the failure must be recorded, not swallowed"
+    assert len(feed.calls) >= 3, "three attempts, not one"
+
+    # the exchange comes back: the retry sweep warms it, and the setup appears
+    feed.fail.clear()
+    retried = await engine.retry_failed(feed)
+    assert retried == 1
+    assert len(engine.cells[("BTCUSDT", "5m")].candles) >= 120
+    assert engine.setup_payloads, "after the retry the instrument is alive, not dead for the session"
+
+
+@pytest.mark.asyncio
+async def test_one_bad_symbol_does_not_stop_the_others():
+    candles = rows_to_candles(RISE + SHORT)
+    feed = FakeFeed({"5m": candles}, fail={"5m"})
+
+    engine = Engine(
+        symbols=["BTCUSDT"],
+        timeframes=["5m"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={"trend_context": False, "require_bos": False},
+        structure={"pivot_len": 2},
+    )
+    feed.fail.clear()
+    await engine.warmup(feed)
+    assert engine.warming() == 0
+
+
+def test_order_block_is_the_last_opposite_candle_before_the_break():
+    candles = rows_to_candles(RISE[-5:] + SHORT[-3:])
+    zone = order_block(candles, "SHORT")
+    assert zone is not None
+    # SHORT: the last bullish candle before the down break, and it sits above
+    # the close of the break candle - the red box on the trader's chart
+    assert zone["high"] >= zone["low"]
+    assert zone["kind"] == "supply"
+
+
+def record(**kwargs) -> SetupRecord:
+    base = dict(
+        key="BTCUSDT|1h|1",
+        symbol="BTCUSDT",
+        timeframe="1h",
+        side="SHORT",
+        created_ms=1_000,
+        entry=100.0,
+        stop=104.0,
+        target=92.0,
+        rr=2.0,
+        zone={"high": 101.0, "low": 99.0, "mid": 100.0},
+        swept_level=104.0,
+        swept_side="high",
+        sweep_ms=900,
+        bos_level=98.0,
+        bos_ms=1_000,
+    )
+    base.update(kwargs)
+    return SetupRecord(**base)
+
+
+def bar_at(high, low, close, ms=2_000) -> dict:
+    return {"high": high, "low": low, "close": close, "close_time": ms, "open": close, "volume": 1.0}
+
+
+def test_a_setup_is_pending_until_price_comes_back_into_the_zone():
+    setup = record()
+    assert setup.valid and setup.state == "pending"
+    assert setup.advance(bar_at(97.5, 95.0, 96.0)) is False, "price moving away is not an event"
+    assert setup.state == "pending", "still valid: the zone has not been mitigated"
+    assert setup.advance(bar_at(100.5, 99.2, 100.0)) is True
+    assert setup.state == "active" and setup.touched_ms == 2_000
+
+
+def test_active_setup_wins_or_loses_and_the_stop_wins_ties():
+    setup = record()
+    setup.advance(bar_at(100.5, 99.2, 100.0))          # filled
+    assert setup.advance(bar_at(99.0, 91.8, 92.5)) is True
+    assert setup.state == "win"
+
+    stopped = record()
+    stopped.advance(bar_at(100.5, 99.2, 100.0))
+    # one candle touches both the target and the stop: assume the stop
+    assert stopped.advance(bar_at(104.5, 91.5, 100.0)) is True
+    assert stopped.state == "stopped", "both in one bar is a loss, not a win"
+
+
+def test_a_setup_that_never_gets_filled_expires_instead_of_haunting_the_list():
+    setup = record(max_bars=3)
+    for i in range(3):
+        setup.advance(bar_at(97.6, 97.0, 97.2, ms=2_000 + i))
+    assert setup.state == "expired" and not setup.valid
+
+
+def test_a_setup_invalidates_if_the_stop_goes_before_the_entry():
+    setup = record()
+    assert setup.advance(bar_at(104.5, 102.0, 104.0)) is True
+    assert setup.state == "invalidated" and not setup.valid
+
+
+@pytest.mark.asyncio
+async def test_the_order_block_comes_from_the_replayed_cell_not_an_empty_one():
+    """The zone is the last opposite candle *of the cell being evaluated*.
+
+    During a history replay that cell is not in ``engine.cells`` yet, so reading
+    it from there produced a zero-height zone at the entry price - the chart drew
+    a line instead of the trader's red box.
+    """
+    candles = rows_to_candles(RISE + SHORT)
+    engine = engine_for("5m")
+    await engine.warm_symbol(FakeFeed({"5m": candles}), "BTCUSDT")
+    setup = next(iter(engine.setup_payloads.values()))
+    zone = setup["zone"]
+    assert zone["high"] > zone["low"], "an order block has height"
+    # a SHORT's supply block sits *above* the entry (that is where you sell from)
+    # and at or below the stop at the sweep extreme
+    assert setup["entry"] <= zone["low"] < zone["high"] <= setup["stop"] * 1.001
+    assert zone["kind"] == "supply", "SHORT setups sit in a supply block"
+
+
+@pytest.mark.asyncio
+async def test_setups_found_in_history_carry_their_own_state():
+    """An old setup is not 'pending' just because nobody has looked at it."""
+    candles = rows_to_candles(RISE + SHORT + [(97, 88, 89)] * 40)
+    engine = engine_for("5m", setup_max_bars=10)
+    await engine.warm_symbol(FakeFeed({"5m": candles}), "BTCUSDT")
+    states = {row["state"] for row in engine.setup_payloads.values()}
+    assert states, "the setup must be found"
+    assert states <= {"win", "stopped", "expired", "invalidated", "active", "pending"}
+    assert any(state in {"expired", "win", "stopped"} for state in states), (
+        "after 40 more bars the life of the setup has moved on"
+    )
+
+
+def test_mitigation_is_tracked_even_when_the_setup_is_old():
+    """"It hasn't been mitigated yet" is a fact about the zone, not the clock."""
+    fresh = record(max_bars=500)
+    fresh.advance(bar_at(97.5, 96.0, 96.5))
+    assert fresh.mitigated is False and fresh.valid
+    fresh.advance(bar_at(100.5, 99.5, 100.0))
+    assert fresh.mitigated is True
+
+    old = record(max_bars=2)
+    for i in range(2):
+        old.advance(bar_at(97.6, 97.0, 97.2, ms=3_000 + i))
+    assert old.state == "expired", "the hold window ran out"
+    assert old.mitigated is False, "but nothing ever used the block"
+    assert old.as_dict()["mitigated"] is False

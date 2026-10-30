@@ -41,6 +41,7 @@ from .confluence import (
 from .filters import Filters
 from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
 from .regime import RegimePoint, RegimeTracker
+from .setups import SetupRecord, order_block
 from .structure import Structure
 from .trend import TrendMap
 
@@ -120,6 +121,40 @@ class Cell:
             return None
         return 1 if last >= self.ema else -1
 
+    def summary(self) -> dict[str, Any]:
+        """A light row: what the table needs for thousands of cells.
+
+        The full trend map (three degrees of pivots, ~1.5 kB) belongs on the
+        setup card and in /api/chart, not on every row of a 3,500-cell table.
+        """
+        last = self.candles[-1] if self.candles else None
+        point = self.tracker.last
+        external = (self.tmap_state or {}).get("external") or {}
+        return {
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "bars": len(self.candles),
+            "warm": point is not None and len(self.candles) >= 120,
+            "price": last["close"] if last else None,
+            "last_close_time": self.last_close_time,
+            "hvb": self.last_hvb,
+            "hvb_time": self.last_hvb_time,
+            "break": self.last_break,
+            "break_time": self.last_break_time,
+            "alerts": self.alerts,
+            "preview": self.preview,
+            "regime_state": (
+                self.regime_point.state(*self.regime_limits) if self.regime_point else None
+            ),
+            "adx": _r(getattr(self.regime_point, "adx", None)),
+            "er": _r(getattr(self.regime_point, "er", None)),
+            "trend": self.trend,
+            "dir": external.get("direction"),
+            "clean": external.get("clean"),
+            "bos": external.get("bos_direction"),
+            "armed": self.structure.armed(last["close"] if last else None) is not None,
+        }
+
     def as_dict(self) -> dict[str, Any]:
         last = self.candles[-1] if self.candles else None
         point = self.tracker.last
@@ -193,6 +228,15 @@ class Engine:
         self._last_state_at = 0.0
         self.state_interval = self._interval_for(len(self.symbols))
         self.cooldowns: dict[tuple[str, str], float] = {}
+        # every setup that was ever published, plus its live state
+        self.registry: dict[str, SetupRecord] = {}
+        self.by_cell: dict[tuple[str, str], list[SetupRecord]] = {}
+        self.setup_payloads: dict[str, dict] = {}
+        self.setup_events: list[dict] = []   # drained by the server and pushed
+        self._quiet = 0            # >0 while replaying history: collect, do not shout
+        self._collected: list[dict] = []
+        self.backfilled = 0
+        self.warm_failures: dict[str, int] = {}
 
     @staticmethod
     def _interval_for(count: int) -> float:
@@ -315,62 +359,122 @@ class Engine:
         cell.tmap_state = cell.tmap.add(bar, atr=cell.regime_point.atr)
         return point
 
-    async def warm_symbol(self, feed, symbol: str) -> None:
-        """Load enough history for one instrument (also used when adding one live)."""
+    async def warm_symbol(self, feed, symbol: str, attempts: int = 3) -> int:
+        """Load enough history for one instrument, then read the setups it holds.
+
+        Returns the number of cells that still came back empty. Two things matter
+        here and both were missing before:
+
+        * a **retry** - one 429 from the exchange used to leave that instrument
+          empty for the rest of the session, silently, which is how 500 symbols
+          can produce no signals at all;
+        * a **replay over the history** afterwards, so a setup that confirmed
+          before the app started still exists. Otherwise the only setups the app
+          can ever show you are the ones that happen while it is open.
+        """
         symbol = symbol.upper()
+        empty = 0
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
             if cell is None or len(cell.candles) >= 120:
                 continue
-            interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
-            if interval is None:  # exchange has no such candle: build it from 1m
-                await self._warm_from_minutes(feed, symbol, tf)
-                continue
-            try:
-                candles = await feed.history(symbol, interval, 600)
-            except Exception as exc:
-                if await self._warm_from_minutes(feed, symbol, tf):
-                    continue
-                await self._emit(
-                    {"type": "log", "level": "warn", "message": f"warm-up {symbol} {tf}: {exc}"}
-                )
-                continue
+            candles: list[dict] = []
+            for attempt in range(attempts):
+                interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
+                if interval is None:  # exchange has no such candle: build it from 1m
+                    if await self._warm_from_minutes(feed, symbol, tf):
+                        candles = []
+                        break
+                else:
+                    try:
+                        candles = await feed.history(symbol, interval, 600)
+                        if candles:
+                            break
+                    except Exception as exc:
+                        if attempt == attempts - 1:
+                            if await self._warm_from_minutes(feed, symbol, tf):
+                                candles = []
+                                break
+                            self.warm_failures[f"{symbol}:{tf}"] = attempt + 1
+                            await self._emit(
+                                {"type": "log", "level": "warn", "message": f"warm-up {symbol} {tf}: {exc}"}
+                            )
+                        else:
+                            await asyncio.sleep(0.6 * (attempt + 1))
             if candles:
-                self.seed(symbol, tf, candles)
+                await self._replay(symbol, tf, candles)
+                self.warm_failures.pop(f"{symbol}:{tf}", None)
+            current = self.cells.get((symbol, tf), cell)
+            if len(current.candles) < 120:
+                empty += 1
+                # silence was the old bug: an instrument with no history looked
+                # exactly like an instrument with nothing to report
+                self.warm_failures.setdefault(f"{symbol}:{tf}", attempts)
+                if current is not None and not current.candles:
+                    await self._emit(
+                        {
+                            "type": "log",
+                            "level": "warn",
+                            "message": f"no {tf} history for {symbol} - it will be retried",
+                        }
+                    )
+        return empty
 
-        # the candle that is still forming has to start at the beginning of its
-        # period, otherwise the first 15m/1h candle after a restart is a stub
+    async def _replay(self, symbol: str, timeframe: str, candles: list[dict]) -> list[dict]:
+        """Feed closed history through the live pipeline once, and keep the result.
+
+        This is the same code path as live - a fresh cell fed the same closed
+        candles through ``_append``/``_evaluate`` - so a setup found here is not
+        a second, approximate definition of the strategy.
+
+        Two details matter:
+
+        * the whole fetched history is replayed (600 bars), not just the 180 the
+          cell keeps, so a setup that confirmed 8 hours ago is still found;
+        * the lifecycle runs over that history too, so an old setup is reported
+          as expired/stopped instead of pretending to still be pending.
+        """
+        cell = self.cells.get((symbol.upper(), timeframe))
+        if cell is None or not candles:
+            return []
+        fresh = Cell(
+            symbol=cell.symbol,
+            timeframe=cell.timeframe,
+            settings=cell.settings,
+            structure_settings=cell.structure_settings,
+            rollup=cell.rollup if timeframe != "1m" else None,
+            regime_limits=cell.regime_limits,
+        )
+        self.by_cell[(cell.symbol, cell.timeframe)] = []
+        self._quiet += 1
+        self._collected = []
         try:
-            minutes = await feed.history(symbol, "1m", 200)
-        except Exception:
-            minutes = []
-        if minutes:
-            for tf in self.timeframes:
-                cell = self.cells.get((symbol, tf))
-                if cell is None or cell.rollup is None:
+            for bar in candles:
+                point = self._append(fresh, bar)
+                self._track_setups(fresh, bar)
+                if point is None:
                     continue
-                self._prime_partial(cell, minutes)
+                structure = fresh.structure
+                setup = structure.last_setup
+                if setup is None or setup.index != structure.count - 1:
+                    continue
+                await self._evaluate(fresh, bar, point)
+        finally:
+            self._quiet -= 1
+            collected, self._collected = self._collected, []
+        fresh.alerts = cell.alerts
+        self.cells[(symbol.upper(), timeframe)] = fresh
+        if collected:
+            self.backfilled += len(collected)
+        return collected
 
-    async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> bool:
-        """Fall back to rolling 1m history up when the exchange has no such candle."""
-        cell = self.cells.get((symbol, tf))
-        if cell is None:
-            return False
-        minutes = int(TIMEFRAMES[tf] / 60_000)
-        # enough 1m bars to fill this timeframe's window - a 1h cell needs
-        # 120 hours of minutes, not 1,000 bars (that was 16 candles)
-        need = min(60_000, (self.min_bars + 5) * minutes)
-        try:
-            bars = await feed.history(symbol, "1m", need)
-        except Exception:
-            return False
-        if not bars:
-            return False
-        rollup = Rollup(tf)
-        for bar in bars:
-            for done in rollup.add(bar):
-                self._append(cell, done)
-        return True
+    def warming(self) -> int:
+        """Cells that still have no usable history - shown while the bot boots."""
+        return sum(
+            1
+            for cell in self.cells.values()
+            if cell.tracker.last is None or len(cell.candles) < 120
+        )
 
     async def warmup(self, feed, concurrency: int = 6) -> None:
         """History for every instrument, in parallel, one bad symbol at a time.
@@ -401,13 +505,95 @@ class Engine:
         await asyncio.gather(*(one(symbol) for symbol in symbols))
         await self._emit_state(force=True)
 
-    def warming(self) -> int:
-        """Cells that still have no usable history - shown while the bot boots."""
-        return sum(
-            1
-            for cell in self.cells.values()
-            if cell.tracker.last is None or len(cell.candles) < 120
-        )
+    def forget_setups(self) -> None:
+        """Drop every remembered setup (used before a full re-scan)."""
+        self.registry.clear()
+        self.setup_payloads.clear()
+        self.setup_events.clear()
+        self.by_cell.clear()
+
+    async def rescan(self, feed, only_missing: bool = False) -> dict[str, Any]:
+        """Re-read history and re-run the scan.
+
+        This is what the rescans button does, and what a filter change needs: the
+        setups you are looking at must be the ones the *current* rules find.
+        """
+        found = 0
+        warmed = 0
+        gate = asyncio.Semaphore(4)
+
+        async def one(symbol: str) -> None:
+            nonlocal found, warmed
+            async with gate:
+                cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
+                missing = any(c is None or len(c.candles) < 120 for c in cells)
+                if missing:
+                    await self.warm_symbol(feed, symbol)
+                    warmed += 1
+                elif not only_missing:
+                    found += len(await self.backfill(symbol))
+
+        await asyncio.gather(*(one(symbol) for symbol in self.symbols))
+        await self._emit_state(force=True)
+        return {"symbols": len(self.symbols), "setups": found, "warmed": warmed}
+
+    async def retry_failed(self, feed) -> int:
+        """Try again for any instrument whose history never arrived."""
+        todo: list[str] = []
+        for symbol in self.symbols:
+            cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
+            if any(cell is not None and len(cell.candles) < 120 for cell in cells):
+                todo.append(symbol)
+        if not todo:
+            return 0
+        gate = asyncio.Semaphore(3)
+
+        async def one(symbol: str) -> None:
+            async with gate:
+                try:
+                    await self.warm_symbol(feed, symbol)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*(one(symbol) for symbol in todo))
+        return len(todo)
+
+    async def backfill(self, symbol: str) -> list[dict]:
+        """Re-derive every timeframe of one instrument from the candles it has."""
+        found: list[dict] = []
+        for tf in self.timeframes:
+            cell = self.cells.get((symbol.upper(), tf))
+            if cell is None or len(cell.candles) < self.min_bars:
+                continue
+            if len(cell.candles) < 120:
+                continue
+            found.extend(await self._replay(symbol, tf, list(cell.candles)))
+        return found
+
+    async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> bool:
+        """Fall back to rolling 1m history up when the exchange has no such candle."""
+        cell = self.cells.get((symbol, tf))
+        if cell is None:
+            return False
+        minutes = int(TIMEFRAMES[tf] / 60_000)
+        # enough 1m bars to fill this timeframe's window - a 1h cell needs
+        # 120 hours of minutes, not 1,000 bars (that was 16 candles)
+        need = min(60_000, (self.min_bars + 5) * minutes)
+        try:
+            bars = await feed.history(symbol, "1m", need)
+        except Exception:
+            return False
+        if not bars:
+            return False
+        rollup = Rollup(tf)
+        built: list[dict] = []
+        for bar in bars:
+            for done in rollup.add(bar):
+                built.append(done)
+        if not built:
+            return False
+        await self._replay(symbol, tf, built)
+        return True
 
     def _prime_partial(self, cell: Cell, minutes: list[dict]) -> None:
         """Feed only the 1m bars of the period in progress into the rollup."""
@@ -439,6 +625,8 @@ class Engine:
                 completed = cell.rollup.add(candle) if cell.rollup else []
             for bar in completed:
                 point = self._append(cell, bar)
+                # first: did this candle change the life of an existing setup?
+                self._track_setups(cell, bar)
                 if point is not None:
                     await self._evaluate(cell, bar, point)
 
@@ -588,6 +776,51 @@ class Engine:
             bar,
         )
 
+    def _markers(self, cell: Cell, candles: list[dict], since: int) -> dict[str, Any]:
+        """Where the structure broke and where the TDIGM HVB printed, bar by bar.
+
+        The same functions the live engine uses (``break_signal`` for the break,
+        the TDI centre cross for the HVB), applied to the same closed candles -
+        so the chart cannot show a break the engine would not have seen. Without
+        this the page could only draw markers for a setup that still exists, and
+        the trader's actual complaint was "it does not show me where the break
+        and the HVB happened".
+        """
+        if len(candles) < 5:
+            return {"bos": [], "hvb": []}
+        settings = cell.settings
+        points = tdi(
+            [float(bar["close"]) for bar in candles],
+            int(settings.get("rsi_period", 50)),
+            int(settings.get("band_period", 50)),
+            int(settings.get("fast_period", 1)),
+            int(settings.get("slow_period", 9)),
+            float(settings.get("band_mult", 1.6185)),
+        )
+        bos: list[dict] = []
+        hvb: list[dict] = []
+        for i in range(1, len(candles)):
+            bar = candles[i]
+            if int(bar["open_time"]) < since:
+                continue
+            brk = break_signal(candles, i, self.break_lookback)
+            if brk:
+                index = i - self.break_lookback if i >= self.break_lookback else 0
+                level = max(float(c["high"]) for c in candles[max(0, i - self.break_lookback):i]) if brk == "high" else min(float(c["low"]) for c in candles[max(0, i - self.break_lookback):i])
+                bos.append({"t": int(bar["open_time"]), "dir": 1 if brk == "high" else -1, "level": level})
+            prev, point = points[i - 1], points[i]
+            if prev is None or point is None:
+                continue
+            before = centre_of(prev, self.centre_reference)
+            centre = centre_of(point, self.centre_reference)
+            if before is None or centre is None:
+                continue
+            if crossed_above(prev.fast, before, point.fast, centre):
+                hvb.append({"t": int(bar["open_time"]), "side": "up"})
+            elif crossed_below(prev.fast, before, point.fast, centre):
+                hvb.append({"t": int(bar["open_time"]), "side": "down"})
+        return {"bos": bos[-40:], "hvb": hvb[-40:]}
+
     def _volume_ratio(self, cell: Cell) -> float | None:
         """This candle's volume against the average of the bars before it.
 
@@ -625,10 +858,137 @@ class Engine:
         if len(self.seen) > 20_000:
             self.seen.clear()
         self.kinds[kind] = self.kinds.get(kind, 0) + 1
-        self.alerts.appendleft(alert)
         if kind == "signal":
+            alert = self._register(alert, bar, cell)
             self.signals.appendleft(alert)
+        self.alerts.appendleft(alert)
+        if self._quiet:
+            # replaying history: this already happened, so collect it and let the
+            # caller decide. Shouting about yesterday's candles is noise.
+            self._collected.append(alert)
+            return
         await self._emit({"type": "alert", "alert": alert})
+
+    # -------------------------------------------------------------- setups
+    def _register(self, alert: dict, bar: dict, cell: Cell | None = None) -> dict:
+        """Turn a signal alert into a tracked setup with a zone and a state."""
+        setup = alert.get("setup") or {}
+        side = alert.get("side") or setup.get("side") or "SHORT"
+        key = f"{alert['symbol']}|{alert['timeframe']}|{alert['time']}"
+        if key in self.setup_payloads:
+            return self.setup_payloads[key]
+        # the cell being evaluated - during a history replay that is the *fresh*
+        # cell, not the one in self.cells yet
+        source = cell or self.cells.get((alert["symbol"], alert["timeframe"]))
+        candles = list(source.candles) if source is not None else []
+        record = SetupRecord(
+            key=key,
+            symbol=alert["symbol"],
+            timeframe=alert["timeframe"],
+            side=side,
+            created_ms=int(alert["time"]),
+            entry=float(setup.get("entry") or alert.get("price") or 0.0),
+            stop=float(setup.get("stop") or 0.0),
+            target=None if setup.get("target") is None else float(setup["target"]),
+            rr=setup.get("rr"),
+            zone=order_block(candles, side),
+            swept_level=float(setup.get("swept_level") or 0.0),
+            swept_side=str(setup.get("swept_side") or ""),
+            sweep_ms=int(setup.get("sweep_time") or 0),
+            bos_level=float(setup.get("broke_level") or 0.0),
+            bos_ms=int(setup.get("broke_time") or 0),
+            break_kind=str(setup.get("break_kind") or "SHIFT"),
+            hvb_ms=int(alert["time"]) if alert.get("hvb") else None,
+            hvb_side=alert.get("hvb"),
+            volume_ratio=alert.get("volume_ratio"),
+            score=alert.get("score"),
+            score_parts=alert.get("score_parts") or {},
+            depth=alert.get("depth"),
+            trend_dir=((alert.get("context") or {}).get("external") or {}).get("direction"),
+            trend_clean=((alert.get("context") or {}).get("external") or {}).get("clean"),
+            reasons=_evidence(alert),
+            max_bars=int(self.filters.config.get("setup_max_bars") or 240),
+        )
+        self.registry[key] = record
+        self.by_cell.setdefault((record.symbol, record.timeframe), []).append(record)
+        # the alert as the engine built it, plus the living state of the setup:
+        # one object, so the feed, the card and the API cannot disagree
+        payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
+        payload["kind"] = "signal"
+        payload["key"] = key
+        payload["setup"] = setup
+        self.setup_payloads[key] = payload
+        return payload
+
+    def _track_setups(self, cell: Cell, bar: dict) -> None:
+        """Every closed bar advances the life of every open setup on that cell."""
+        records = self.by_cell.get((cell.symbol, cell.timeframe))
+        if not records:
+            return
+        for record in records:
+            if record.state in ("win", "stopped", "expired", "invalidated"):
+                continue
+            if not record.advance(bar):
+                continue
+            payload = self.setup_payloads.get(record.key)
+            if payload is None:
+                continue
+            payload.update(record.as_dict())
+            if self._quiet:
+                continue
+            self.setup_events.append(payload)  # the server pushes these out
+
+    def open_setups(self, *, valid_only: bool = False, limit: int = 300) -> list[dict]:
+        rows = list(self.setup_payloads.values())
+        if valid_only:
+            rows = [row for row in rows if row.get("valid")]
+        rows.sort(key=lambda row: -row["created_ms"])
+        return rows[:limit]
+
+    def setup_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self.setup_payloads.values():
+            counts[row["state"]] = counts.get(row["state"], 0) + 1
+        return counts
+
+    def chart(self, symbol: str, timeframe: str, bars: int = 180) -> dict:
+        """Candles plus every marker the setup is made of, for one cell."""
+        cell = self.cells.get((symbol.upper(), timeframe))
+        if cell is None:
+            return {"symbol": symbol, "timeframe": timeframe, "candles": [], "setups": []}
+        candles = list(cell.candles)[-max(20, min(400, bars)):]
+        first = int(candles[0]["open_time"]) if candles else 0
+        rows = []
+        for bar in candles:
+            rows.append(
+                {
+                    "t": int(bar["open_time"]),
+                    "o": bar["open"],
+                    "h": bar["high"],
+                    "l": bar["low"],
+                    "c": bar["close"],
+                    "v": bar.get("volume"),
+                }
+            )
+        setups = [
+            row
+            for row in self.setup_payloads.values()
+            if row["symbol"] == symbol.upper() and row["timeframe"] == timeframe
+            and row["created_ms"] >= first
+        ]
+        setups.sort(key=lambda row: row["created_ms"])
+        markers = self._markers(cell, candles, first)
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "candles": rows,
+            "markers": markers,
+            "setups": setups,
+            "structure": cell.structure.as_dict(),
+            "trend": cell.tmap_state or {},
+            "warm": len(cell.candles) >= 120,
+            "bars": len(cell.candles),
+        }
 
     # ------------------------------------------------------------- preview
     def _preview(self, symbol: str, candle: dict) -> None:
@@ -762,9 +1122,14 @@ class Engine:
             "structure_settings": self.structure_settings,
             "filters": self.filters.summary(),
             "kinds": dict(self.kinds),
-            "cells": [cell.as_dict() for cell in self.cells.values()],
+            "cells": [cell.summary() for cell in self.cells.values()],
             "alerts": list(self.alerts)[:40],
-            "signals": list(self.signals)[:60],
+            "signals": self.open_setups(limit=120),
+            "setup_counts": self.setup_counts(),
+            "setups_valid": sum(1 for row in self.setup_payloads.values() if row.get("valid")),
+            "backfilled": self.backfilled,
+            "failed": len(self.warm_failures),
+            "warming": self.warming(),
             "candles_seen": self.candles_seen,
             "last_candle_age": round(time.time() - self.last_event_at, 1),
             "uptime": round(time.time() - self.started_at, 1),
@@ -774,3 +1139,49 @@ class Engine:
 
 def _r(value: float | None) -> float | None:
     return round(value, 2) if value is not None else None
+
+
+def _evidence(alert: dict) -> list[str]:
+    """The one-line reason a setup is a setup - what the card prints.
+
+    Written once, here, so the alert, the setup record and the docs cannot drift
+    apart: every entry is a fact the engine computed, never a slogan.
+    """
+    out: list[str] = []
+    book = alert.get("book") or {}
+    ctx = alert.get("context") or {}
+    external = ctx.get("external") or {}
+    setup = alert.get("setup") or {}
+    swept = setup.get("swept_side")
+    if swept:
+        out.append(f"swept the {'high' if swept == 'high' else 'low'} at {_fmt(setup.get('swept_level'))}")
+    if setup.get("broke_level") is not None:
+        out.append(f"broke structure at {_fmt(setup.get('broke_level'))} ({setup.get('break_kind', 'SHIFT')})")
+    if alert.get("hvb"):
+        out.append(f"HVB {alert['hvb']} on the break candle ({_fmt(alert.get('hvb_points'))} pts)")
+    if external.get("direction"):
+        degree = "HH+HL" if external["direction"] > 0 else "LH+LL"
+        out.append(
+            "external trend " + ("bullish" if external["direction"] > 0 else "bearish")
+            + (f" (clean {degree})" if external.get("clean") else " (mixed swings)")
+        )
+    depth = (alert.get("depth") or {}).get("value")
+    if depth:
+        out.append(f"depth {depth}")
+    if alert.get("volume_ratio") is not None:
+        out.append(f"volume {alert['volume_ratio']:.2f}x")
+    if book.get("zone"):
+        out.append(f"entry in {book['zone']}")
+    return out
+
+
+def _fmt(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "–"
+    if abs(number) >= 1000:
+        return f"{number:,.0f}"
+    if abs(number) >= 1:
+        return f"{number:.2f}"
+    return f"{number:.6f}".rstrip("0").rstrip(".")

@@ -2,7 +2,7 @@
 """TDIGM liquidity scanner - one command to run it.
 
     python run.py check                     # can this machine reach the exchange?
-    python run.py serve                     # LIVE stream (exchange from config.json)
+    python run.py serve                     # LIVE perps (exchange + market from config.json)
     python run.py serve --exchange mexc     # LIVE from MEXC
     python run.py serve --symbols BTCUSDT,ETHUSDT
     python run.py replay data/btc 40        # replay real recorded candles at 40 bars/s
@@ -57,7 +57,7 @@ def make_engine(config: dict) -> Engine:
 async def check(config: dict, exchange: str) -> int:
     symbol = config["symbols"][0] if config.get("symbols") else "BTCUSDT"
     print(f"1) {exchange} REST history for {symbol} ...")
-    feed = make_feed(exchange, [symbol])
+    feed = make_feed(exchange, [symbol], market=str(config.get("market", "futures")))
     try:
         candles = await feed.history(symbol, "1m", 10)
         last = candles[-1]
@@ -104,9 +104,11 @@ async def universe(config: dict, exchange: str, top: int) -> int:
 
 
 def serve(config: dict, feed, source: str, config_path: Path) -> None:
+    market = str(config.get("market", "futures")).lower()
     engine = make_engine(config)
     engine.source = source
     engine.exchange = getattr(feed, "name", "binance")
+    engine.market = getattr(feed, "market", market)
     available = sorted({symbol for symbol, _ in getattr(feed, "files", [])})
     if source == "replay" and available:
         # A replay can only speak for the instruments it has files for; empty
@@ -116,7 +118,10 @@ def serve(config: dict, feed, source: str, config_path: Path) -> None:
     server = config.get("server", {})
     host = server.get("host", "0.0.0.0")
     port = int(server.get("port", 8700))
-    print(f"source={source}  exchange={engine.exchange}  symbols={len(engine.symbols)}  timeframes={engine.timeframes}")
+    print(
+        f"source={source}  exchange={engine.exchange}  market={market}  "
+        f"symbols={len(engine.symbols)}  timeframes={engine.timeframes}"
+    )
     print(f"open http://localhost:{port}   (the page is up now; history warms in the background)")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
@@ -129,6 +134,12 @@ def main() -> int:
     ap.add_argument("--config", default=str(CONFIG_PATH))
     ap.add_argument("--symbols", default="", help="comma-separated override, e.g. BTCUSDT,ETHUSDT")
     ap.add_argument("--exchange", default="", help="binance (default) or mexc")
+    ap.add_argument(
+        "--market",
+        default="",
+        choices=["", "futures", "spot"],
+        help="futures (USDT-M perpetuals, default) or spot",
+    )
     ap.add_argument("--top", type=int, default=20, help="universe: how many to print")
     ap.add_argument(
         "--skip",
@@ -144,6 +155,9 @@ def main() -> int:
         config["symbols"] = config_store.clean_symbols(args.symbols.split(","))
     if args.exchange:
         config["exchange"] = args.exchange
+    if args.market:
+        config["market"] = args.market
+    market = str(config.get("market", "futures")).lower()
     exchange = str(config.get("exchange", "binance")).lower()
 
     if args.command == "check":
@@ -154,7 +168,7 @@ def main() -> int:
 
     if args.command == "serve":
         try:
-            feed = make_feed(exchange, config["symbols"])
+            feed = make_feed(exchange, config["symbols"], market=market)
         except FeedError as exc:
             print(f"feed error: {exc}")
             return 2

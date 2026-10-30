@@ -260,6 +260,55 @@
     padding: 12px 15px; color: #ffc9d3; background: rgba(255,92,122,.08);
     border-bottom: 1px solid #4a1c28; font-size: 12.5px;
   }
+
+  /* ------------------------------------------------ filter bar / setups / chart */
+  .filterbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 10px 12px; margin-bottom: 14px;
+  }
+  .filterbar .grow { flex: 1 1 190px; min-width: 150px; }
+  .filterbar input[type="search"], .filterbar select, .filterbar input[type="number"] {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 9px; padding: 7px 9px; font: inherit; font-size: 12px; min-width: 0;
+  }
+  .filterbar select { cursor: pointer; }
+  .tfchips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tfchip {
+    font-family: var(--mono); font-size: 11px; padding: 5px 9px; border-radius: 8px;
+    border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer;
+  }
+  .tfchip.on { background: rgba(180,135,255,.16); border-color: #4a3a6b; color: #d6c2ff; }
+  .filterbar label.tgl { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
+
+  .setups { display: grid; grid-template-columns: minmax(330px, 1.05fr) minmax(0, 1.6fr); gap: 14px; margin-bottom: 14px; }
+  @media (max-width: 1100px) { .setups { grid-template-columns: 1fr; } }
+  .setup-list { max-height: 560px; overflow: auto; }
+  .setup-row {
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer;
+  }
+  .setup-row:hover { background: rgba(255,255,255,.02); }
+  .setup-row.sel { background: rgba(180,135,255,.09); box-shadow: inset 2px 0 0 var(--purple); }
+  .setup-row .l1 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .setup-row .sym { font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+  .setup-row .tf { font-family: var(--mono); font-size: 10.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+  .setup-row .why { font-size: 10.5px; color: var(--muted-2); grid-column: 1 / -1; line-height: 1.5; }
+  .setup-row .nums { font-family: var(--mono); font-size: 10.5px; color: var(--muted); grid-column: 1 / -1; display: flex; gap: 10px; flex-wrap: wrap; }
+  .state { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; padding: 1px 7px; border-radius: 999px; border: 1px solid; }
+  .state.valid { color: var(--green); border-color: #1d5c47; background: rgba(46,230,168,.08); }
+  .state.armed { color: var(--amber); border-color: #6b4c1c; background: rgba(255,179,71,.08); }
+  .state.dead { color: var(--muted); border-color: var(--line); }
+  .state.win { color: var(--green); border-color: #1d5c47; }
+  .state.stopped { color: var(--red); border-color: #5a2430; }
+  .chartwrap { position: relative; }
+  #chart { width: 100%; height: 430px; display: block; border-radius: 10px; background: #0b0f16; }
+  .chartlegend { display: flex; gap: 12px; flex-wrap: wrap; padding: 8px 12px 0; font-size: 10.5px; color: var(--muted-2); }
+  .chartlegend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .charthint { padding: 8px 12px 12px; font-size: 11px; color: var(--muted-2); }
+  .charthint b { color: var(--text); }
+  .marketbadge { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--amber); border: 1px solid #6b4c1c; border-radius: 6px; padding: 2px 6px; }
+  .btnrow { display: flex; gap: 6px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -271,6 +320,7 @@
     </div>
     <span class="badge" id="source-badge"><span class="dot"></span><span id="source-text">connecting</span></span>
     <span class="badge exchange" id="exchange-badge">–</span>
+    <span class="badge exchange" id="market-badge-top">–</span>
     <div class="spacer"></div>
     <div class="meta">
       <span>instruments <b id="m-symbols">–</b></span>
@@ -284,6 +334,67 @@
   </header>
 
   <div class="bad" id="feed-error" style="display:none"></div>
+
+
+  <div class="filterbar" id="filterbar">
+    <input class="grow" type="search" id="f-search" placeholder="find instrument…  (BTC, ETH…)" />
+    <div class="tfchips" id="f-tfchips"></div>
+    <select id="f-side" title="direction">
+      <option value="both">both sides</option>
+      <option value="long">long only</option>
+      <option value="short">short only</option>
+    </select>
+    <select id="f-state" title="setup state">
+      <option value="valid">valid (pending + filled)</option>
+      <option value="pending">not filled yet</option>
+      <option value="active">filled now</option>
+      <option value="all">every state</option>
+    </select>
+    <select id="f-sort" title="order">
+      <option value="new">newest first</option>
+      <option value="score">best score</option>
+      <option value="rr">best R:R</option>
+      <option value="sym">A→Z</option>
+    </select>
+    <label class="tgl"><input type="checkbox" id="f-validonly" checked /> valid only</label>
+    <label class="tgl"><input type="checkbox" id="f-hvonly" /> HVB required</label>
+    <div class="btnrow">
+      <button class="btn ghost mini" id="f-rescan" title="re-read every instrument's history and re-run the setup scan">↻ rescan</button>
+      <button class="btn ghost mini" id="f-wide" title="watch the top 500 contracts by turnover">+ top 500</button>
+    </div>
+    <span class="meta" id="f-count">–</span>
+  </div>
+
+  <div class="setups">
+    <section class="card">
+      <h2>
+        <span>Setups</span><span class="count" id="setups-count">0</span>
+        <span class="right"><span class="marketbadge" id="market-badge">futures</span></span>
+      </h2>
+      <div class="setup-list" id="setups"></div>
+      <div class="hintline">
+        <b>valid</b> = pending (price has not come back into the order block) or filled.
+        A setup stays on this list after it dies, with the state and the reason — nothing is deleted.
+        Click one to draw its structure break, its HVB and its order block on the chart.
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>
+        <span id="chart-title">Chart</span><span class="count" id="chart-tf">–</span>
+        <span class="right"><span class="mini" id="chart-meta">pick a setup</span></span>
+      </h2>
+      <div class="chartwrap"><canvas id="chart"></canvas></div>
+      <div class="chartlegend">
+        <span><i style="background:#ffb347"></i>structure break (BOS)</span>
+        <span><i style="background:#b487ff"></i>HVB candle</span>
+        <span><i style="background:rgba(255,92,122,.45)"></i>order block</span>
+        <span><i style="background:#2ee6a8"></i>target / 2R</span>
+        <span><i style="background:#ff5c7a"></i>stop</span>
+      </div>
+      <div class="charthint" id="chart-hint">Orders travel: sweep → break of structure → HVB on the break candle → the order block is the last opposite candle before it.</div>
+    </section>
+  </div>
 
   <section class="kpis">
     <div class="kpi" style="--accent: var(--green)">
@@ -672,6 +783,7 @@
       if (msg.type === "state") onState(msg);
       else if (msg.type === "alert") onAlert(msg.alert);
       else if (msg.type === "filtered") { filteredCount++; filtered.unshift(msg.alert); filtered = filtered.slice(0, 40); renderFilterReasons(); }
+      else if (msg.type === "setup") { onSetup(msg.setup); }
       else if (msg.type === "log") toast(msg.message, msg.level === "error" ? "err" : "");
     };
     ws.onclose = () => {
@@ -738,6 +850,7 @@
     if (!configFilters) { configFilters = JSON.parse(JSON.stringify(next.filters.config)); configStructure = next.structure_settings; }
     setSource(next.source, false);
     $("exchange-badge").textContent = next.exchange || "exchange";
+    $("market-badge-top").textContent = `${next.market || "futures"} only`;
     $("m-symbols").textContent = next.symbols.length;
     $("m-candles").textContent = compact(next.candles_seen);
     $("m-feed").textContent = next.preview ? "streaming" : "streaming (previews off)";
@@ -756,8 +869,13 @@
     // complete setups are also kept separately so they never scroll away
     if (next.alerts) alerts = mergeAlerts(next.alerts, alerts, 300);
     if (next.signals) alerts = mergeAlerts(next.signals, alerts, 300);
-
+    // the setups list is the engine's own registry: replace, never merge, so a
+    // setup that changed state cannot show up twice with two different states
+    if (Array.isArray(next.signals)) ui.setups = next.signals;
     $("k-signals").textContent = (next.kinds && next.kinds.signal) || 0;
+    $("k-signals-sub").textContent =
+      `${(next.setups || []).filter((r) => r.valid).length} valid · ${next.backfilled || 0} found in history`;
+
     const sweeps = (next.kinds && next.kinds.sweep) || 0;
     $("k-sweeps").textContent = sweeps;
     const warm = (next.cells || []).filter((c) => c.warm);
@@ -771,10 +889,13 @@
 
     const armed = next.cells.filter((c) => c.armed);
     $("k-armed").textContent = armed.length;
-    $("k-signals-sub").textContent = next.preview === false
-      ? "sweep + opposite break + HVB (previews off: big universe)"
-      : "sweep + opposite break + HVB";
+    const validNow = (next.signals || []).filter((r) => r.valid).length;
+    $("k-signals").textContent = validNow;
+    $("k-signals-sub").textContent =
+      `${(next.setups_valid ?? validNow)} valid · ${next.backfilled || 0} found in history` +
+      (next.failed ? ` · ${next.failed} instrument(s) unreachable` : "");
 
+    renderSetups();
     renderMatrix();
     renderArmed(armed);
     renderFeed();
@@ -792,6 +913,19 @@
     const seen = new Set(existing.map(key));
     const fresh = incoming.filter((a) => !seen.has(key));
     return [...fresh, ...existing].sort((a, b) => b.time - a.time).slice(0, cap);
+  }
+
+  function onSetup(setup) {
+    if (!setup || !setup.key) return;
+    const row = (ui.setups || []).find((r) => r.key === setup.key);
+    if (row) Object.assign(row, setup);
+    else { ui.setups = [setup, ...(ui.setups || [])].slice(0, 200); }
+    if (setup.valid && (setup.state === "pending" || setup.state === "active")) {
+      toast(`${setup.state === "active" ? "FILLED" : "VALID"} · ${setup.side} ${setup.symbol} ${setup.timeframe} · order block ${fmt(setup.zone.low)}–${fmt(setup.zone.high)}`, "ok");
+      beep(setup.side);
+    }
+    renderSetups();
+    if (setup.key === ui.selected) drawChart();
   }
 
   function onAlert(alert) {
@@ -820,6 +954,338 @@
         osc.start(now + i * 0.12); osc.stop(now + i * 0.12 + 0.24);
       });
     } catch {}
+  }
+
+
+  // ------------------------------------------------------------ filter bar
+  const ui = {
+    tfs: new Set(),            // empty = every timeframe
+    side: "both",
+    state: "valid",
+    sort: "new",
+    search: "",
+    validOnly: true,
+    hvbOnly: false,
+    selected: null,            // setup key drawn on the chart
+    setups: [],
+    chart: null,
+  };
+
+  function buildTfChips() {
+    const box = $("f-tfchips");
+    const tfs = (state && state.timeframes) || [];
+    if (box.dataset.sig === tfs.join(",")) return;
+    box.dataset.sig = tfs.join(",");
+    const all = document.createElement("button");
+    all.className = "tfchip" + (ui.tfs.size === 0 ? " on" : "");
+    all.textContent = "all";
+    all.onclick = () => { ui.tfs.clear(); buildTfChips(); refreshTfChips(); renderSetups(); };
+    box.replaceChildren(all);
+    for (const tf of tfs) {
+      const b = document.createElement("button");
+      b.className = "tfchip" + (ui.tfs.has(tf) ? " on" : "");
+      b.textContent = tf;
+      b.onclick = () => {
+        if (ui.tfs.has(tf)) ui.tfs.delete(tf); else ui.tfs.add(tf);
+        ui.tfs.size ? all.classList.remove("on") : all.classList.add("on");
+        b.classList.toggle("on", ui.tfs.has(tf));
+        renderSetups();
+      };
+      box.append(b);
+    }
+  }
+  function refreshTfChips() { $("f-tfchips").dataset.sig = ""; buildTfChips(); }
+
+  function setupMatches(row) {
+    if (ui.search && !row.symbol.includes(ui.search)) return false;
+    if (ui.tfs.size && !ui.tfs.has(row.timeframe)) return false;
+    if (ui.side !== "both" && row.side.toLowerCase() !== ui.side) return false;
+    if (ui.hvbOnly && !row.hvb_side) return false;
+    if (ui.validOnly && !row.valid) return false;
+    if (ui.state === "pending" && row.state !== "pending") return false;
+    if (ui.state === "active" && row.state !== "active") return false;
+    if (ui.state === "valid" && !row.valid) return false;
+    return true;
+  }
+
+  function filteredSetups() {
+    const rows = (ui.setups || []).filter(setupMatches);
+    const by = {
+      new: (a, b) => b.created_ms - a.created_ms,
+      score: (a, b) => (b.score || 0) - (a.score || 0) || b.created_ms - a.created_ms,
+      rr: (a, b) => (b.rr ?? -1) - (a.rr ?? -1),
+      sym: (a, b) => a.symbol.localeCompare(b.symbol) || b.created_ms - a.created_ms,
+    }[ui.sort];
+    return rows.sort(by).slice(0, 200);
+  }
+
+  function stateClass(row) {
+    if (row.state === "pending" || row.state === "active") return "valid";
+    if (row.state === "win") return "win";
+    if (row.state === "stopped") return "stopped";
+    return "dead";
+  }
+
+  function renderSetups() {
+    buildTfChips();
+    const box = $("setups");
+    const rows = filteredSetups();
+    $("setups-count").textContent = rows.length;
+    $("f-count").textContent = `${rows.length} of ${(ui.setups || []).length} setups`;
+    $("market-badge").textContent = (state && state.market) || "futures";
+    // nothing to click? draw the biggest timeframe of the first instrument so the
+    // page always shows where the breaks and the HVBs were, even with no setup
+    if (!rows.length && !ui.chart && state && (state.cells || []).length) {
+      const warmCells = state.cells.filter((c) => c.warm);
+      const pick = warmCells.find((c) => c.timeframe === "1h")
+        || warmCells.find((c) => c.timeframe === "4h")
+        || warmCells[0];
+      if (pick) loadChart(pick.symbol, pick.timeframe, null);
+    }
+    if (!rows.length) {
+      const warm = state ? state.warming : 0;
+      const total = (ui.setups || []).length;
+      box.innerHTML = `<div class="empty">${warm
+        ? `Warming ${warm} instrument/timeframe cells — setups appear here as their history lands.`
+        : total
+          ? `${total} setup(s) are known but none of them match these filters. Untick “valid only”, or raise the timeframe chips.`
+          : "No setups yet. Every closed candle is checked; ↻ rescan re-reads each instrument's history with the current rules."}</div>`;
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const row of rows) {
+      const el = document.createElement("div");
+      el.className = "setup-row" + (ui.selected === row.key ? " sel" : "");
+      el.onclick = () => selectSetup(row.key);
+
+      const l1 = document.createElement("div");
+      l1.className = "l1";
+      l1.append(span("sym", row.symbol), span("tf", row.timeframe),
+                span("side " + (row.side === "SHORT" ? "short" : "long"), row.side),
+                span(`state ${stateClass(row)}`, row.state), span("tf", ago(row.created_ms) + " ago"),
+                span("tf", row.mitigated ? "mitigated" : "not mitigated"));
+      if (row.hvb_side) l1.append(span("tag on", "HVB"));
+      if (row.break_kind === "MS") l1.append(span("tag", "MS"));
+
+      const nums = document.createElement("div");
+      nums.className = "nums";
+      nums.append(
+        document.createTextNode(`entry ${fmt(row.entry)}`),
+        document.createTextNode(`stop ${fmt(row.stop)}`),
+        document.createTextNode(`target ${row.target === null ? "–" : fmt(row.target)}`),
+        document.createTextNode(`2R ${fmt(row.target_2r)}`),
+        document.createTextNode(`R:R ${row.rr === null || row.rr === undefined ? "–" : row.rr.toFixed(2)}`),
+        document.createTextNode(`score ${row.score === null || row.score === undefined ? "–" : Math.round(row.score)}`),
+      );
+      nums.append(span("state " + (row.r_now >= 0 ? "valid" : "stopped"), `${row.r_now >= 0 ? "+" : ""}${row.r_now ?? 0}R now`));
+
+      const why = document.createElement("div");
+      why.className = "why";
+      why.textContent = (row.reasons || []).join(" · ");
+
+      el.append(l1, nums, why);
+      frag.append(el);
+    }
+    box.replaceChildren(frag);
+    if (!ui.selected && rows.length) selectSetup(rows[0].key);
+  }
+
+  function span(cls, text) {
+    const node = document.createElement("span");
+    node.className = cls;
+    node.textContent = text;
+    return node;
+  }
+
+  async function selectSetup(key) {
+    ui.selected = key;
+    for (const node of document.querySelectorAll(".setup-row")) node.classList.remove("sel");
+    const row = (ui.setups || []).find((r) => r.key === key);
+    if (!row) return;
+    await loadChart(row.symbol, row.timeframe, key);
+  }
+
+  async function loadChart(symbol, timeframe, key) {
+    try {
+      const res = await fetch(`/api/chart?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&bars=180`, { cache: "no-store" });
+      ui.chart = await res.json();
+    } catch (err) {
+      $("chart-meta").textContent = "chart unavailable";
+      return;
+    }
+    ui.selected = key || null;
+    drawChart();
+  }
+
+  // ---------------------------------------------------------------- chart
+  function drawChart() {
+    const canvas = $("chart");
+    const data = ui.chart;
+    if (!data || !data.candles || !data.candles.length) {
+      const ctx = canvas.getContext("2d");
+      canvas.width = canvas.clientWidth || 600; canvas.height = 430;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth || 640, H = 430;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const bars = data.candles;
+    const setup = (data.setups || []).find((s) => s.key === ui.selected) || (data.setups || [])[data.setups.length - 1];
+    const padL = 8, padR = 66, padT = 12, padB = 22;
+    let hi = Math.max(...bars.map((b) => b.h)), lo = Math.min(...bars.map((b) => b.l));
+    if (setup) {
+      hi = Math.max(hi, setup.zone ? setup.zone.high : hi, setup.stop);
+      lo = Math.min(lo, setup.target ?? setup.target_2r, setup.zone ? setup.zone.low : lo);
+    }
+    const span = (hi - lo) || 1;
+    hi += span * 0.06; lo -= span * 0.06;
+    const x = (i) => padL + (i * (W - padL - padR)) / Math.max(1, bars.length - 1);
+    const y = (p) => padT + ((hi - p) / (hi - lo)) * (H - padT - padB);
+    const cw = Math.max(1, Math.min(9, (W - padL - padR) / bars.length * 0.68));
+    const indexOf = new Map(bars.map((b, i) => [b.t, i]));
+
+    // grid + price axis
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 4; i++) {
+      const p = lo + ((hi - lo) * i) / 4;
+      ctx.strokeStyle = "rgba(255,255,255,.05)";
+      ctx.beginPath(); ctx.moveTo(padL, y(p)); ctx.lineTo(W - padR, y(p)); ctx.stroke();
+      ctx.fillStyle = "#7d8798";
+      ctx.fillText(fmt(p), W - padR + 6, y(p));
+    }
+
+    // candles
+    bars.forEach((b, i) => {
+      const up = b.c >= b.o;
+      ctx.strokeStyle = up ? "#2ee6a8" : "#ff5c7a";
+      ctx.fillStyle = up ? "rgba(46,230,168,.85)" : "rgba(255,92,122,.85)";
+      ctx.beginPath(); ctx.moveTo(x(i), y(b.h)); ctx.lineTo(x(i), y(b.l)); ctx.stroke();
+      const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
+      ctx.fillRect(x(i) - cw / 2, top, cw, Math.max(1, bot - top));
+    });
+
+    // every break and every HVB in the window, even when no setup is selected:
+    // the trader asked to *see* where the structure broke and where the HVB was
+    const markers = data.markers || { bos: [], hvb: [] };
+    const idx = new Map(bars.map((b, i) => [b.t, i]));
+    for (const m of markers.bos) {
+      const i = idx.get(m.t);
+      if (i === undefined) continue;
+      const x0 = x(i);
+      ctx.strokeStyle = m.dir > 0 ? "rgba(255,179,71,.85)" : "rgba(255,179,71,.85)";
+      ctx.beginPath();
+      ctx.moveTo(x0 - 4, y(m.level) + (m.dir > 0 ? 3 : -3));
+      ctx.lineTo(x0, y(m.level));
+      ctx.lineTo(x0 + 4, y(m.level) + (m.dir > 0 ? 3 : -3));
+      ctx.stroke();
+      ctx.fillStyle = "rgba(255,179,71,.75)";
+      ctx.fillText(m.dir > 0 ? "BOS↑" : "BOS↓", x0 + 3, y(m.level) + (m.dir > 0 ? 12 : -12));
+    }
+    for (const m of markers.hvb) {
+      const i = idx.get(m.t);
+      if (i === undefined) continue;
+      const b = bars[i];
+      ctx.fillStyle = "rgba(180,135,255,.9)";
+      ctx.beginPath();
+      ctx.arc(x(i), m.side === "up" ? y(b.l) + 6 : y(b.h) - 6, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (!setup) { drawChartMeta(data, null); return; }
+
+    // the order block (the last opposite candle before the break)
+    if (setup.zone) {
+      const z = setup.zone;
+      const from = setup.created_ms;
+      const startIdx = indexOf.get(z.time);
+      const x0 = startIdx !== undefined ? x(startIdx) : padL;
+      ctx.fillStyle = setup.side === "SHORT" ? "rgba(255,92,122,.20)" : "rgba(46,230,168,.18)";
+      ctx.fillRect(x0, y(z.high), W - padR - x0, Math.max(2, y(z.low) - y(z.high)));
+      ctx.strokeStyle = setup.side === "SHORT" ? "rgba(255,92,122,.65)" : "rgba(46,230,168,.6)";
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x0, y(z.high)); ctx.lineTo(W - padR, y(z.high)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x0, y(z.low)); ctx.lineTo(W - padR, y(z.low)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#ffc9d3";
+      ctx.fillText("order block", x0 + 4, y(z.high) - 7);
+    }
+
+    // the structure break
+    const bosIdx = indexOf.get(setup.bos_ms);
+    if (bosIdx !== undefined) {
+      const bx = x(bosIdx);
+      ctx.strokeStyle = "#ffb347";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(bx - 7, y(setup.bos_level)); ctx.lineTo(bx + 7, y(setup.bos_level)); ctx.stroke();
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#ffb347";
+      ctx.fillText("BOS " + setup.break_kind, bx + 9, y(setup.bos_level));
+    }
+
+    // the HVB candle
+    const hvbIdx = indexOf.get(setup.hvb_ms);
+    if (hvbIdx !== undefined) {
+      ctx.fillStyle = "#b487ff";
+      ctx.beginPath(); ctx.arc(x(hvbIdx), y(bars[hvbIdx].l) + 7, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillText("HVB", x(hvbIdx) + 6, y(bars[hvbIdx].l) + 7);
+    }
+
+    // the sweep level that was taken
+    ctx.strokeStyle = "rgba(180,135,255,.55)";
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(padL, y(setup.swept_level)); ctx.lineTo(W - padR, y(setup.swept_level)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // entry / stop / target of the setup
+    const lines = [
+      ["entry " + fmt(setup.entry), setup.entry, "#c9d3e3"],
+      ["stop " + fmt(setup.stop), setup.stop, "#ff5c7a"],
+      ["2R", setup.target_2r, "rgba(46,230,168,.6)"],
+    ];
+    if (setup.target !== null) lines.push(["target " + fmt(setup.target), setup.target, "#2ee6a8"]);
+    for (const [label, price, colour] of lines) {
+      if (!Number.isFinite(price)) continue;
+      ctx.strokeStyle = colour;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(padL, y(price)); ctx.lineTo(W - padR, y(price)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = colour;
+      ctx.fillText(label, padL + 2, y(price) - 7);
+    }
+
+    // the moment the setup confirmed
+    const cIdx = indexOf.get(setup.created_ms - 1) ?? indexOf.get(setup.created_ms);
+    if (cIdx !== undefined) {
+      ctx.strokeStyle = "rgba(255,255,255,.25)";
+      ctx.beginPath(); ctx.moveTo(x(cIdx), padT); ctx.lineTo(x(cIdx), H - padB); ctx.stroke();
+      ctx.fillStyle = "#8b97ad";
+      ctx.fillText("setup", x(cIdx) + 4, padT + 8);
+    }
+
+    drawChartMeta(data, setup);
+  }
+
+  function drawChartMeta(data, setup) {
+    $("chart-title").textContent = data.symbol || "Chart";
+    $("chart-tf").textContent = data.timeframe || "";
+    const live = (ui.setups || []).find((r) => r.key === ui.selected);
+    if (live) {
+      $("chart-meta").textContent = `${live.state} · ${fmt(live.entry)} → ${live.target === null ? "2R " + fmt(live.target_2r) : fmt(live.target)}`;
+    } else {
+      $("chart-meta").textContent = data.warm ? `${data.bars} bars` : "warming";
+    }
+    $("chart-hint").innerHTML = setup
+      ? `<b>${setup.side}</b> ${setup.symbol} ${setup.timeframe} · swept <b>${fmt(setup.swept_level)}</b> · broke structure at <b>${fmt(setup.bos_level)}</b> (${setup.break_kind})` +
+        (setup.hvb_ms ? ` · HVB on that candle` : "") +
+        ` · order block <b>${fmt(setup.zone.low)} – ${fmt(setup.zone.high)}</b>` +
+        ` · state <b>${setup.state}</b>${setup.valid ? " (still valid)" : ""}`
+      : "Pick a setup on the left; its break, HVB and order block are drawn here.";
   }
 
   function renderFeed() {
@@ -1054,6 +1520,12 @@
         node.title = title;
         const box = el("span", cls);
         box.append(el("span", "p", price(cell.price)), el("span", "s", status));
+        box.style.cursor = "pointer";
+        box.onclick = () => {
+          ui.selected = null;
+          loadChart(cell.symbol, tf, null);
+          $("chart-title").scrollIntoView({ behavior: "smooth", block: "center" });
+        };
         node.replaceChildren(box);
       });
     }
@@ -1301,6 +1773,43 @@
   $("btn-filters-2").onclick = () => { fillFilterForm(); openDrawer(drawerFilters); };
   $("btn-symbols").onclick = () => { openDrawer(drawerSymbols); if (!universe.loaded) loadUniverse(false); };
   $("f-apply").onclick = applyFilters;
+  $("f-search").oninput = (e) => { ui.search = e.target.value.trim().toUpperCase(); renderSetups(); };
+  $("f-side").onchange = (e) => { ui.side = e.target.value; renderSetups(); };
+  $("f-state").onchange = (e) => {
+    ui.state = e.target.value;
+    ui.validOnly = e.target.value === "valid";
+    $("f-validonly").checked = ui.validOnly;
+    renderSetups();
+  };
+  $("f-sort").onchange = (e) => { ui.sort = e.target.value; renderSetups(); };
+  $("f-validonly").onchange = (e) => {
+    ui.validOnly = e.target.checked;
+    if (ui.validOnly) { ui.state = "valid"; $("f-state").value = "valid"; }
+    else { ui.state = "all"; $("f-state").value = "all"; }
+    renderSetups();
+  };
+  $("f-hvonly").onchange = (e) => { ui.hvbOnly = e.target.checked; renderSetups(); };
+  $("f-rescan").onclick = async () => {
+    const btn = $("f-rescan");
+    btn.disabled = true; btn.textContent = "rescanning…";
+    try {
+      const res = await fetch("/api/rescan", { method: "POST" });
+      const json = await res.json();
+      toast(json.message || "rescanned", json.ok ? "ok" : "warn");
+    } catch (err) { toast("Could not rescan: " + err, "err"); }
+    btn.disabled = false; btn.textContent = "↻ rescan";
+  };
+  $("f-wide").onclick = async () => {
+    toast("Loading the biggest contracts by turnover…", "");
+    try {
+      const res = await fetch("/api/universe/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preset: "top500" }) });
+      const json = await res.json();
+      if (json.error) { toast(json.error, "err"); return; }
+      (json.warnings || []).forEach((w) => toast(w, "warn"));
+      toast(`Added ${(json.added || []).length} contract(s) — they warm in the background`, "ok");
+    } catch (err) { toast("Could not add: " + err, "err"); }
+  };
+  window.addEventListener("resize", () => { if (ui.chart) drawChart(); });
   $("f-reset").onclick = () => { fillFilterForm(); toast("Back to the saved values", ""); };
   $("uni-search").oninput = renderUniverse;
   $("matrix-search").oninput = renderMatrix;

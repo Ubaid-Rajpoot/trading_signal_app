@@ -71,6 +71,7 @@ class BaseFeed:
 
     source = "live"
     name = "feed"
+    market = "spot"
     chunk_size = 100
     tf_map: dict[str, str | None] = {}
     supports_history = True
@@ -429,6 +430,290 @@ class MexcFeed(BaseFeed):
         return sorted(out, key=lambda x: -x["turnover"])
 
 
+
+# ------------------------------------------------------------------ futures
+# The trader trades the perpetual contract, so the price that matters is the
+# contract's, not spot. The two differ (basis, funding, different wicks), and a
+# swing high on spot is not the level the contract swept.
+
+MEXC_FUTURES_REST = "https://contract.mexc.com"
+MEXC_FUTURES_WS = "wss://contract.mexc.com/edge"
+MEXC_FUTURES_TFS = {
+    "1m": "Min1",
+    "3m": None,          # build from 1m
+    "5m": "Min5",
+    "15m": "Min15",
+    "30m": "Min30",
+    "1h": "Min60",
+    "2h": None,          # build from 1m
+    "4h": "Hour4",
+    "1d": "Day1",
+}
+
+
+def contract_symbol(symbol: str) -> str:
+    """``BTCUSDT`` -> ``BTC_USDT`` (MEXC's contract naming)."""
+    symbol = str(symbol).upper().replace("_", "")
+    for quote in ("USDT", "USDC", "USD"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return f"{symbol[:-len(quote)]}_{quote}"
+    return symbol
+
+
+def plain_symbol(symbol: str) -> str:
+    """``BTC_USDT`` -> ``BTCUSDT`` (what the rest of the bot speaks)."""
+    return str(symbol).upper().replace("_", "")
+
+
+def _kline(symbol: str, open_time: int, o, h, l, c, v, trades: int = 0, closed: bool = True) -> dict:
+    return {
+        "symbol": symbol,
+        "open_time": int(open_time),
+        "close_time": int(open_time) + 59_999,
+        "open": _num(o),
+        "high": _num(h),
+        "low": _num(l),
+        "close": _num(c),
+        "volume": _num(v),
+        "trades": int(trades or 0),
+        "closed": closed,
+    }
+
+
+class MexcFuturesFeed(BaseFeed):
+    """MEXC USDT-M perpetuals (contract.mexc.com), streamed as 1m klines.
+
+    ``market = "futures"``. The exchange names contracts ``BTC_USDT``; everything
+    above this class uses ``BTCUSDT``, so the mapping happens here and only here.
+    """
+
+    name = "mexc"
+    market = "futures"
+    tf_map = MEXC_FUTURES_TFS
+    chunk_size = 60
+
+    def __init__(self, symbols: Iterable[str], **kwargs: object) -> None:
+        super().__init__(symbols, **kwargs)
+        self._last_candle: dict[str, dict] = {}
+
+    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+        mapped = MEXC_FUTURES_TFS.get(interval, None)
+        if not mapped:
+            raise FeedError(f"MEXC futures has no {interval} interval - aggregate 1m instead")
+        contract = contract_symbol(symbol)
+        now_s = int(time.time())
+        step = int(TIMEFRAMES[interval] / 1000) if interval in TIMEFRAMES else 60
+        start = now_s - step * (limit + 5)
+        rows = await self._get_json(
+            f"{MEXC_FUTURES_REST}/api/v1/contract/kline/{contract}",
+            {"interval": mapped, "start": start, "end": now_s},
+        )
+        data = (rows or {}).get("data") or {}  # type: ignore[union-attr]
+        times = data.get("time") or []
+        if not times:
+            raise FeedError(f"MEXC futures returned no {interval} candles for {contract}")
+        symbol_plain = plain_symbol(contract)
+        candles = []
+        now_ms = int(time.time() * 1000)
+        for i, stamp in enumerate(times):
+            open_time = int(stamp) * 1000
+            if open_time + step * 1000 > now_ms:
+                continue  # still forming
+            candles.append(
+                _kline(
+                    symbol_plain,
+                    open_time,
+                    data["open"][i],
+                    data["high"][i],
+                    data["low"][i],
+                    data["close"][i],
+                    data["vol"][i],
+                )
+            )
+        if not candles:
+            raise FeedError(f"MEXC futures returned no closed {interval} candles for {contract}")
+        return candles[-limit:]
+
+    async def universe(self) -> list[dict]:
+        detail = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/detail")
+        tickers = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/ticker")
+        stats = {t.get("symbol"): t for t in ((tickers or {}).get("data") or [])}  # type: ignore[union-attr]
+        out = []
+        for item in (detail or {}).get("data") or []:  # type: ignore[union-attr]
+            symbol = item.get("symbol")
+            if not symbol or item.get("quoteCoin") != "USDT":
+                continue
+            tick = stats.get(symbol)
+            if not tick:
+                continue
+            turnover = _num(tick.get("amount24"))
+            if turnover <= 0:
+                continue  # nothing traded: not a market worth watching
+            out.append(
+                {
+                    "symbol": plain_symbol(symbol),
+                    "base": item.get("baseCoin"),
+                    "quote": item.get("quoteCoin"),
+                    "price": _num(tick.get("lastPrice")),
+                    "change": _num(tick.get("riseFallRate")) * 100,
+                    "turnover": turnover,
+                    "market": "futures",
+                }
+            )
+        return sorted(out, key=lambda x: -x["turnover"])
+
+    async def stream(self, symbols: list[str]) -> None:
+        if websockets is None:
+            raise FeedError("the 'websockets' package is not installed")
+        async with websockets.connect(MEXC_FUTURES_WS, ping_interval=None, close_timeout=5, max_queue=4096) as ws:
+            self.connected = True
+            self.status = (
+                f"futures - {len(self._symbols)} contracts on {len(self._chunks())} socket(s)"
+            )
+            for symbol in symbols:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "method": "sub.kline",
+                            "param": {"symbol": contract_symbol(symbol), "interval": "Min1"},
+                        }
+                    )
+                )
+            ping = asyncio.create_task(self._ping(ws))
+            try:
+                async for raw in ws:
+                    message = json.loads(raw)
+                    if message.get("channel") != "push.kline":
+                        continue
+                    data = message.get("data") or {}
+                    symbol = plain_symbol(data.get("symbol") or "")
+                    if not symbol:
+                        continue
+                    open_time = int(_num(data.get("t")) * 1000)
+                    candle = _kline(
+                        symbol,
+                        open_time,
+                        data.get("o"),
+                        data.get("h"),
+                        data.get("l"),
+                        data.get("c"),
+                        data.get("q") or data.get("v"),
+                        closed=False,
+                    )
+                    previous = self._last_candle.get(symbol)
+                    if previous is not None and open_time > previous["open_time"]:
+                        await self._push({**previous, "closed": True})
+                    self._last_candle[symbol] = candle
+                    await self._push(dict(candle))
+            finally:
+                ping.cancel()
+
+    @staticmethod
+    async def _ping(ws) -> None:
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await ws.send(json.dumps({"method": "ping"}))
+            except Exception:
+                return
+
+
+BINANCE_FUTURES_REST = "https://fapi.binance.com"
+BINANCE_FUTURES_WS = "wss://fstream.binance.com"
+
+
+class BinanceFuturesFeed(BaseFeed):
+    """Binance USDT-M futures (fapi / fstream). ``market = "futures"``."""
+
+    name = "binance"
+    market = "futures"
+    tf_map = {tf: tf for tf in TIMEFRAMES}
+    chunk_size = 150
+
+    def __init__(self, symbols: Iterable[str], **kwargs: object) -> None:
+        super().__init__(symbols, **kwargs)
+        self._last_candle: dict[str, dict] = {}
+
+    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": min(limit, 1000)}
+        rows = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/klines", params)
+        now_ms = int(time.time() * 1000)
+        candles = [
+            _kline(
+                symbol.upper(),
+                int(r[0]),
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                r[5],
+                int(r[8]) if len(r) > 8 else 0,
+            )
+            for r in rows  # type: ignore[union-attr]
+            if int(r[6]) < now_ms
+        ]
+        if not candles:
+            raise FeedError(f"binance futures returned no closed {interval} candles for {symbol}")
+        return candles
+
+    async def universe(self) -> list[dict]:
+        info = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/exchangeInfo")
+        tickers = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/24hr")
+        stats = {t.get("symbol"): t for t in tickers or []}  # type: ignore[union-attr]
+        out = []
+        for item in (info or {}).get("symbols") or []:  # type: ignore[union-attr]
+            if item.get("quoteAsset") != "USDT" or item.get("status") != "TRADING":
+                continue
+            if item.get("contractType") not in {"PERPETUAL", None}:
+                continue
+            tick = stats.get(item.get("symbol"))
+            if not tick:
+                continue
+            turnover = _num(tick.get("quoteVolume"))
+            if turnover <= 0:
+                continue
+            out.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "base": item.get("baseAsset"),
+                    "quote": item.get("quoteAsset"),
+                    "price": _num(tick.get("lastPrice")),
+                    "change": _num(tick.get("priceChangePercent")),
+                    "turnover": turnover,
+                    "market": "futures",
+                }
+            )
+        return sorted(out, key=lambda x: -x["turnover"])
+
+    async def stream(self, symbols: list[str]) -> None:
+        if websockets is None:
+            raise FeedError("the 'websockets' package is not installed")
+        streams = "/".join(f"{s.lower()}@kline_1m" for s in symbols)
+        url = f"{BINANCE_FUTURES_WS}/stream?streams={streams}"
+        async with websockets.connect(url, ping_interval=180, close_timeout=5, max_queue=4096) as ws:
+            self.connected = True
+            self.status = f"futures - {len(self._symbols)} contracts on one stream"
+            async for raw in ws:
+                message = json.loads(raw)
+                k = (message.get("data") or {}).get("k") or {}
+                if not k:
+                    continue
+                symbol = str(k.get("s") or "").upper()
+                if not symbol:
+                    continue
+                candle = _kline(
+                    symbol,
+                    int(k.get("t", 0)),
+                    k.get("o"),
+                    k.get("h"),
+                    k.get("l"),
+                    k.get("c"),
+                    k.get("v"),
+                    int(k.get("n") or 0),
+                    closed=bool(k.get("x")),
+                )
+                await self._push(candle)
+
 # ------------------------------------------------------------------- replay
 class ReplayFeed(BaseFeed):
     """Real recorded candle files played back at ``speed`` bars per second.
@@ -443,6 +728,7 @@ class ReplayFeed(BaseFeed):
 
     source = "replay"
     name = "replay"
+    market = "replay"
     supports_history = True
 
     def __init__(
@@ -573,11 +859,31 @@ def _replay_row(symbol: str, row: list[str]) -> dict:
     }
 
 
-FEEDS = {"binance": BinanceFeed, "mexc": MexcFeed}
+SPOT_FEEDS = {"binance": BinanceFeed, "mexc": MexcFeed}
+FUTURES_FEEDS = {"binance": BinanceFuturesFeed, "mexc": MexcFuturesFeed}
+FEEDS = SPOT_FEEDS  # backwards compatible name
 
 
-def make_feed(exchange: str, symbols: Iterable[str], **kwargs: object) -> BaseFeed:
+def make_feed(
+    exchange: str,
+    symbols: Iterable[str],
+    market: str = "futures",
+    **kwargs: object,
+) -> BaseFeed:
+    """Build the feed for an exchange **and a market** (perpetuals by default).
+
+    The trader trades USDT-M perpetuals, so ``market="futures"`` is the default:
+    spot wicks and contract wicks are not the same levels, and a signal taken off
+    the wrong book is a signal for a market nobody is trading.
+    """
     key = (exchange or "binance").lower()
-    if key not in FEEDS:
-        raise FeedError(f"unknown exchange {exchange!r} (choose from {', '.join(FEEDS)})")
-    return FEEDS[key](symbols, **kwargs)
+    market = (market or "futures").lower()
+    table = FUTURES_FEEDS if market == "futures" else SPOT_FEEDS
+    if key not in table:
+        raise FeedError(
+            f"unknown exchange {exchange!r} for the {market} market "
+            f"(choose from {', '.join(table)})"
+        )
+    feed = table[key](symbols, **kwargs)
+    feed.market = market
+    return feed
