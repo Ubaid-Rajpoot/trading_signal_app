@@ -99,6 +99,7 @@ def engine_for(*timeframes: str, **filters) -> Engine:
             **filters,
         },
         structure={"pivot_len": 2, "sweep_max_wait": 60},
+        strategy="sweep",
     )
 
 
@@ -168,6 +169,7 @@ async def test_one_bad_symbol_does_not_stop_the_others():
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         filters={"trend_context": False, "require_bos": False},
         structure={"pivot_len": 2},
+        strategy="sweep",
     )
     feed.fail.clear()
     await engine.warmup(feed)

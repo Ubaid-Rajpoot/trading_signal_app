@@ -51,6 +51,8 @@ def make_engine(config: dict) -> Engine:
         filters=config.get("filters"),
         structure=config.get("structure"),
         preview_max_symbols=int(config.get("preview_max_symbols", 200)),
+        strategy=config.get("strategy", "book"),
+        book=config.get("book"),
     )
 
 

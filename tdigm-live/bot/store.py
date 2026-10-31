@@ -92,7 +92,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 )
 
 # a decided outcome is final - these are never overwritten by a later "live" push
-FINAL_STATES = ("win", "stopped")
+FINAL_STATES = ("win", "stopped", "breakeven")
 
 
 def _num(value: Any) -> float | None:
@@ -369,11 +369,14 @@ class SignalStore:
             same way keeps the number on the page comparable with the number in
             the measurements, instead of quietly mixing two yardsticks.
             """
+            if row["state"] == "breakeven":
+                return 0.0
             return 2.0 if row["state"] == "win" else -1.0
 
         def summarise(rows: list[sqlite3.Row]) -> dict[str, Any]:
             wins = sum(1 for r in rows if r["state"] == "win")
             losses = sum(1 for r in rows if r["state"] == "stopped")
+            scratches = sum(1 for r in rows if r["state"] == "breakeven")
             decided = wins + losses
             total_r = sum(r_of(r) for r in rows if r["state"] in FINAL_STATES)
             return {
@@ -381,6 +384,7 @@ class SignalStore:
                 "wins": wins,
                 "losses": losses,
                 "decided": decided,
+                "breakeven": scratches,
                 "expired": sum(1 for r in rows if r["state"] == "expired"),
                 "win_rate": round(wins / decided, 4) if decided else None,
                 "r_per_trade": round(total_r / decided, 3) if decided else None,

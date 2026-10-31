@@ -198,6 +198,7 @@ def _engine(**filters):
         break_lookback=5,
         filters={"structure": True, "hvb": False, "break": False, **filters},
         structure={"pivot_len": 3, "major_len": 9, "macro_len": 27, "sweep_max_wait": 120},
+        strategy="sweep",
     )
 
 

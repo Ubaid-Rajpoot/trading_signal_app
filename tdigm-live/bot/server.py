@@ -233,6 +233,7 @@ def create_app(
             "connected": getattr(feed, "connected", None),
             "source": getattr(feed, "source", "live"),
             "market": getattr(feed, "market", "futures"),
+            "strategy": engine.strategy,
             "name": getattr(feed, "name", ""),
         }
         # the market the bot is configured for; `feed.market` may be "replay"
@@ -252,6 +253,7 @@ def create_app(
             "counts": engine.setup_counts(),
             "total": len(engine.setup_payloads),
             "market": getattr(feed, "market", "futures"),
+            "strategy": engine.strategy,
         }
 
     @app.get("/api/signals")

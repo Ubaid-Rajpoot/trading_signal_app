@@ -294,6 +294,8 @@
   .setup-row .sym { font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
   .setup-row .tf { font-family: var(--mono); font-size: 10.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
   .setup-row .why { font-size: 10.5px; color: var(--muted-2); grid-column: 1 / -1; line-height: 1.5; }
+  .setup-row .chain { color: #a9b6cc; font-family: ui-monospace, monospace; font-size: 10.5px; }
+  .setup-row .why.warn { color: var(--amber); }
   .setup-row .nums { font-family: var(--mono); font-size: 10.5px; color: var(--muted); grid-column: 1 / -1; display: flex; gap: 10px; flex-wrap: wrap; }
   .state { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; padding: 1px 7px; border-radius: 999px; border: 1px solid; }
   .state.valid { color: var(--green); border-color: #1d5c47; background: rgba(46,230,168,.08); }
@@ -348,6 +350,7 @@
       <option value="valid">valid (pending + filled)</option>
       <option value="pending">not filled yet</option>
       <option value="active">filled now</option>
+      <option value="scratch">scratched at break-even</option>
       <option value="all">every state</option>
     </select>
     <select id="f-sort" title="order">
@@ -356,10 +359,19 @@
       <option value="rr">best R:R</option>
       <option value="sym">A→Z</option>
     </select>
-    <select id="f-grade" title="setup grade">
+    <select id="f-grade" title="grade = how many of the book's conditions lined up">
+      <option value="A,B,C">grade A + B + C</option>
+      <option value="A">grade A (the full story)</option>
       <option value="A,B">grade A + B</option>
-      <option value="A">grade A only (strict)</option>
-      <option value="B">grade B only (relaxed)</option>
+      <option value="B">grade B</option>
+      <option value="C">grade C</option>
+    </select>
+    <select id="f-session" title="session the entry happened in (UTC)">
+      <option value="">any session</option>
+      <option value="asia">Asia</option>
+      <option value="london">London</option>
+      <option value="ny">New York</option>
+      <option value="off-session">off-session</option>
     </select>
     <label class="tgl"><input type="checkbox" id="f-validonly" checked /> valid only</label>
     <label class="tgl"><input type="checkbox" id="f-hvonly" /> HVB required</label>
@@ -975,7 +987,8 @@
     search: "",
     validOnly: true,
     hvbOnly: false,
-    grades: new Set(["A", "B"]),
+    grades: new Set(["A", "B", "C"]),
+    session: "",
     archive: true,
     archived: [],
     selected: null,            // setup key drawn on the chart
@@ -1013,14 +1026,16 @@
     if (ui.tfs.size && !ui.tfs.has(row.timeframe)) return false;
     if (ui.side !== "both" && row.side.toLowerCase() !== ui.side) return false;
     if (ui.hvbOnly && !row.hvb_side) return false;
-    if (ui.grades.size && !ui.grades.has(row.grade || "B")) return false;
+    if (ui.grades.size && !ui.grades.has(row.grade || "C")) return false;
+    if (ui.session && (row.session || "") !== ui.session) return false;
     // a decided setup (win / stopped / expired) is history, not an open position:
     // the "valid only" switch is about open setups and must not hide the archive
-    const decided = ["win", "stopped", "expired", "invalidated"].includes(row.state);
+    const decided = ["win", "stopped", "breakeven", "expired", "invalidated"].includes(row.state);
     const history = ui.archive && decided;
     if (ui.validOnly && !row.valid && !history) return false;
     if (ui.state === "pending" && row.state !== "pending") return false;
     if (ui.state === "active" && row.state !== "active") return false;
+    if (ui.state === "scratch" && row.state !== "breakeven") return false;
     if (ui.state === "valid" && !row.valid && !history) return false;
     return true;
   }
@@ -1098,6 +1113,41 @@
     box.innerHTML = bits.join(" · ") + ` <span class="mini">— R is scored against the fixed 2R target, the same convention every measurement in the docs uses</span>`;
   }
 
+  function chainOf(row) {
+    // the book's order: pool raided -> displacement + gap -> mitigation -> plan
+    const bits = [];
+    const trap = row.trap;
+    if (trap && trap.name) {
+      bits.push(`swept ${trap.name} ${fmt(trap.level)}${trap.grade ? " (" + trap.grade + ")" : ""}`);
+    }
+    const ac = row.ac;
+    if (ac) {
+      const direction = ac.kind === "bear" ? "bearish" : "bullish";
+      const size = ac.body_atr ? ` ${ac.body_atr}×ATR` : "";
+      const volume = ac.volume_ratio ? `, ${ac.volume_ratio}× vol` : "";
+      bits.push(`${direction} AC${size}${volume}`);
+      bits.push(`FVG ${fmt(ac.bottom)}–${fmt(ac.top)}`);
+    }
+    if (row.shift) {
+      bits.push(`${row.shift.kind || "MS"} ${row.shift.direction > 0 ? "up" : "down"} @ ${fmt(row.shift.level)}`);
+    }
+    if (row.target) {
+      bits.push(`draw ${fmt(row.target)}${row.rr ? ` (1:${Number(row.rr).toFixed(1)})` : ""}`);
+    }
+    return bits.join("  →  ") || (row.reasons || []).slice(0, 3).join(" · ");
+  }
+
+  function feeLine(row) {
+    if (!row.fee_r) return null;
+    const line = document.createElement("div");
+    line.className = "why" + (row.fee_r > 0.2 ? " warn" : "");
+    const risk = row.risk_pct ? `${row.risk_pct.toFixed(2)}% stop` : "stop";
+    line.textContent = row.fee_r > 0.2
+      ? `fees ${row.fee_r.toFixed(2)}R — the ${risk} is too tight to pay ${(row.fee_pct || 0.07).toFixed(2)}% round trip; treat this as a watch-list idea`
+      : `fees ${row.fee_r.toFixed(2)}R on a ${risk}`;
+    return line;
+  }
+
   function marketAgo(ms) {
     const seconds = Math.max(0, (nowMs() - ms) / 1000);
     if (seconds < 90) return Math.round(seconds) + "s";
@@ -1144,8 +1194,11 @@
       l1.append(span("sym", row.symbol), span("tf", row.timeframe),
                 span("side " + (row.side === "SHORT" ? "short" : "long"), row.side),
                 span(`state ${stateClass(row)}`, row.state), span("tf", "grade " + (row.grade || "?")),
-                span("tf", marketAgo(row.created_ms) + " ago"),
-                span("tf", row.mitigated ? "mitigated" : "not mitigated"));
+                span("tf", marketAgo(row.created_ms) + " ago"));
+      if (row.seeded) l1.append(span("tag", "from history"));
+      if (row.be_ms) l1.append(span("tag on", "stop at BE"));
+      if (row.htf) l1.append(span("tf", "vs " + row.htf + " bias"));
+      if (row.session) l1.append(span("tag", row.session));
       if (row.hvb_side) l1.append(span("tag on", "HVB"));
       if (row.break_kind === "MS") l1.append(span("tag", "MS"));
 
@@ -1153,7 +1206,7 @@
       nums.className = "nums";
       nums.append(
         document.createTextNode(`entry ${fmt(row.entry)}`),
-        document.createTextNode(`stop ${fmt(row.stop)}`),
+        document.createTextNode(`stop ${fmt(row.stop0 ?? row.stop)}${row.be_ms ? " → BE" : ""}`),
         document.createTextNode(row.target === null
           ? `target 2R ${fmt(row.target_2r)} (no liquidity left)`
           : `target ${fmt(row.target)}`),
@@ -1161,16 +1214,24 @@
         document.createTextNode(`R:R ${row.rr === null || row.rr === undefined ? "–" : row.rr.toFixed(2)}`),
         document.createTextNode(`score ${row.score === null || row.score === undefined ? "–" : Math.round(row.score)}`),
       );
-      const decided = ["win", "stopped", "expired", "invalidated"].includes(row.state);
+      const decided = ["win", "stopped", "breakeven", "expired", "invalidated"].includes(row.state);
       nums.append(decided
-        ? span("state " + stateClass(row), row.state === "win" ? "closed at target" : row.state === "stopped" ? "closed at stop" : "closed, never filled")
+        ? span("state " + stateClass(row), row.state === "win" ? "closed at target"
+            : row.state === "stopped" ? "closed at stop"
+            : row.state === "breakeven" ? "scratched at break-even"
+            : "closed, never filled")
         : span("state " + (row.r_now >= 0 ? "valid" : "stopped"), `${row.r_now >= 0 ? "+" : ""}${row.r_now ?? 0}R now`));
 
+      // the story, in the order the book tells it
+      const chain = document.createElement("div");
+      chain.className = "why chain";
+      chain.textContent = chainOf(row);
       const why = document.createElement("div");
       why.className = "why";
       why.textContent = (row.reasons || []).join(" · ");
-
-      el.append(l1, nums, why);
+      const cost = feeLine(row);
+      el.append(l1, nums, chain, why);
+      if (cost) el.append(cost);
       frag.append(el);
     }
     box.replaceChildren(frag);
@@ -1284,9 +1345,20 @@
       ctx.fill();
     }
 
+    // the liquidity map: the levels the trade is aimed at (p.5-19)
+    const pools = (data.pools || []).filter((p) => p.price > lo && p.price < hi);
+    for (const pool of pools) {
+      ctx.strokeStyle = pool.swept_ms ? "rgba(125,135,152,.35)" : "rgba(201,211,227,.35)";
+      ctx.setLineDash([1, 4]);
+      ctx.beginPath(); ctx.moveTo(padL, y(pool.price)); ctx.lineTo(W - padR, y(pool.price)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = pool.swept_ms ? "#5b6474" : "#8b97ad";
+      ctx.fillText(`${pool.name}${pool.swept_ms ? " (taken)" : ""}`, W - padR - 92, y(pool.price));
+    }
+
     if (!setup) { drawChartMeta(data, null); return; }
 
-    // the order block (the last opposite candle before the break)
+    // the imbalance the entry comes from (FVG / HVI)
     if (setup.zone) {
       const z = setup.zone;
       const from = setup.created_ms;
@@ -1300,7 +1372,9 @@
       ctx.beginPath(); ctx.moveTo(x0, y(z.low)); ctx.lineTo(W - padR, y(z.low)); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = "#ffc9d3";
-      ctx.fillText("order block", x0 + 4, y(z.high) - 7);
+      const label = (setup.ac && (setup.ac.volume_ratio || 0) >= 1.5)
+        ? "HVI (high-volume imbalance)" : "FVG (algo candle)";
+      ctx.fillText(label, x0 + 4, y(z.high) - 7);
     }
 
     // the structure break
@@ -1368,11 +1442,11 @@
       $("chart-meta").textContent = data.warm ? `${data.bars} bars` : "warming";
     }
     $("chart-hint").innerHTML = setup
-      ? `<b>${setup.side}</b> ${setup.symbol} ${setup.timeframe} · swept <b>${fmt(setup.swept_level)}</b> · broke structure at <b>${fmt(setup.bos_level)}</b> (${setup.break_kind})` +
-        (setup.hvb_ms ? ` · HVB on that candle` : "") +
-        ` · order block <b>${fmt(setup.zone.low)} – ${fmt(setup.zone.high)}</b>` +
+      ? `<b>${setup.side}</b> ${setup.symbol} ${setup.timeframe} · ${chainOf(setup)}` +
+        ` · entry <b>${fmt(setup.entry)}</b> stop <b>${fmt(setup.stop0 ?? setup.stop)}</b>` +
+        ` target <b>${fmt(setup.target)}</b> (1:${setup.rr})` +
         ` · state <b>${setup.state}</b>${setup.valid ? " (still valid)" : ""}`
-      : "Pick a setup on the left; its break, HVB and order block are drawn here.";
+      : "Pick a setup on the left: the liquidity map, the imbalance it came from, the entry and the draw are drawn here.";
   }
 
   function renderFeed() {
@@ -1881,6 +1955,7 @@
     renderSetups();
   };
   $("f-archive").onchange = (e) => { ui.archive = e.target.checked; loadArchive(); };
+  $("f-session").onchange = (e) => { ui.session = e.target.value; renderSetups(); };
   $("f-csv").onclick = () => { window.open("/api/signals.csv?limit=5000", "_blank"); };
   $("f-rescan").onclick = async () => {
     const btn = $("f-rescan");

@@ -139,6 +139,7 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         filters={"trend_context": False, "require_bos": False},
         structure={"pivot_len": 2},
+        strategy="sweep",
     )
     engine.attach_store(store)
     engine.market = "futures"
@@ -151,6 +152,7 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         filters={},
         structure={"pivot_len": 2},
+        strategy="sweep",
     )
     fresh.attach_store(SignalStore(tmp_path / "sig.sqlite3"))
     restored = fresh.load_stored()

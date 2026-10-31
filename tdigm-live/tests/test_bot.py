@@ -163,6 +163,8 @@ def fast_engine(**filters):
         filters={"structure": True, "hvb": True, "trend_context": False,
                  "require_bos": False, **filters},
         structure={"pivot_len": 2, "sweep_max_wait": 60},
+        # these tests pin the previous sweep engine, which is still selectable
+        strategy="sweep",
     )
 
 
@@ -503,6 +505,7 @@ def make_engine(**filters):
         filters={"structure": True, "hvb": False, "break": False,
                  "trend_context": False, "require_bos": False, **filters},
         structure={"pivot_len": 2, "sweep_max_wait": 60},
+        strategy="sweep",
     )
 
 
