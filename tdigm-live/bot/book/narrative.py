@@ -92,6 +92,7 @@ class Trap:
     time: int
     index: int           # bar index in the narrative series
     extreme: float       # how far the wick went past the level
+    bias: int = 0        # the HTF bias as it stood when the trap printed
 
     @property
     def direction(self) -> int:
@@ -289,7 +290,7 @@ class Narrative:
             return
 
         self.trap = Trap(side=side, level=level, name=name, grade=grade,
-                         time=time, index=index, extreme=extreme)
+                         time=time, index=index, extreme=extreme, bias=bias)
         self.armed = None
         out.append({"type": "trap", "trap": self.trap, "bar": bar})
 
@@ -415,7 +416,7 @@ class Narrative:
             return
 
         # ---- context, recorded rather than silently enforced
-        bias = int(self.bar_htf_bias)
+        bias = int(trap.bias)      # the bias the idea was born with, not today's
         premium = self.bar_premium
         if self.s.premium_discount and premium is not None:
             want = "premium" if direction < 0 else "discount"
@@ -447,7 +448,8 @@ class Narrative:
             target=target,
             rr=rr,
             trap={"side": trap.side, "level": trap.level, "name": trap.name,
-                  "grade": trap.grade, "time": trap.time, "extreme": trap.extreme},
+                  "grade": trap.grade, "time": trap.time, "extreme": trap.extreme,
+                  "bias": trap.bias},
             imbalance=gap.as_dict(),
             shift=shift,
             confluences=confluences,
@@ -476,7 +478,7 @@ class Narrative:
         if bias:
             word = "bullish" if bias > 0 else "bearish"
             agrees = bias == direction
-            lines.append(f"{self.s.htf} bias {word}" + ("" if agrees else " (against the trade)"))
+            lines.append(f"{self.s.htf} bias {word}" + ("" if agrees else " (taken against it)"))
             if agrees:
                 score += 2
         else:
