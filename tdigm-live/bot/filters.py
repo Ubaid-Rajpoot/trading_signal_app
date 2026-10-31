@@ -6,7 +6,11 @@ condition on/off or narrows the same condition:
 
     structure        the sweep -> opposite-side break (the drawing). On by default.
     trend_context    the external structure must agree: higher highs + higher lows
-                     for a long, lower highs + lower lows for a short (bot/trend.py)
+                     for a long, lower highs + lower lows for a short (bot/trend.py).
+                     OFF by default since round 19: on real data it removed a
+                     third of the signals and did not improve R per trade
+                     (docs/trend-rules.md). The evidence is still on every card,
+                     and it is what makes a setup grade A instead of B.
     require_hh_hl    demand the clean swing sequence, not just the last break
     require_bos      a break of STRUCTURE in the trade direction, not older than
                      bos_max_age bars (a close through a swing, never a wick)
@@ -18,6 +22,10 @@ condition on/off or narrows the same condition:
     confirm_mode     "all" = every switched-on condition must hold;
                      "score" = the weighted confluence score must reach
                      confirm_min_score (bos + hvb + volume + fvg + trend + depth)
+    hvb_window       the HVB may print on the break candle or up to N bars after
+                     it (the TDI cross and the structure break are two different
+                     measurements; demanding the same candle was the single
+                     biggest reason a real setup never appeared)
     hvb              the TDIGM price line crosses the CENTRE band on the signal bar
     hvb_min_points   and how far past the centre it closed, in RSI points
     hvb_min_speed    and how fast: this candle's step vs the line's average step
@@ -52,8 +60,8 @@ from typing import Any
 DEFAULT_FILTERS: dict[str, Any] = {
     "structure": True,
     # --- the trader's trend / nesting rules (round 17) ---
-    "trend_context": True,
-    "require_hh_hl": True,
+    "trend_context": False,
+    "require_hh_hl": False,
     "require_bos": True,
     "bos_max_age": 240,
     "max_internal_depth": 2,
@@ -65,6 +73,8 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "confirm_mode": "all",
     "confirm_min_score": 60,
     "hvb": True,
+    # the HVB may print on the break candle or up to N bars after it
+    "hvb_window": 3,
     "hvb_min_points": 1.0,
     "hvb_min_speed": 1.5,
     "regime": True,

@@ -42,6 +42,7 @@ from .filters import Filters
 from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
 from .regime import RegimePoint, RegimeTracker
 from .setups import SetupRecord, order_block
+from .store import SignalStore
 from .structure import Structure
 from .trend import TrendMap
 
@@ -77,6 +78,7 @@ class Cell:
     ema: float | None = None
     ema_bars: int = 0
     last_setup: dict | None = None
+    pending: dict | None = None   # a confirmed setup waiting for its HVB
 
     def __post_init__(self) -> None:
         self.tracker = TdiTracker(
@@ -237,6 +239,8 @@ class Engine:
         self._collected: list[dict] = []
         self.backfilled = 0
         self.warm_failures: dict[str, int] = {}
+        self.store: SignalStore | None = None
+        self.market = "futures"
 
     @staticmethod
     def _interval_for(count: int) -> float:
@@ -338,6 +342,38 @@ class Engine:
             cell.structure = fresh
             cell.tmap = trend
             cell.tmap_state = trend.state()
+
+    # --------------------------------------------------------------- archive
+    def attach_store(self, store: SignalStore | None) -> None:
+        """Give the engine a database: every setup is written as it is found."""
+        self.store = store
+
+    def load_stored(self, limit: int = 400) -> int:
+        """Put the archive on the board before a single candle arrives.
+
+        A restart used to mean an empty screen until the exchange answered - the
+        setups found a minute earlier were still in the database but nothing read
+        them back. These rows are marked ``stored`` so the page can say "from the
+        archive"; a live replay of the same history replaces them in place.
+        """
+        if self.store is None or not self.store.enabled:
+            return 0
+        rows = self.store.list(limit=limit)
+        for row in rows:
+            key = row.get("key")
+            if not key or key in self.setup_payloads:
+                continue
+            self.setup_payloads[key] = row
+        return len(rows)
+
+    def _remember(self, payload: dict) -> None:
+        """Write-through to the database. Never allowed to break the scanner."""
+        if self.store is None:
+            return
+        try:
+            self.store.record(payload, self.market)
+        except Exception:  # a disk problem is logged by the store, not raised here
+            pass
 
     # -------------------------------------------------------------- warmup
     def seed(self, symbol: str, timeframe: str, candles: list[dict]) -> None:
@@ -476,7 +512,7 @@ class Engine:
             if cell.tracker.last is None or len(cell.candles) < 120
         )
 
-    async def warmup(self, feed, concurrency: int = 6) -> None:
+    async def warmup(self, feed, concurrency: int = 30) -> None:
         """History for every instrument, in parallel, one bad symbol at a time.
 
         Serial warm-up is what made a 120-instrument universe look dead for
@@ -512,7 +548,9 @@ class Engine:
         self.setup_events.clear()
         self.by_cell.clear()
 
-    async def rescan(self, feed, only_missing: bool = False, reset: bool = False) -> dict[str, Any]:
+    async def rescan(
+        self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30
+    ) -> dict[str, Any]:
         """Re-read history and re-run the scan.
 
         This is what the rescans button does, and what a filter change needs: the
@@ -522,7 +560,7 @@ class Engine:
             self.forget_setups()
         found = 0
         warmed = 0
-        gate = asyncio.Semaphore(4)
+        gate = asyncio.Semaphore(max(1, int(concurrency)))
 
         async def one(symbol: str) -> None:
             nonlocal found, warmed
@@ -549,7 +587,7 @@ class Engine:
                 todo.append(symbol)
         if not todo:
             return 0
-        gate = asyncio.Semaphore(3)
+        gate = asyncio.Semaphore(30)
 
         async def one(symbol: str) -> None:
             async with gate:
@@ -702,6 +740,12 @@ class Engine:
             "volume_ratio": self._volume_ratio(cell),
         }
 
+        # a setup confirmed earlier and is still waiting for its HVB: does this
+        # candle print it? (the TDI cross often trails the structure break by a
+        # bar or two, which is why "same candle only" was so sparse)
+        if cell.pending is not None:
+            await self._confirm_pending(cell, bar, hvb, hvb_points, hvb_speed, centre_cross, base, point)
+
         if setup is not None:
             book = self._confluence(cell, setup, bar)
             depth = cell.tmap.depth(setup.side, setup.break_kind, setup.index)
@@ -725,6 +769,34 @@ class Engine:
                 "setup": setup.as_dict(),
             }
             candidate["score"], candidate["score_parts"] = self.filters.score_of(candidate)
+            window = int(self.filters.config.get("hvb_window") or 0)
+            if (
+                window > 0
+                and not hvb
+                and self.filters.config.get("hvb", True)
+                and str(self.filters.config.get("confirm_mode") or "all").lower() == "all"
+            ):
+                # hold it: the setup is real, the HVB has not printed yet
+                cell.pending = {
+                    "candidate": candidate,
+                    "setup": setup.as_dict(),
+                    "index": setup.index,
+                    "count": cell.structure.count - 1,
+                    "side": setup.side,
+                }
+                # say it out loud: the setup is real, the HVB has not printed yet
+                await self._emit(
+                    {
+                        "type": "filtered",
+                        "alert": {
+                            **candidate,
+                            "filtered": [f"HVB not on the break candle yet - watching {window} more bar(s)"],
+                        },
+                    }
+                )
+                return
+            candidate["hvb_lag"] = 0 if hvb else None
+            candidate["grade"] = grade_of(candidate)
             ok, reasons = self._apply_filters(cell, candidate, bar)
             if ok:
                 candidate["filtered"] = []
@@ -824,6 +896,67 @@ class Engine:
                 hvb.append({"t": int(bar["open_time"]), "side": "down"})
         return {"bos": bos[-40:], "hvb": hvb[-40:]}
 
+    async def _confirm_pending(
+        self,
+        cell: Cell,
+        bar: dict,
+        hvb: str | None,
+        hvb_points: float,
+        hvb_speed: float | None,
+        centre_cross: str | None,
+        base: dict,
+        point: TdiPoint,
+    ) -> None:
+        """Publish a held setup the moment its HVB prints, or let it go.
+
+        ``hvb_window`` bars is the whole tolerance: the structure break and the
+        TDIGM cross are two different measurements and they do not always land on
+        the same candle. The setup keeps the entry/stop it was confirmed with;
+        only the HVB fields come from this candle, and ``hvb_lag`` says how late
+        it was, so the record stays exact (and the tier is B, not A).
+        """
+        held = cell.pending
+        if held is None:
+            return
+        window = int(self.filters.config.get("hvb_window") or 0)
+        lag = cell.structure.count - 1 - int(held["count"])
+        want = "down" if held["side"] == "SHORT" else "up"
+        if lag > window:
+            cell.pending = None
+            self.filters.rejections["no HVB inside the window"] = (
+                self.filters.rejections.get("no HVB inside the window", 0) + 1
+            )
+            return
+        if not hvb or hvb != want:
+            return
+        cell.pending = None
+        candidate = dict(held["candidate"])
+        candidate.update(
+            {
+                "time": int(bar["close_time"]),
+                "price": bar["close"],
+                "hvb": hvb,
+                "centre_cross": centre_cross,
+                "hvb_points": round(abs(hvb_points), 2),
+                "hvb_speed": _r(hvb_speed),
+                "hvb_lag": lag,
+                "regime": base.get("regime"),
+                "armed": base.get("armed"),
+                "context": base.get("context"),
+                "volume_ratio": base.get("volume_ratio"),
+            }
+        )
+        candidate["score"], candidate["score_parts"] = self.filters.score_of(candidate)
+        candidate["grade"] = grade_of(candidate)
+        ok, reasons = self._apply_filters(cell, candidate, bar)
+        if not ok:
+            await self._emit({"type": "filtered", "alert": {**candidate, "filtered": reasons}})
+            return
+        candidate["filtered"] = []
+        cell.alerts += 1
+        self.cooldowns[(cell.symbol, cell.timeframe)] = time.time()
+        await self._publish(cell, candidate, bar)
+
     def _volume_ratio(self, cell: Cell) -> float | None:
         """This candle's volume against the average of the bars before it.
 
@@ -878,8 +1011,11 @@ class Engine:
         setup = alert.get("setup") or {}
         side = alert.get("side") or setup.get("side") or "SHORT"
         key = f"{alert['symbol']}|{alert['timeframe']}|{alert['time']}"
-        if key in self.setup_payloads:
+        if key in self.registry:
             return self.setup_payloads[key]
+        if key in self.setup_payloads and self.setup_payloads[key].get("stored"):
+            # a row loaded from the archive: replace it with the live record
+            self.setup_payloads.pop(key, None)
         # the cell being evaluated - during a history replay that is the *fresh*
         # cell, not the one in self.cells yet
         source = cell or self.cells.get((alert["symbol"], alert["timeframe"]))
@@ -909,6 +1045,7 @@ class Engine:
             depth=alert.get("depth"),
             trend_dir=((alert.get("context") or {}).get("external") or {}).get("direction"),
             trend_clean=((alert.get("context") or {}).get("external") or {}).get("clean"),
+            grade=alert.get("grade"),
             reasons=_evidence(alert),
             max_bars=int(self.filters.config.get("setup_max_bars") or 240),
         )
@@ -921,6 +1058,7 @@ class Engine:
         payload["key"] = key
         payload["setup"] = setup
         self.setup_payloads[key] = payload
+        self._remember(payload)
         return payload
 
     def _track_setups(self, cell: Cell, bar: dict) -> None:
@@ -937,6 +1075,9 @@ class Engine:
             if payload is None:
                 continue
             payload.update(record.as_dict())
+            payload["valid"] = record.valid
+            payload["mitigated"] = record.mitigated
+            self._remember(payload)
             if self._quiet:
                 continue
             self.setup_events.append(payload)  # the server pushes these out
@@ -1131,6 +1272,7 @@ class Engine:
             "setup_counts": self.setup_counts(),
             "setups_valid": sum(1 for row in self.setup_payloads.values() if row.get("valid")),
             "backfilled": self.backfilled,
+            "archive": (self.store.counts() if self.store else {}),
             "failed": len(self.warm_failures),
             "warming": self.warming(),
             "candles_seen": self.candles_seen,
@@ -1142,6 +1284,26 @@ class Engine:
 
 def _r(value: float | None) -> float | None:
     return round(value, 2) if value is not None else None
+
+
+def grade_of(alert: dict) -> str:
+    """A / B, from what the setup actually has - never from a wish.
+
+    A  every strict condition held: the HVB printed on the break candle itself,
+       the external sequence is clean, and the last break of structure agrees.
+    B  everything held except one of those: the HVB came late (inside
+       ``hvb_window``), or the external sequence is mixed. Still a setup, one
+       rung down, and the card says which rung and why.
+    """
+    lag = alert.get("hvb_lag")
+    external = (alert.get("context") or {}).get("external") or {}
+    clean = external.get("clean", True)
+    bos = external.get("bos_direction")
+    side = str(alert.get("side") or "")
+    agrees = bos is None or (bos > 0) == (side == "LONG")
+    if (lag in (0, None)) and clean and agrees:
+        return "A"
+    return "B"
 
 
 def _evidence(alert: dict) -> list[str]:

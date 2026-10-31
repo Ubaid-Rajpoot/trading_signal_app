@@ -100,6 +100,7 @@ class SetupRecord:
     hvb_side: str | None = None
     volume_ratio: float | None = None
     score: float | None = None
+    grade: str | None = None
     score_parts: dict[str, Any] = field(default_factory=dict)
     depth: dict[str, Any] | None = None
     trend_dir: int | None = None
@@ -181,6 +182,7 @@ class SetupRecord:
             "hvb_side": self.hvb_side,
             "volume_ratio": self.volume_ratio,
             "score": self.score,
+            "grade": self.grade,
             "score_parts": self.score_parts,
             "depth": self.depth,
             "trend_dir": self.trend_dir,

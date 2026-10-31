@@ -16,6 +16,9 @@
   "exchange": "mexc",
   "market": "futures",
   "max_symbols": 600,
+  "workers": 30,
+  "database": "data/tdigm.sqlite3",
+  "history_days": 0,
   "timeframes": [
     "1m",
     "5m",
@@ -45,8 +48,8 @@
   },
   "filters": {
     "structure": true,
-    "trend_context": true,
-    "require_hh_hl": true,
+    "trend_context": false,
+    "require_hh_hl": false,
     "require_bos": true,
     "bos_max_age": 240,
     "max_internal_depth": 2,
@@ -84,7 +87,8 @@
     "trend_ema": 50,
     "sessions": [],
     "cooldown_minutes": 0,
-    "setup_max_bars": 240
+    "setup_max_bars": 240,
+    "hvb_window": 3
   },
   "break_lookback": 20,
   "hvb_min_points": 0,

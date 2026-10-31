@@ -188,6 +188,54 @@ minute instead of leaving that instrument silently dead. How that works, and the
 exact definitions of the order block and of valid/invalid, are in
 [`docs/setups.md`](docs/setups.md).
 
+### The archive (round 20)
+
+The page used to be a window on the process: a setup that printed at 03:10 was
+gone from the app after a restart. Everything is now written to SQLite
+(`data/tdigm.sqlite3`, WAL) the moment it is found, and updated through its whole
+life - `pending → active → win | stopped | expired`. A restart shows the archive
+**before a single candle arrives**, a decided outcome is never overwritten by a
+re-scan, and the numbers on the board (hit rate, R per decided trade, per grade)
+are computed from those rows rather than from memory:
+
+> 107 setups recorded · 43 won · 54 stopped · hit rate 44% · +0.33R per decided trade
+
+`include archive` (on by default) merges the stored list into the setups card;
+`GET /api/signals` and `GET /api/signals.csv` read the same rows. R is scored
+against the fixed 2R target, the convention every measurement below uses.
+`tools/backfill_archive.py` fills the archive from recorded candles and walks each
+setup forward to decide its outcome. Why it is built this way, and what it
+guarantees, is in [`docs/archive.md`](docs/archive.md).
+
+### Thirty instruments at a time
+
+Warm-up and rescan run a pool of **30** (`workers` in `config.json`); the runtime
+"+symbols" queue is drained by the same 30 consumers from one FIFO, so no
+instrument starves the ones behind it. Measured: 30 in flight, for warm-up and for
+a rescan, with a rate-limited instrument neither stopping the queue nor
+disappearing silently (`tests/test_parallel.py`). Honest limit: this sandbox has 2
+cores and the per-bar replay is pure Python, so what is verified is the pool and
+the non-blocking behaviour, not a 30× CPU speed-up.
+
+### Sparsity: what changed
+
+Two defaults moved, both measured over BTCUSDT 2023-01 → 2025-06, 5m/15m/30m/1h,
+fixed 2R:
+
+| variant | signals | win% | R/trade |
+|---|---|---|---|
+| HVB on the break candle (old) | 68 | 41.7% | 0.25 |
+| HVB within 3 bars of the break | 72 | 40.6% | 0.22 |
+| **+ external HH/HL gate off (new default)** | **107** | **42.6%** | **0.28** |
+
+`hvb_window: 3` (the TDI cross and the structure break are two measurements; the
+same candle was the biggest reason a real setup never appeared) and
+`trend_context`/`require_hh_hl` **off** - the gate removed a third of the signals
+without paying for it in expectancy. The trend evidence is still on every card and
+is what makes a setup **grade A** instead of **grade B**; the archive reports both
+grades separately. Relaxing `max_internal_depth` was measured too and rejected
+(89 signals, 0.18R/trade). Details: [`docs/archive.md`](docs/archive.md).
+
 ### The book's confluences (p.42, p.53, p.87)
 
 Every alert says where it sits in the book, and each of these is a switch:
@@ -454,7 +502,7 @@ built locally from 1m — the code always builds every timeframe from 1m anyway.
 ## What "works" means here
 
 ```bash
-python -m pytest tests -q      # 48 tests, no network needed
+python -m pytest tests -q      # 134 tests, no network needed
 ```
 
 Covered: batch TDIGM equals the incremental one; Wilder's RSI; the 5m/15m rollup
@@ -494,7 +542,9 @@ tdigm-live/
   bot/config_store.py    atomic config read/write + validation
   web/index.html         the page (no framework, no build)
   tools/scan_history.py  the measurement tool used for the numbers above
-  tests/                 48 tests
+  bot/store.py           the SQLite archive: every setup, for good
+  tools/backfill_archive.py  fill the archive from recorded candles
+  tests/                 134 tests
 ```
 
 ## Troubleshooting

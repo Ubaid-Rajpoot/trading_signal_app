@@ -10,6 +10,7 @@ never calls an exchange directly.
 from __future__ import annotations
 
 import asyncio
+import os
 import contextlib
 import json
 import time
@@ -22,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
 from . import config_store
+from .store import SignalStore
 from .engine import Engine
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
@@ -67,9 +69,19 @@ def create_app(
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "binance")
     max_symbols = int(config.get("max_symbols", 500))
+    workers = max(1, int(config.get("workers", 30)))
+    db_path = (
+        os.environ.get("TDIGM_DB")
+        or config.get("database")
+        or str(Path(__file__).resolve().parents[1] / "data" / "tdigm.sqlite3")
+    )
+    store = SignalStore(None if config.get("database") == "" else db_path)
+    engine.attach_store(store)
+    restored = engine.load_stored()
     universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None}
     tasks: list[asyncio.Task] = []
     warm_queue: asyncio.Queue[str] = asyncio.Queue()
+    history_days = float(config.get("history_days", 0) or 0)
     rescan_state: dict[str, Any] = {"running": False, "result": None}
     warm_pending: set[str] = set()
 
@@ -87,6 +99,13 @@ def create_app(
             warm_queue.put_nowait(symbol)
 
     async def warmer() -> None:
+        """One of ``workers`` consumers of the warm-up queue.
+
+        A single consumer meant every instrument the user added waited behind the
+        one before it - 500 additions was a 500-step queue. Several consumers
+        pull from the same queue, so an add is picked up within one turn and no
+        instrument can starve the ones behind it: they all wait in the same FIFO.
+        """
         while True:
             symbol = await warm_queue.get()
             try:
@@ -96,7 +115,6 @@ def create_app(
             finally:
                 warm_pending.discard(symbol)
                 warm_queue.task_done()
-            await asyncio.sleep(0.05)
 
     async def pump() -> None:
         """Read candles from the feed and hand them to the engine, forever."""
@@ -144,7 +162,7 @@ def create_app(
         and rows fill in as their history lands.
         """
         try:
-            await engine.warmup(feed)
+            await engine.warmup(feed, concurrency=workers)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # never take the page down over warm-up
@@ -156,7 +174,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         tasks.append(asyncio.create_task(boot()))
-        tasks.append(asyncio.create_task(warmer()))
+        for _ in range(workers):
+            tasks.append(asyncio.create_task(warmer()))
         tasks.append(asyncio.create_task(setup_pusher()))
         tasks.append(asyncio.create_task(retry_sweeper()))
         try:
@@ -194,6 +213,9 @@ def create_app(
             "failed": len(engine.warm_failures),
             "market": str(config.get("market", "futures")),
             "setups": len(engine.setup_payloads),
+            "stored": store.counts().get("total", 0),
+            "store": store.enabled,
+            "workers": workers,
             "rescanning": bool(rescan_state.get("running")),
             "setups_valid": len(engine.open_setups(valid_only=True, limit=10_000)),
             "candles_seen": engine.candles_seen,
@@ -232,6 +254,69 @@ def create_app(
             "market": getattr(feed, "market", "futures"),
         }
 
+    @app.get("/api/signals")
+    async def signals(
+        limit: int = 300,
+        symbol: str = "",
+        timeframe: str = "",
+        grade: str = "",
+        state: str = "",
+        side: str = "",
+        valid: int | None = None,
+        since: int = 0,
+        search: str = "",
+    ) -> dict[str, Any]:
+        """The archive: every setup ever recorded, newest first.
+
+        This is what makes the page survive a restart - it is read from SQLite, so
+        it does not depend on any process still being up.
+        """
+        rows = store.list(
+            limit=limit,
+            symbol=symbol,
+            timeframe=timeframe,
+            grade=grade,
+            state=state,
+            side=side,
+            valid=valid,
+            since=since,
+            search=search,
+        )
+        return {
+            "signals": rows,
+            "count": len(rows),
+            "counts": store.counts(),
+            "results": store.results(),
+            "enabled": store.enabled,
+            "problem": store.problem,
+            "path": str(store.path) if store.path else None,
+        }
+
+    @app.get("/api/signals.csv")
+    async def signals_csv(limit: int = 5000) -> Any:
+        """The same rows as a CSV, because an archive you cannot take out is a trap."""
+        import csv as _csv
+        import io
+
+        rows = store.export(limit=limit)
+        buffer = io.StringIO()
+        fields = ["created_ms", "symbol", "market", "timeframe", "side", "grade", "state",
+                  "valid", "mitigated", "entry", "stop", "target", "target_2r", "rr",
+                  "score", "r_now", "zone_low", "zone_high", "swept_level", "bos_level",
+                  "break_kind", "hvb_side", "hvb_lag", "volume_ratio", "trend_dir",
+                  "closed_ms", "evidence"]
+        writer = _csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        from fastapi.responses import Response
+
+        return Response(
+            buffer.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="tdigm-signals.csv"'},
+        )
+
     @app.get("/api/chart")
     async def chart(symbol: str, timeframe: str, bars: int = 180) -> JSONResponse:
         """Candles + the markers a setup is made of, for one instrument."""
@@ -254,7 +339,7 @@ def create_app(
 
         async def run() -> None:
             try:
-                rescan_state["result"] = await engine.rescan(feed, reset=reset)
+                rescan_state["result"] = await engine.rescan(feed, reset=reset, concurrency=workers)
                 await hub.send_all(
                     {
                         "type": "log",
@@ -366,7 +451,7 @@ def create_app(
                 return {"ok": True, "filters": filters, "warning": f"could not write config: {exc}"}
         await engine._emit_state(force=True)  # noqa: SLF001
         # the rules changed, so the setups on screen have to be re-derived
-        asyncio.create_task(engine.rescan(feed, reset=True))
+        asyncio.create_task(engine.rescan(feed, reset=True, concurrency=workers))
         return {"ok": True, "filters": filters, "summary": engine.filters.summary()}
 
     @app.post("/api/tdi")

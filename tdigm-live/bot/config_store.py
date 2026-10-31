@@ -40,7 +40,7 @@ _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "struct
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
               "trend_context", "require_hh_hl", "require_bos", "volume_break"}
 # whole-number keys that must stay integers (they are counts of bars)
-_COUNT_KEYS = {"max_internal_depth", "setup_max_bars"}
+_COUNT_KEYS = {"max_internal_depth", "setup_max_bars", "hvb_window"}
 
 
 def read(path: str | Path) -> dict[str, Any]:

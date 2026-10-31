@@ -356,13 +356,21 @@
       <option value="rr">best R:R</option>
       <option value="sym">A→Z</option>
     </select>
+    <select id="f-grade" title="setup grade">
+      <option value="A,B">grade A + B</option>
+      <option value="A">grade A only (strict)</option>
+      <option value="B">grade B only (relaxed)</option>
+    </select>
     <label class="tgl"><input type="checkbox" id="f-validonly" checked /> valid only</label>
     <label class="tgl"><input type="checkbox" id="f-hvonly" /> HVB required</label>
+    <label class="tgl"><input type="checkbox" id="f-archive" checked /> include archive</label>
     <div class="btnrow">
       <button class="btn ghost mini" id="f-rescan" title="re-read every instrument's history and re-run the setup scan">↻ rescan</button>
       <button class="btn ghost mini" id="f-wide" title="watch the top 500 contracts by turnover">+ top 500</button>
     </div>
     <span class="meta" id="f-count">–</span>
+    <span class="meta" id="f-store">archive –</span>
+    <button class="btn ghost mini" id="f-csv" title="download every stored signal as CSV">⤓ csv</button>
   </div>
 
   <div class="setups">
@@ -372,6 +380,7 @@
         <span class="right"><span class="marketbadge" id="market-badge">futures</span></span>
       </h2>
       <div class="setup-list" id="setups"></div>
+      <div class="hintline" id="archive-stats" style="border-top:none;padding-top:0"></div>
       <div class="hintline">
         <b>valid</b> = pending (price has not come back into the order block) or filled.
         A setup stays on this list after it dies, with the state and the reason — nothing is deleted.
@@ -966,6 +975,9 @@
     search: "",
     validOnly: true,
     hvbOnly: false,
+    grades: new Set(["A", "B"]),
+    archive: true,
+    archived: [],
     selected: null,            // setup key drawn on the chart
     setups: [],
     chart: null,
@@ -1001,15 +1013,29 @@
     if (ui.tfs.size && !ui.tfs.has(row.timeframe)) return false;
     if (ui.side !== "both" && row.side.toLowerCase() !== ui.side) return false;
     if (ui.hvbOnly && !row.hvb_side) return false;
-    if (ui.validOnly && !row.valid) return false;
+    if (ui.grades.size && !ui.grades.has(row.grade || "B")) return false;
+    // a decided setup (win / stopped / expired) is history, not an open position:
+    // the "valid only" switch is about open setups and must not hide the archive
+    const decided = ["win", "stopped", "expired", "invalidated"].includes(row.state);
+    const history = ui.archive && decided;
+    if (ui.validOnly && !row.valid && !history) return false;
     if (ui.state === "pending" && row.state !== "pending") return false;
     if (ui.state === "active" && row.state !== "active") return false;
-    if (ui.state === "valid" && !row.valid) return false;
+    if (ui.state === "valid" && !row.valid && !history) return false;
     return true;
   }
 
+  function allSetups() {
+    // live registry first, then the database: a stored row whose key is live is
+    // shown once, with the live state (which is always newer)
+    const live = ui.setups || [];
+    const seen = new Set(live.map((r) => r.key));
+    const stored = (ui.archived || []).filter((r) => !seen.has(r.key));
+    return [...live, ...stored];
+  }
+
   function filteredSetups() {
-    const rows = (ui.setups || []).filter(setupMatches);
+    const rows = allSetups().filter(setupMatches);
     const by = {
       new: (a, b) => b.created_ms - a.created_ms,
       score: (a, b) => (b.score || 0) - (a.score || 0) || b.created_ms - a.created_ms,
@@ -1039,6 +1065,39 @@
     return "dead";
   }
 
+  async function loadArchive() {
+    if (!ui.archive) { ui.archived = []; renderSetups(); return; }
+    try {
+      const res = await fetch("/api/signals?limit=400", { cache: "no-store" });
+      const json = await res.json();
+      ui.archived = json.signals || [];
+      $("f-store").textContent = json.enabled
+        ? `archive ${json.counts?.total ?? ui.archived.length}`
+        : "archive off";
+      ui.results = json.results || {};
+      renderArchiveStats();
+      renderSetups();
+    } catch (err) {
+      $("f-store").textContent = "archive unreachable";
+    }
+  }
+
+  function renderArchiveStats() {
+    const box = $("archive-stats");
+    const r = (ui.results || {}).all || {};
+    const byGrade = ui.results || {};
+    if (!r.n) { box.textContent = "The archive is empty: nothing has been recorded yet."; return; }
+    const pct = (v) => (v === null || v === undefined ? "–" : Math.round(v * 100) + "%");
+    const bits = [`<b>${r.n}</b> setups recorded`, `${r.wins} won · ${r.losses} stopped`];
+    if (r.win_rate !== null && r.win_rate !== undefined) bits.push(`hit rate <b>${pct(r.win_rate)}</b>`);
+    if (r.r_per_trade !== null && r.r_per_trade !== undefined) bits.push(`<b>${r.r_per_trade > 0 ? "+" : ""}${r.r_per_trade}R</b> per decided trade`);
+    for (const grade of ["A", "B"]) {
+      const g = byGrade["grade_" + grade];
+      if (g && g.wins + g.losses > 0) bits.push(`grade ${grade}: ${g.wins}/${g.wins + g.losses} (${pct(g.win_rate)}, ${g.r_per_trade > 0 ? "+" : ""}${g.r_per_trade}R)`);
+    }
+    box.innerHTML = bits.join(" · ") + ` <span class="mini">— R is scored against the fixed 2R target, the same convention every measurement in the docs uses</span>`;
+  }
+
   function marketAgo(ms) {
     const seconds = Math.max(0, (nowMs() - ms) / 1000);
     if (seconds < 90) return Math.round(seconds) + "s";
@@ -1052,7 +1111,8 @@
     const box = $("setups");
     const rows = filteredSetups();
     $("setups-count").textContent = rows.length;
-    $("f-count").textContent = `${rows.length} of ${(ui.setups || []).length} setups`;
+    const everything = allSetups();
+    $("f-count").textContent = `${rows.length} of ${everything.length} setups`;
     $("market-badge").textContent = (state && state.market) || "futures";
     // nothing to click? draw the biggest timeframe of the first instrument so the
     // page always shows where the breaks and the HVBs were, even with no setup
@@ -1065,7 +1125,7 @@
     }
     if (!rows.length) {
       const warm = state ? state.warming : 0;
-      const total = (ui.setups || []).length;
+      const total = everything.length;
       box.innerHTML = `<div class="empty">${warm
         ? `Warming ${warm} instrument/timeframe cells — setups appear here as their history lands.`
         : total
@@ -1083,7 +1143,8 @@
       l1.className = "l1";
       l1.append(span("sym", row.symbol), span("tf", row.timeframe),
                 span("side " + (row.side === "SHORT" ? "short" : "long"), row.side),
-                span(`state ${stateClass(row)}`, row.state), span("tf", marketAgo(row.created_ms) + " ago"),
+                span(`state ${stateClass(row)}`, row.state), span("tf", "grade " + (row.grade || "?")),
+                span("tf", marketAgo(row.created_ms) + " ago"),
                 span("tf", row.mitigated ? "mitigated" : "not mitigated"));
       if (row.hvb_side) l1.append(span("tag on", "HVB"));
       if (row.break_kind === "MS") l1.append(span("tag", "MS"));
@@ -1100,7 +1161,10 @@
         document.createTextNode(`R:R ${row.rr === null || row.rr === undefined ? "–" : row.rr.toFixed(2)}`),
         document.createTextNode(`score ${row.score === null || row.score === undefined ? "–" : Math.round(row.score)}`),
       );
-      nums.append(span("state " + (row.r_now >= 0 ? "valid" : "stopped"), `${row.r_now >= 0 ? "+" : ""}${row.r_now ?? 0}R now`));
+      const decided = ["win", "stopped", "expired", "invalidated"].includes(row.state);
+      nums.append(decided
+        ? span("state " + stateClass(row), row.state === "win" ? "closed at target" : row.state === "stopped" ? "closed at stop" : "closed, never filled")
+        : span("state " + (row.r_now >= 0 ? "valid" : "stopped"), `${row.r_now >= 0 ? "+" : ""}${row.r_now ?? 0}R now`));
 
       const why = document.createElement("div");
       why.className = "why";
@@ -1812,6 +1876,12 @@
     renderSetups();
   };
   $("f-hvonly").onchange = (e) => { ui.hvbOnly = e.target.checked; renderSetups(); };
+  $("f-grade").onchange = (e) => {
+    ui.grades = new Set(e.target.value.split(",").filter(Boolean));
+    renderSetups();
+  };
+  $("f-archive").onchange = (e) => { ui.archive = e.target.checked; loadArchive(); };
+  $("f-csv").onclick = () => { window.open("/api/signals.csv?limit=5000", "_blank"); };
   $("f-rescan").onclick = async () => {
     const btn = $("f-rescan");
     btn.disabled = true; btn.textContent = "rescanning…";
@@ -1874,6 +1944,8 @@
 
   // ------------------------------------------------------------------ boot
   refresh();                                   // paint from HTTP at once
+  loadArchive();                               // and the archive, before any candle
+  setInterval(loadArchive, 30000);
   connect();                                   // ...and upgrade to the socket
   setInterval(pollTick, 3000);
   setInterval(() => { if (state) { const age = state.last_candle_age + (Date.now() - connectedAt) / 1000; if (age > 180 && state.source === "live") showFeedError(`No candle for ${Math.round(age)}s — the stream is silent.`); } }, 5000);

@@ -86,6 +86,8 @@ async def main() -> int:
                     help="how many bars back a break of structure still counts (0 = forever)")
     ap.add_argument("--max-depth", type=int, default=2,
                     help="1 = external only, 2 = one level of internal (default), 3+ allows nesting")
+    ap.add_argument("--hvb-window", type=int, default=3,
+                    help="the HVB may print on the break candle or up to N bars after it")
     ap.add_argument("--volume-break", action="store_true",
                     help="the signal candle must be a high-volume bar")
     ap.add_argument("--volume-mult", type=float, default=1.5, help="how many x the average volume")
@@ -146,6 +148,7 @@ async def main() -> int:
             "structure": not args.no_structure,
             "hvb": not args.no_hvb,
             "hvb_min_points": args.hvb_points,
+            "hvb_window": args.hvb_window,
             "break": bool(args.require_break),
             "min_rr": args.min_rr,
             "max_bars_since_sweep": args.max_bars,
@@ -321,6 +324,7 @@ def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizo
     by_regime: dict[str, list[tuple[str, float]]] = defaultdict(list)
     by_depth: dict[str, list[tuple[str, float]]] = defaultdict(list)
     by_volume: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    by_grade: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for alert in alerts:
         result, r = _outcome(alert, bars[alert["timeframe"]], horizon, target_mode, fixed_r)
         by_tf[alert["timeframe"]].append((result, r))
@@ -332,6 +336,7 @@ def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizo
         bucket = "?" if ratio is None else ("<1.0x" if ratio < 1 else "1-1.5x" if ratio < 1.5
                                            else "1.5-2.5x" if ratio < 2.5 else "2.5x+")
         by_volume[bucket].append((result, r))
+        by_grade[str(alert.get("grade") or "older")].append((result, r))
 
     out: list[tuple[str, dict]] = []
     for tf in timeframes:
@@ -344,6 +349,8 @@ def score(alerts: list[dict], candles: list[dict], timeframes: list[str], horizo
         out.append((f"depth {depth}", _bucket(rows)))
     for bucket, rows in sorted(by_volume.items()):
         out.append((f"volume {bucket}", _bucket(rows)))
+    for grade, rows in sorted(by_grade.items()):
+        out.append((f"grade {grade}", _bucket(rows)))
     return out
 
 

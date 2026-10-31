@@ -1,0 +1,159 @@
+"""The archive: a signal that was printed once must stay printable.
+
+The complaint behind this file is the one smc-radar already answered - the page
+was a window on the scanner, and a restart erased the record of everything found
+so far. These tests pin what the database has to guarantee:
+
+* a setup is written the moment it is found, and its whole life is written too;
+* a restart shows the archive before a single candle arrives;
+* a decided outcome is final (a re-scan must not turn a win into "pending");
+* the archive survives a second process opening it (that is the whole point).
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from bot.engine import Engine  # noqa: E402
+from bot.store import SignalStore, row_of  # noqa: E402
+
+PAYLOAD = {
+    "key": "BTCUSDT|1h|1700000000000",
+    "symbol": "BTCUSDT",
+    "timeframe": "1h",
+    "side": "SHORT",
+    "grade": "A",
+    "state": "pending",
+    "valid": True,
+    "mitigated": False,
+    "created_ms": 1_700_000_000_000,
+    "entry": 100.0,
+    "stop": 104.0,
+    "target": 92.0,
+    "target_2r": 92.0,
+    "rr": 2.0,
+    "score": 100.0,
+    "zone": {"high": 101.0, "low": 99.0, "mid": 100.0},
+    "depth": {"value": 2, "label": "internal"},
+    "hvb_side": "down",
+    "hvb_lag": 0,
+    "break_kind": "MS",
+    "swept_level": 104.0,
+    "bos_level": 98.0,
+    "volume_ratio": 1.8,
+    "trend_dir": -1,
+    "trend_clean": True,
+    "reasons": ["swept the high at 104", "broke structure at 98 (MS)"],
+}
+
+
+def test_a_row_carries_everything_a_trader_filters_on():
+    row = row_of(PAYLOAD)
+    assert row["symbol"] == "BTCUSDT" and row["timeframe"] == "1h"
+    assert row["zone_high"] == 101.0 and row["zone_low"] == 99.0
+    assert row["depth"] == 2 and row["grade"] == "A"
+    assert json.loads(row["evidence"])[0].startswith("swept the high")
+    assert json.loads(row["payload"])["key"] == PAYLOAD["key"]
+
+
+def test_a_setup_is_written_then_kept_up_to_date(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    assert store.enabled and store.problem is None
+
+    assert store.record(PAYLOAD)
+    rows = store.list()
+    assert len(rows) == 1 and rows[0]["state"] == "pending" and rows[0]["stored"] is True
+
+    store.record({**PAYLOAD, "state": "active", "valid": True, "mitigated": True})
+    rows = store.list()
+    assert len(rows) == 1, "the same setup is one row, not two"
+    assert rows[0]["state"] == "active" and rows[0]["mitigated"] is True
+    assert store.counts()["total"] == 1
+
+
+def test_a_decided_outcome_is_final(tmp_path):
+    """A re-scan replays history: it must never rewrite a win back to pending."""
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    store.record(PAYLOAD)
+    store.record({**PAYLOAD, "state": "win", "valid": False, "closed_ms": 1_700_000_500_000})
+    store.record({**PAYLOAD, "state": "pending", "valid": True, "closed_ms": None})
+    row = store.list()[0]
+    assert row["state"] == "win", "a decided result is never overwritten"
+    assert row["closed_ms"] == 1_700_000_500_000
+
+
+def test_the_archive_outlives_the_process(tmp_path):
+    path = tmp_path / "sig.sqlite3"
+    first = SignalStore(path)
+    first.record(PAYLOAD)
+    first.close()
+
+    second = SignalStore(path)
+    rows = second.list()
+    assert len(rows) == 1 and rows[0]["key"] == PAYLOAD["key"], (
+        "opening the file again is the whole point: the signal survived the restart"
+    )
+
+
+def test_filters_read_the_archive_not_the_process(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    store.record(PAYLOAD)
+    store.record({**PAYLOAD, "key": "ETHUSDT|15m|1", "symbol": "ETHUSDT", "timeframe": "15m", "grade": "B"})
+    assert [r["symbol"] for r in store.list(timeframe="1h")] == ["BTCUSDT"]
+    assert [r["grade"] for r in store.list(grade="B")] == ["B"]
+    assert [r["symbol"] for r in store.list(search="eth")] == ["ETHUSDT"]
+    assert store.list(valid=0) == []
+
+
+def test_results_are_computed_from_the_rows(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    store.record({**PAYLOAD, "key": "A", "state": "win", "valid": False})
+    store.record({**PAYLOAD, "key": "B", "state": "stopped", "valid": False})
+    store.record({**PAYLOAD, "key": "C", "state": "pending", "valid": True})
+    results = store.results()["all"]
+    assert results["wins"] == 1 and results["losses"] == 1
+    assert results["win_rate"] == 0.5
+    assert results["r_per_trade"] == 0.5, "(2R - 1R) / 2 decided trades"
+
+
+def test_a_broken_disk_never_stops_the_scanner(tmp_path):
+    bad = tmp_path / "nope" / "x.sqlite3"
+    bad.parent.mkdir()
+    (bad).write_text("not a database")  # sqlite will refuse this file
+    store = SignalStore(bad)
+    # either it opened a real file after all, or it degraded cleanly - never raise
+    assert store.enabled is False or store.record(PAYLOAD)
+
+
+def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    engine = Engine(
+        symbols=["BTCUSDT"],
+        timeframes=["1h"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={"trend_context": False, "require_bos": False},
+        structure={"pivot_len": 2},
+    )
+    engine.attach_store(store)
+    engine.market = "futures"
+    engine._remember(PAYLOAD)  # the same call the publish path makes
+
+    # a restart: a brand new engine, the same database
+    fresh = Engine(
+        symbols=["BTCUSDT"],
+        timeframes=["1h"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={},
+        structure={"pivot_len": 2},
+    )
+    fresh.attach_store(SignalStore(tmp_path / "sig.sqlite3"))
+    restored = fresh.load_stored()
+    assert restored == 1
+    assert fresh.setup_payloads[PAYLOAD["key"]]["symbol"] == "BTCUSDT"
+    assert fresh.open_setups(valid_only=True), "the archive row is on the board at boot"
