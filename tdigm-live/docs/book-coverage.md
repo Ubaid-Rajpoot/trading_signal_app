@@ -115,3 +115,61 @@ python tools/book_study.py data/btc
 # the live defaults, with the walk-forward
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,5m,15m,30m,1h --target range
 ```
+
+---
+
+# The book engine, measured (round 22)
+
+The gates above were the *old* engine: a sweep, a break, an HVB. `bot/book/` is
+the book's own chain instead — liquidity map → trap → displacement that leaves an
+imbalance → mitigation of that imbalance → the plan, with the draw on the next
+liquidity. Everything below is that engine on **BTCUSDT, 2023-01-01 →
+2024-12-31**, entry timeframes `5m,15m,30m,1h`, replayed through the live engine
+(`tools/book_study.py`), fees **0.06% round trip** (maker in, taker out) charged
+in the plan and tested in the walk-forward.
+
+```
+../.venv/bin/python -m tools.book_study data/btc --symbol BTCUSDT \
+    --mode shift --fill 1.0 --be-at-r 2.0
+```
+
+| entry recipe | n | win / BE / loss | total R | R / trade | median planned R:R |
+|---|---|---|---|---|---|
+| mitigation at 50% of the gap, stop to BE at +1R *(shipped before this round)* | 219 | 28 / 80 / 110 | +12.51 | +0.057 | 4.93 |
+| **full gap fill, then the reverse shift, BE at +2R** *(shipped now)* | 217 | 45 / 30 / 142 | **+42.79** | **+0.197** | 3.73 |
+
+Why the second one is the default: it is also the *book's* recipe (p.87 — follow
+the daily cycle, wait for the **full FVG fill**, then the reverse shift), so it is
+more faithful **and** better on this sample. Entering at half the gap on the fill
+alone is a shortcut the book does not make.
+
+The honest split of the winning row:
+
+| window | trades | total R | R / trade |
+|---|---|---|---|
+| 2023 | 94 | +46.0 | +0.49 |
+| 2024 | 123 | −3.2 | −0.03 |
+
+**All of the edge is in 2023.** Two years, one instrument, 217 trades is a thin
+sample, and a year-by-year split that flips sign is the definition of "not
+proven". Add to that:
+
+* **Break-even at +2R is an approximation.** The book says *move the stop to
+  break-even when price breaks structure* (p.109); the live engine cannot see a
+  structural break on the entry timeframe cheaply, so it uses a fixed R
+  multiple. +2R was chosen because +1R measured worse (+12.51R vs +42.79R) — on
+  the same data that selected everything else, so it is a fitted parameter, not
+  a discovered one. It is in `config.json` (`book.breakeven_at_r`) for exactly
+  that reason.
+* **One instrument.** The live scanner runs many; nothing here measures whether
+  the same recipe works on anything but BTC.
+* **Median planned R:R is 3.73, under the 1:4 preference.** The floor
+  (`book.min_rr`) is 3.0 and the trader asked for 1:4; at 4.0 the sample loses
+  about half its trades (this is the "≥1:4 preference vs signal count" trade-off
+  that has been stated in every round). The card shows the real number on every
+  plan — nothing is rounded up to look like it met a target.
+
+So: **the implementation is faithful and auditable; the edge is not established.**
+The engine is built so that this is checkable rather than believed — the numbers
+above come out of the same code the page runs, and the same command can be
+pointed at another instrument, another window, or a different exit.

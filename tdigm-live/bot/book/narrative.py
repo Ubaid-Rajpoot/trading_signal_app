@@ -47,8 +47,8 @@ class BookSettings:
     arm_bars: int = 30                # the AC must print this soon after the trap
 
     # the entry
-    entry_mode: str = "mitigation"    # "mitigation" | "shift" | "immediate"
-    fill_frac: float = 0.5            # how much of the FVG must be mitigated
+    entry_mode: str = "shift"         # "mitigation" | "shift" | "immediate"
+    fill_frac: float = 1.0            # p.87: the *full* FVG fill, then the reverse shift
     entry_max_bars: int = 40
     min_rr: float = 4.0               # the trader's floor (round 16: 1:4)
     max_rr: float = 100.0             # a 1:500 draw is a broken series

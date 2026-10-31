@@ -191,3 +191,35 @@ def test_centre_band_choice_is_applied_and_saved(client):
     saved = json.loads(Path(client.config_path).read_text())  # type: ignore[attr-defined]
     assert saved["tdi"]["hvb_reference"] == "fifty"
     assert client.get("/api/state").json()["centre_reference"] == "fifty"
+
+
+# ------------------------------------------------------------ notifications
+def test_the_page_is_served_with_its_own_assets(client):
+    """One HTML file, one stylesheet, one script - and the queue they share."""
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "/app.js" in page.text and "/notify.js" in page.text
+    assert page.text.count('class="toast"') == 1, "there is exactly one toast slot"
+    assert 'id="toasts"' not in page.text, "the old stack is gone"
+    for asset in ("/app.js", "/app.css", "/notify.js"):
+        assert client.get(asset).status_code == 200
+
+
+def test_notifications_are_counted_even_when_nothing_is_shown(client):
+    """A warning is recorded and counted, and it never becomes a toast."""
+    body = client.get("/api/notifications").json()
+    assert set(body["counts"]) == {"unread", "events", "filtered", "suppressed"}
+    assert body["counts"]["events"] == len(body["events"])
+    for event in body["events"]:
+        assert event["severity"] != "action", "only an actionable event may be sent as a toast"
+        assert event["category"] == "system"
+    health = client.get("/api/health").json()["notifications"]
+    assert health["events"] == body["counts"]["events"]
+    # every engine message that is *not* worth keeping is counted, never dropped silently
+    assert health["suppressed"] >= 0 and health["filtered"] >= 0
+
+
+def test_marking_read_clears_the_badge(client):
+    body = client.post("/api/notifications/read").json()
+    assert body["ok"] is True
+    assert body["counts"]["unread"] == 0

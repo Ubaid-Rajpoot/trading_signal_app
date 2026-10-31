@@ -1170,7 +1170,7 @@ class Engine:
             state="active",
             touched_ms=int(plan["created_ms"]),
             max_bars=int(self.book_config.get("setup_max_bars", 240)),
-            breakeven_at_r=float(self.book_config.get("breakeven_at_r", 1.0) or 0.0),
+            breakeven_at_r=float(self.book_config.get("breakeven_at_r", 2.0) or 0.0),
         )
         self.registry[key] = record
         self.by_cell.setdefault((record.symbol, record.timeframe), []).append(record)

@@ -169,7 +169,7 @@ def main() -> int:
     ap.add_argument("--start", default="")
     ap.add_argument("--end", default="")
     ap.add_argument("--mode", default="shift", choices=["shift", "mitigation", "immediate"])
-    ap.add_argument("--fill", type=float, default=0.5)
+    ap.add_argument("--fill", type=float, default=1.0)
     ap.add_argument("--min-rr", type=float, default=3.0)
     ap.add_argument("--body-atr", type=float, default=1.0)
     ap.add_argument("--vol-mult", type=float, default=1.3)
@@ -189,7 +189,7 @@ def main() -> int:
                     help="only accept displacements that carry volume (p.81)")
     ap.add_argument("--require-vector", action="store_true",
                     help="only accept engulfing displacements (p.71)")
-    ap.add_argument("--be-at-r", type=float, default=0.0, help="also report break-even at +nR")
+    ap.add_argument("--be-at-r", type=float, default=2.0, help="also report break-even at +nR")
     ap.add_argument("--scale-at-r", type=float, default=0.0,
                     help="bank half the position at +nR and move the stop to break-even")
     ap.add_argument("--scale-frac", type=float, default=0.5)

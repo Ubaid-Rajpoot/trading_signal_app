@@ -211,9 +211,13 @@ def _scenario() -> list[dict]:
 
 
 def test_the_whole_chain_produces_a_plan_with_a_stop_behind_the_imbalance():
+    # the mechanics of the entry, pinned in the simplest mode: the mitigation
+    # *is* the entry. The shipped default waits for a reverse shift on top of
+    # the mitigation - that is the next test's job.
     narrative = Narrative("BTCUSDT", BookSettings(entry_tf="5m", htf="15m",
                                                   min_rr=3.0, min_stop_atr=0.0,
-                                                  htf_required=False),
+                                                  htf_required=False,
+                                                  entry_mode="mitigation", fill_frac=0.5),
                           _liquidity())
     events: list[dict] = []
     for candle in _scenario():
@@ -227,6 +231,30 @@ def test_the_whole_chain_produces_a_plan_with_a_stop_behind_the_imbalance():
     assert plan["target"] == pytest.approx(96.0), "the draw is the untouched Asian low"
     assert plan["rr"] >= 3.0
     assert plan["confluences"], "the card has to be able to explain itself"
+
+
+def test_the_shipped_default_waits_for_the_reverse_shift_after_a_full_fill():
+    """p.87: the full FVG fill, *then* a reversal break - not the fill alone.
+
+    The same scenario that trades above must not trade on the shipped defaults:
+    a retrace into the gap is only half of the confluence, and entering there is
+    entering before the book's model is complete.
+    """
+    settings = BookSettings(entry_tf="5m", htf="15m", min_rr=3.0,
+                            min_stop_atr=0.0, htf_required=False)
+    assert settings.entry_mode == "shift"
+    assert settings.fill_frac == 1.0
+    narrative = Narrative("BTCUSDT", settings, _liquidity())
+    events: list[dict] = []
+    bars = _scenario()
+    # the market does nothing for longer than the entry window: the armed setup
+    # has to expire *and be counted*, never vanish
+    bars += [bar(9 + i, 97.9, 98.1, 97.7, 98.0) for i in range(45)]
+    for candle in bars:
+        narrative.liquidity.add(candle)
+        events += narrative.on_bar(candle, {"bias": -1, "premium": 0.8})
+    assert [e for e in events if e["type"] == "setup"] == []
+    assert "the setup expired without an entry" in narrative.drops
 
 
 def test_a_pool_that_is_accepted_instead_of_raided_is_dropped():
