@@ -186,6 +186,22 @@ def create_app(
         Now the server is up instantly, the page shows every cell as warming,
         and rows fill in as their history lands.
         """
+        if config.get("auto_universe") and hasattr(feed, "universe"):
+            try:
+                items = await feed.universe()
+                ranked = [item["symbol"] for item in items]
+                wanted = ranked[:max_symbols]
+                if wanted:
+                    current = list(engine.symbols)
+                    removed = engine.remove_symbols(current)
+                    if removed:
+                        feed.remove_symbols(removed)
+                    added = engine.add_symbols(wanted)
+                    if added:
+                        feed.add_symbols(added)
+                    _persist_symbols()
+            except Exception as exc:
+                await publish({"type": "log", "level": "warn", "message": f"auto-universe fetch failed: {exc}"})
         try:
             await engine.warmup(feed, concurrency=workers)
         except asyncio.CancelledError:

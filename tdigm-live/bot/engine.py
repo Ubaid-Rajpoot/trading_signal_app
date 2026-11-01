@@ -462,7 +462,7 @@ class Engine:
                         break
                 else:
                     try:
-                        candles = await feed.history(symbol, interval, 600)
+                        candles = await feed.history(symbol, interval, 2500)
                         if candles:
                             break
                     except Exception as exc:

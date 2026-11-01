@@ -123,12 +123,29 @@ class BaseFeed:
         """
         raise NotImplementedError
 
-    async def _get_json(self, url: str, params: dict | None = None) -> object:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(url, params=params)
-        if resp.status_code != 200:
-            raise FeedError(f"{url} -> HTTP {resp.status_code} {resp.text[:120]}")
-        return resp.json()
+    async def _get_json(self, url: str, params: dict | None = None, retries: int = 4) -> object:
+        delay = 1.0
+        for attempt in range(retries):
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(url, params=params)
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 429 and attempt < retries - 1:
+                    await asyncio.sleep(delay + random.uniform(0, 0.5))
+                    delay *= 2.0
+                    continue
+                if resp.status_code >= 500 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    delay *= 2.0
+                    continue
+                raise FeedError(f"{url} -> HTTP {resp.status_code} {resp.text[:120]}")
+            except (httpx.RequestError, asyncio.TimeoutError) as exc:
+                if attempt == retries - 1:
+                    raise FeedError(f"{url} -> {type(exc).__name__}: {exc}")
+                await asyncio.sleep(delay)
+                delay *= 2.0
+        raise FeedError(f"{url} -> max retries exceeded")
 
     # -------------------------------------------------------------- stream
     async def stream(self, symbols: list[str]) -> AsyncIterator[dict]:  # pragma: no cover
