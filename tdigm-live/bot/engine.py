@@ -502,7 +502,7 @@ class Engine:
         # Audit the complete archive, not merely the rows that fit on the first
         # page.  This answers whether a missing sweep is systemic and prevents a
         # malformed legacy row from remaining tradeable just because it is old.
-        audit_rows = self.store.list(limit=50_000)
+        audit_rows = self.store.all_payloads()
         audited: dict[str, list[str]] = {}
         require_hvb = bool(self.filters.config.get("hvb", True))
         for row in audit_rows:
@@ -523,7 +523,7 @@ class Engine:
         # A still-valid setup may be older than the newest archive page. Always
         # restore valid rows too so restart cannot turn "unmitigated" into a
         # stale JSON row that never receives another candle.
-        valid = self.store.list(limit=50_000, valid=1)
+        valid = [row for row in self.store.all_payloads() if row.get("valid")]
         rows = list({row.get("key"): row for row in [*recent, *valid] if row.get("key")}.values())
         for row in rows:
             key = row.get("key")

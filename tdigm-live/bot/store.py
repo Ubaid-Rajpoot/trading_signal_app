@@ -363,6 +363,31 @@ class SignalStore:
             out.append(payload)
         return out
 
+    def all_payloads(self) -> list[dict]:
+        """Read every archived payload for startup integrity auditing.
+
+        The visible archive is deliberately paged; an integrity boundary is not.
+        A malformed row must not escape quarantine because it happened to be row
+        50,001 in a long-running database.
+        """
+        if not self.enabled or self._db is None:
+            return []
+        with self._lock:
+            try:
+                rows = self._db.execute("SELECT payload FROM signals ORDER BY created_ms DESC").fetchall()
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return []
+        out: list[dict] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            payload["stored"] = True
+            out.append(payload)
+        return out
+
     def export(self, limit: int = 5000) -> list[dict]:
         """The columns as flat rows - for the CSV, and for anyone auditing."""
         if not self.enabled or self._db is None:
