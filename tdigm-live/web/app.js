@@ -418,7 +418,7 @@
         + (row.sweep_ms ? " [" + clock(row.sweep_ms) + "]" : ""));
     }
     if (row.bos_level !== null && row.bos_level !== undefined) {
-      chain.push("opposite body break @ " + num(row.bos_level) + " [" + clock(row.created_ms) + "]");
+      chain.push("same-leg opposite body break @ " + num(row.bos_level) + " [" + clock(row.created_ms) + "]");
     }
     if (row.hvb_side) chain.push("same-candle HVB " + row.hvb_side);
     if (row.trap) chain.push("trap " + (row.trap.side || "") + " @ " + num(row.trap.level));
@@ -840,7 +840,7 @@
           + (data.history_error ? " · " + data.history_error : "");
       } else {
         audit.className = "chart-audit ok";
-        audit.textContent = "✓ high/low sweep → opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
+        audit.textContent = "✓ paired-leg H/L sweep → same-leg opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
       }
     } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
     $("chart-tf").textContent = candles.length + " historical bars"

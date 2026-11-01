@@ -104,10 +104,21 @@ def test_a_decided_outcome_is_final(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
     store.record(PAYLOAD)
     store.record({**PAYLOAD, "state": "win", "valid": False, "closed_ms": 1_700_000_500_000})
-    store.record({**PAYLOAD, "state": "pending", "valid": True, "closed_ms": None})
+    corrected = {
+        **PAYLOAD,
+        "state": "pending", "valid": True, "closed_ms": None,
+        "entry": 99.0, "stop": 106.0, "target": 88.0,
+        "swept_level": 103.0,
+        "setup": {**PAYLOAD["setup"], "swept_level": 103.0, "sweep_high": 105.0},
+    }
+    store.record(corrected)
     row = store.list()[0]
     assert row["state"] == "win", "a decided result is never overwritten"
     assert row["closed_ms"] == 1_700_000_500_000
+    assert (row["entry"], row["stop"], row["target"]) == (100.0, 104.0, 92.0)
+    assert row["swept_level"] == 103.0 and row["setup"]["swept_level"] == 103.0, (
+        "a rescan may correct structural evidence without rewriting the outcome"
+    )
 
 
 def test_the_archive_outlives_the_process(tmp_path):
@@ -211,6 +222,23 @@ def test_startup_audits_and_quarantines_a_legacy_signal_without_a_sweep(tmp_path
     assert row["valid"] is False and row["state"] == "invalidated"
     assert any("sweep time" in reason for reason in row["chain_errors"])
     assert bad["key"] not in engine.registry
+
+
+def test_startup_quarantines_a_versioned_signal_without_paired_endpoint_times(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    versioned = {**PAYLOAD, "chain_version": 2}
+    store.record(versioned)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(versioned["key"])
+    assert row["state"] == "invalidated"
+    assert any("paired-leg endpoint proof" in reason for reason in row["chain_errors"])
+    assert versioned["key"] not in engine.registry
 
 
 def test_the_record_carries_an_honest_error_bar(tmp_path):

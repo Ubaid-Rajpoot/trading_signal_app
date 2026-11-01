@@ -39,17 +39,19 @@ BTCUSDT   15m   SHORT   entry 102,431.50   stop 103,988.20   target 100,902.00  
    next liquidity / range extreme       ← target
 ```
 
-For a **short**: a swing high is swept (its stops are taken), then a candle
-**closes below the most recent swing low**. For a **long**: mirrored — a swing
-low is swept, then a candle closes above the most recent swing high.
+For a **short**: the high of a completed high→low leg is swept (its stops are
+taken), then a candle **closes below that exact leg's low**. For a **long**:
+mirrored — sweep the low of a completed low→high leg, then close above that
+exact leg's high.
 
 | term | definition (nothing hidden) |
 |---|---|
 | swing / level | a high that no other high in `pivot_len` bars on either side beats (equal highs count — double tops are liquidity). Only confirmed `pivot_len` bars later, so nothing looks ahead. |
-| sweep | `high > level` (buy-side) or `low < level` (sell-side) on a **closed** candle |
-| sweep killed | a later **close** beyond the sweep extreme — price accepted the new level, so there is nothing to reverse |
-| confirmation | close beyond the most recent intact swing on the other side, within `sweep_max_wait` bars |
-| stop | the sweep extreme (just beyond the swept high / low) |
+| paired leg | SHORT is a completed `high → later low` leg; LONG is a completed `low → later high` leg |
+| sweep | `high >` that leg's high (SHORT) or `low <` that leg's low (LONG), on a **closed** candle |
+| extension | price may continue beyond the swept endpoint; the candidate remains paired and the stop follows the run's final extreme |
+| confirmation | body close through the **other endpoint of that same leg** within `sweep_max_wait` bars |
+| stop | the run's final extreme beyond the swept high / low |
 | target | `range`: the far extreme of the range that existed **before** the sweep (the dashed line / arrow in the drawing). `next`: the nearest resting liquidity beyond the entry. Small swings printed *inside* the reversal leg are never used as a target. |
 | entry | the close of the confirming candle |
 
@@ -210,7 +212,7 @@ is never overwritten by a re-scan, and the numbers on the board (hit rate, R per
 are computed from those rows rather than from memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
-`H/L sweep → later opposite body close → correctly directed same-candle HVB`.
+`paired-leg H/L sweep → body close through that same leg's opposite endpoint → correctly directed same-candle HVB`.
 Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
@@ -530,9 +532,10 @@ python -m pytest tests -q      # full deterministic suite, no network needed
 
 Covered: batch TDIGM equals the incremental one; Wilder's RSI; the 5m/15m rollup
 (open/high/low/close/volume, clock aligned); a break needs a close, not a wick;
-sweep → opposite break produces exactly one setup with the stop beyond the sweep
-extreme and no target from levels printed inside the reversal leg; a sweep that
-keeps going is killed; filters reject for the stated reason and count it; alerts
+a completed leg's H/L sweep → break of the opposite endpoint of that same leg
+produces exactly one setup, while an unrelated newer pivot cannot be substituted;
+the stop follows the run's final extreme and no target comes from levels printed
+inside the reversal leg; filters reject for the stated reason and count it; alerts
 never fire on a forming candle or twice on the same one; adding/removing
 instruments writes `config.json`; MEXC kline frames parse in both encodings;
 feed sharding splits 250 symbols into 100/100/50 sockets.

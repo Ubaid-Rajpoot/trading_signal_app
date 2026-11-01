@@ -52,7 +52,9 @@ from .trend import TrendMap
 MAX_CANDLES = 180
 
 
-def sweep_chain_errors(payload: dict[str, Any], *, require_hvb: bool = True) -> list[str]:
+def sweep_chain_errors(
+    payload: dict[str, Any], *, require_hvb: bool = True, require_leg_proof: bool = False
+) -> list[str]:
     """Return hard integrity failures for a TDIGM sweep signal.
 
     Filters decide whether a *valid chain* is tradeable.  This function protects
@@ -75,6 +77,7 @@ def sweep_chain_errors(payload: dict[str, Any], *, require_hvb: bool = True) -> 
         except (TypeError, ValueError, OverflowError):
             return 0
 
+    require_leg_proof = require_leg_proof or as_int(payload.get("chain_version")) >= 2
     side = str(payload.get("side") or setup.get("side") or "").upper()
     swept_side = str(setup.get("swept_side") or payload.get("swept_side") or "").lower()
     swept_level = setup.get("swept_level", payload.get("swept_level"))
@@ -101,6 +104,13 @@ def sweep_chain_errors(payload: dict[str, Any], *, require_hvb: bool = True) -> 
         errors.append("sweep time is missing")
     if break_ms <= sweep_ms:
         errors.append("sweep must precede the body-break candle")
+    swept_level_ms = as_int(setup.get("swept_level_time") or payload.get("swept_level_ms"))
+    broke_level_ms = as_int(setup.get("broke_level_time") or payload.get("broke_level_ms"))
+    if require_leg_proof and not (swept_level_ms and broke_level_ms):
+        errors.append("paired-leg endpoint proof is missing")
+    if swept_level_ms or broke_level_ms:
+        if not (0 < swept_level_ms < broke_level_ms < sweep_ms < break_ms):
+            errors.append("swept and broken levels are not endpoints of the same completed leg")
     try:
         body_level = float(broke_level)
     except (TypeError, ValueError):
@@ -1375,7 +1385,9 @@ class Engine:
         kind = alert["kind"]
         if kind == "signal" and self.strategy == "sweep":
             errors = sweep_chain_errors(
-                alert, require_hvb=bool(self.filters.config.get("hvb", True))
+                alert,
+                require_hvb=bool(self.filters.config.get("hvb", True)),
+                require_leg_proof=True,
             )
             if errors:
                 reason = "integrity: " + "; ".join(errors)
@@ -1537,6 +1549,7 @@ class Engine:
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
         payload["kind"] = "signal"
         payload["strategy"] = "sweep"
+        payload["chain_version"] = 2
         payload["key"] = key
         payload["setup"] = setup
         payload["chain_valid"] = True
@@ -1958,7 +1971,11 @@ def _evidence(alert: dict) -> list[str]:
     if swept:
         out.append(f"swept the {'high' if swept == 'high' else 'low'} at {_fmt(setup.get('swept_level'))}")
     if setup.get("broke_level") is not None:
-        out.append(f"broke structure at {_fmt(setup.get('broke_level'))} ({setup.get('break_kind', 'SHIFT')})")
+        pairing = ", paired leg" if setup.get("swept_level_time") and setup.get("broke_level_time") else ""
+        out.append(
+            f"broke structure at {_fmt(setup.get('broke_level'))} "
+            f"({setup.get('break_kind', 'SHIFT')}{pairing})"
+        )
     if alert.get("hvb"):
         out.append(f"HVB {alert['hvb']} on the break candle ({_fmt(alert.get('hvb_points'))} pts)")
     if external.get("direction"):

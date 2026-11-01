@@ -289,7 +289,9 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     proof = setup.as_dict()
     assert proof["sweep_time"] < proof["break_time"]
     assert proof["sweep_high"] > proof["swept_level"]
-    assert proof["sweep_low"] == 101.0
+    assert proof["sweep_low"] == 102.0
+    assert proof["swept_level"] == 107.0
+    assert proof["swept_level_time"] < proof["broke_level_time"] < proof["sweep_time"]
 
 
 def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
@@ -298,6 +300,7 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
         "setup": {
             "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
             "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
+            "swept_level_time": 5_000, "broke_level_time": 8_000,
             "broke_level": 95.0, "break_time": 20_000,
         },
     }
@@ -309,6 +312,13 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
     assert any("down HVB" in reason for reason in sweep_chain_errors(wrong_hvb))
     fake_wick = {**valid, "setup": {**valid["setup"], "sweep_high": 106.9}}
     assert any("did not take" in reason for reason in sweep_chain_errors(fake_wick))
+    unrelated = {**valid, "setup": {**valid["setup"], "swept_level_time": 9_000,
+                                      "broke_level_time": 6_000}}
+    assert any("same completed leg" in reason for reason in sweep_chain_errors(unrelated))
+    unproved = {**valid, "chain_version": 2,
+                "setup": {k: v for k, v in valid["setup"].items()
+                          if k not in {"swept_level_time", "broke_level_time"}}}
+    assert any("endpoint proof" in reason for reason in sweep_chain_errors(unproved))
 
 
 @pytest.mark.asyncio
@@ -327,6 +337,26 @@ async def test_publication_boundary_refuses_an_hvb_and_break_without_a_sweep():
     assert any("preceding high sweep" in reason for reason in engine.filters.rejections)
 
 
+@pytest.mark.asyncio
+async def test_publication_boundary_requires_exact_paired_leg_proof():
+    engine = make_engine(hvb=True)
+    cell = engine.cells[("BTCUSDT", "5m")]
+    candle = bar(20_000, 95.0, high=100.0, low=94.0)
+    candle["timeframe"] = "5m"
+    unproved = {
+        "kind": "signal", "symbol": "BTCUSDT", "timeframe": "5m",
+        "side": "SHORT", "time": candle["close_time"], "hvb": "down", "hvb_lag": 0,
+        "setup": {
+            "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
+            "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
+            "broke_level": 96.0, "break_time": candle["close_time"],
+        },
+    }
+    await engine._publish(cell, unproved, candle)
+    assert not engine.signals and not engine.setup_payloads
+    assert any("paired-leg endpoint proof" in reason for reason in engine.filters.rejections)
+
+
 def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
     # The sweep candle itself closes below the opposite low.  Because the rule
     # requires the break *subsequently*, a following candle that merely stays
@@ -339,12 +369,66 @@ def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
     assert sweeps and not setups
 
 
-def test_sweep_is_invalidated_when_price_keeps_going():
-    # sweep the 107 high and then CLOSE above it: no reversal, no setup
-    rows = SHORT_PATTERN[:19] + [(110, 103, 109)]
-    st, _, sweeps, setups, invalid = run_structure(rows)
-    assert sweeps and not setups
-    assert invalid, "closing beyond the sweep extreme must drop the setup"
+def test_swept_leg_survives_an_extension_and_stop_follows_the_final_extreme():
+    # The BTC reference does exactly this: price takes the paired leg high,
+    # continues higher, and only then reverses through that leg's low. Accepting
+    # above the first swept price must not make the later valid chain disappear.
+    rows = SHORT_PATTERN[:19] + [(110, 103, 109), (109, 90, 91)]
+    _st, _, sweeps, setups, invalid = run_structure(rows)
+    assert sweeps and setups
+    assert not invalid
+    assert setups[-1][1].stop == 110.0
+
+
+def test_break_must_use_the_other_endpoint_of_the_same_completed_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    # Completed leg: high 120 -> low 100. The newer high 130 has no later low,
+    # so it is not the high of the leg whose low 100 is about to break.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 130.0, 3, 180_000),
+    ])
+    st.count = 4
+    swept = st.add(bar(240_000, 129.0, high=131.0, low=121.0))
+    assert swept["sweep"] is not None
+    assert swept["sweep"].level == 120.0, "the unpaired newer high cannot be substituted"
+    assert swept["sweep"].opposite.price == 100.0
+
+    broken = st.add(bar(300_000, 95.0, high=129.0, low=94.0))
+    assert broken["setup"] is not None
+    proof = broken["setup"].as_dict()
+    assert proof["swept_level"] == 120.0
+    assert proof["broke_level"] == 100.0
+    assert proof["swept_level_time"] < proof["broke_level_time"]
+
+
+def test_long_break_uses_the_high_of_the_same_low_to_high_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    # Completed leg: low 80 -> high 100. The newer low 70 is unpaired.
+    st.levels.extend([
+        Level("low", 80.0, 1, 60_000),
+        Level("high", 100.0, 2, 120_000),
+        Level("low", 70.0, 3, 180_000),
+    ])
+    st.count = 4
+    swept = st.add(bar(240_000, 71.0, high=79.0, low=69.0))
+    assert swept["sweep"] is not None
+    assert swept["sweep"].side == "low"
+    assert swept["sweep"].level == 80.0
+    assert swept["sweep"].opposite.price == 100.0
+
+    broken = st.add(bar(300_000, 105.0, high=106.0, low=71.0))
+    assert broken["setup"] is not None
+    proof = broken["setup"].as_dict()
+    assert proof["side"] == "LONG"
+    assert proof["swept_level"] == 80.0
+    assert proof["broke_level"] == 100.0
+    assert proof["swept_level_time"] < proof["broke_level_time"]
 
 
 def test_no_setup_without_the_opposite_break():

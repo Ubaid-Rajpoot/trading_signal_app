@@ -4,7 +4,7 @@ This is the drawing the trader sent, in code:
 
     a swing HIGH is liquidity (stops sit above it)
     -> price pokes through it                      = the liquidity was taken (SWEEP)
-    -> price closes through the opposite swing LOW = the reversal is confirmed (BREAK)
+    -> price closes through the LOW endpoint of that same leg = reversal confirmed (BREAK)
     -> only then is there a setup
 
 The mirrored version gives the long side: sweep a swing low, then close above the
@@ -28,11 +28,13 @@ Definitions used by the alerts (all exact, no hidden magic):
                         external trend / the dealing range of p.42
     break_kind          "SHIFT" or "MS", recorded on every setup
     sweep               bar.high > level (high level) / bar.low < level (low level)
-    sweep invalidation  a later CLOSE beyond the sweep extreme - price accepted
-                        the new level, so there is nothing to reverse
-    opposite break      close below the most recent intact swing low (after a
-                        high sweep) or above the most recent swing high (after a
-                        low sweep), within ``sweep_max_wait`` bars of the sweep
+    paired leg          SHORT uses a HIGH -> later LOW leg; LONG uses a LOW ->
+                        later HIGH leg. The swept and broken levels must be the
+                        two endpoints of that same completed leg
+    sweep lifetime      the stop follows the run's furthest extreme; the paired
+                        candidate expires after ``sweep_max_wait`` bars
+    opposite break      close through the paired endpoint of that exact leg,
+                        within ``sweep_max_wait`` bars of the sweep
     stop                the sweep extreme (just beyond the swept high/low)
     target              "next": the next resting liquidity beyond the entry, or
                         "range": the far extreme of the pre-sweep range (the
@@ -94,7 +96,8 @@ class Sweep:
     index: int
     time: int
     extreme: float  # the furthest the sweep went (the stop goes just beyond)
-    opposite: Level | None = None  # the level that must break to confirm
+    opposite: Level | None = None  # the paired endpoint that must break
+    boundary: Level | None = None  # the swept endpoint of that same structural leg
     open: float | None = None
     high: float | None = None
     low: float | None = None
@@ -110,6 +113,7 @@ class Sweep:
             "high": self.high,
             "low": self.low,
             "close": self.close,
+            "boundary": self.boundary.as_dict() if self.boundary else None,
             "opposite": self.opposite.as_dict() if self.opposite else None,
         }
 
@@ -144,6 +148,9 @@ class Setup:
             "sweep_high": self.sweep.high,
             "sweep_low": self.sweep.low,
             "sweep_close": self.sweep.close,
+            # The structural endpoints prove both events belong to one leg:
+            # SHORT = high -> low, LONG = low -> high.
+            "swept_level_time": self.sweep.boundary.time if self.sweep.boundary else None,
             "broke_level": self.broke.price,
             # The level's own time is useful context, but it is not the break
             # event.  ``break_time`` is the body-close/HVB candle itself.
@@ -181,6 +188,10 @@ class Structure:
         self.external_trend: int | None = None
         self.last_major_break: dict[str, Any] | None = None
         self._major_count = 0
+        # Several completed legs can have their boundary taken before one of
+        # their paired endpoints breaks. Keep every candidate; ``sweeps`` is the
+        # latest-per-side compatibility view used by the page.
+        self._candidates: dict[str, list[Sweep]] = {"high": [], "low": []}
         self.sweeps: dict[str, Sweep | None] = {"high": None, "low": None}
         self.last_setup: Setup | None = None
         self.sweep_count = 0
@@ -240,8 +251,13 @@ class Structure:
             found = self._pivot_at(confirm_pos)
             if found is not None:
                 side, level_price = found
-                duplicate = any(
-                    abs(level.price - level_price) < 1e-12 and level.side == side for level in self.levels
+                # Equal prices after an opposite pivot are a new structural leg,
+                # not a duplicate. Collapse only adjacent same-side plateau
+                # confirmations; global price de-duplication erased leg pairing.
+                duplicate = bool(
+                    self.levels
+                    and self.levels[-1].side == side
+                    and abs(self.levels[-1].price - level_price) < 1e-12
                 )
                 if not duplicate:
                     pivot_time = int(self.times[confirm_pos])
@@ -284,101 +300,152 @@ class Structure:
                 self.last_major_break = {"side": "low", "price": level.price, "index": index}
                 events["major_break"] = self.last_major_break
 
-        # 2. sweeps: each side is tracked separately, so taking buy-side
-        #    liquidity does not stop the bot watching the sell side.
+        # 2. Completed structural legs, not unrelated nearest pivots.
+        #
+        # SHORT leg: HIGH -> later LOW. The high must be taken; that exact low
+        # must later receive the body close.
+        # LONG leg:  LOW  -> later HIGH. The low must be taken; that exact high
+        # must later receive the body close.
+        #
+        # A large run can take several completed legs before reversing, so keep
+        # every paired candidate. Selecting a recent high and an unrelated old
+        # low is explicitly impossible here.
+        existing = {
+            (s.side, s.boundary.index if s.boundary else -1,
+             s.opposite.index if s.opposite else -1)
+            for values in self._candidates.values() for s in values
+        }
         for side in SIDES:
-            if self.sweeps[side] is not None:
-                continue
-            level = self._sweepable(side, high, low, index)
-            if level is None:
-                continue
-            sweep = Sweep(
-                side=side,
-                level=level.price,
-                index=index,
-                time=int(self.times[-1]),
-                extreme=high if side == "high" else low,
-                opposite=self._opposite_level("low" if side == "high" else "high", level.price),
-                open=float(bar["open"]),
-                high=high,
-                low=low,
-                close=price,
-            )
-            level.swept = True
-            self.sweeps[side] = sweep
-            self.sweep_count += 1
-            events["sweeps"].append(sweep)
-            if events["sweep"] is None:
-                events["sweep"] = sweep
+            grouped: dict[int, tuple[Level, list[Level]]] = {}
+            for boundary, opposite in self._completed_legs(side, index):
+                key = (side, boundary.index, opposite.index)
+                if key in existing:
+                    continue
+                bucket = grouped.setdefault(boundary.index, (boundary, []))[1]
+                bucket.append(opposite)
 
-        # 3. a sweep is only a setup if price then REVERSES through the other
-        #    side. If instead it closes beyond the sweep extreme, the market
-        #    kept going - the level was never defended, so drop it.
+            for boundary, opposites in grouped.values():
+                taken = high > boundary.price if side == "high" else low < boundary.price
+                if not taken:
+                    continue
+                made: list[Sweep] = []
+                for opposite in opposites:
+                    sweep = Sweep(
+                        side=side,
+                        level=boundary.price,
+                        index=index,
+                        time=int(self.times[-1]),
+                        extreme=high if side == "high" else low,
+                        opposite=opposite,
+                        boundary=boundary,
+                        open=float(bar["open"]),
+                        high=high,
+                        low=low,
+                        close=price,
+                    )
+                    self._candidates[side].append(sweep)
+                    events["sweeps"].append(sweep)
+                    made.append(sweep)
+                if made:
+                    boundary.swept = True
+                    self.sweep_count += 1
+                    latest = max(made, key=lambda row: row.opposite.index if row.opposite else -1)
+                    if events["sweep"] is None or (
+                        latest.opposite is not None
+                        and events["sweep"].opposite is not None
+                        and latest.opposite.index > events["sweep"].opposite.index
+                    ):
+                        events["sweep"] = latest
+
+        # 3. Extend the stop to the run's final extreme and wait for the paired
+        # endpoint. A close above an earlier swept high is not enough to kill the
+        # candidate: the supplied BTC example deliberately runs through that old
+        # high before reversing. Time expiry or consumption of the paired level
+        # removes it; a true inside->outside body close confirms it.
         for side in SIDES:
-            sweep = self.sweeps[side]
-            if sweep is None:
-                continue
-            previous_extreme = sweep.extreme
-            waited = index - sweep.index
-            if side == "high":
-                sweep.extreme = max(sweep.extreme, high)
-                if price > previous_extreme or waited > self.sweep_max_wait:
-                    self.sweeps[side] = None
+            survivors: list[Sweep] = []
+            broken: list[Sweep] = []
+            for sweep in self._candidates[side]:
+                waited = index - sweep.index
+                if side == "high":
+                    sweep.extreme = max(sweep.extreme, high)
+                else:
+                    sweep.extreme = min(sweep.extreme, low)
+
+                if waited > self.sweep_max_wait or sweep.opposite is None:
                     self.invalidated += 1
                     events["invalidated"] = True
-                elif (
-                    sweep.opposite is not None
-                    and index > sweep.index
-                    and previous_close >= sweep.opposite.price
-                    and price < sweep.opposite.price
-                ):
-                    events["setup"] = self._make_setup("SHORT", bar, index, sweep)
-            else:
-                sweep.extreme = min(sweep.extreme, low)
-                if price < previous_extreme or waited > self.sweep_max_wait:
-                    self.sweeps[side] = None
-                    self.invalidated += 1
-                    events["invalidated"] = True
-                elif (
-                    sweep.opposite is not None
-                    and index > sweep.index
-                    and previous_close <= sweep.opposite.price
-                    and price > sweep.opposite.price
-                ):
-                    events["setup"] = self._make_setup("LONG", bar, index, sweep)
+                    continue
+                crossed = (
+                    index > sweep.index
+                    and (
+                        (side == "high" and previous_close >= sweep.opposite.price and price < sweep.opposite.price)
+                        or (side == "low" and previous_close <= sweep.opposite.price and price > sweep.opposite.price)
+                    )
+                )
+                if crossed:
+                    broken.append(sweep)
+                else:
+                    survivors.append(sweep)
 
+            self._candidates[side] = survivors
+            if broken:
+                # If one displacement crosses several old endpoints, the latest
+                # completed leg is the active structure. Every crossed endpoint
+                # is consumed, but only that paired leg becomes the setup.
+                chosen = max(broken, key=lambda row: row.opposite.index if row.opposite else -1)
+                for row in broken:
+                    if row.opposite is not None:
+                        row.opposite.swept = True
+                if events["setup"] is None:
+                    events["setup"] = self._make_setup(
+                        "SHORT" if side == "high" else "LONG", bar, index, chosen
+                    )
+
+        self._sync_sweeps()
         self._expire(index)
         self.events = events
         return events
 
-    def _sweepable(self, side: str, high: float, low: float, index: int) -> Level | None:
-        """The nearest still-intact level of ``side`` that this bar poked through."""
-        for level in reversed(self.levels):
-            if level.side != side or level.swept:
-                continue
-            if index - level.index > self.level_max_age:
-                continue
-            if side == "high" and high > level.price:
-                return level
-            if side == "low" and low < level.price:
-                return level
-        return None
+    def _completed_legs(self, side: str, index: int) -> list[tuple[Level, Level]]:
+        """Completed, intact legs whose boundary on ``side`` can be swept.
 
-    def _opposite_level(self, side: str, sweep_price: float) -> Level | None:
-        """The swing on the other side that has to break for a reversal.
-
-        The most recent intact swing of that side on the far side of the sweep:
-        a low below the swept high for a short, a high above the swept low for a
-        long.
+        The endpoint chooses its nearest preceding opposite pivot. This is the
+        missing relation in the old detector: price alone ("some low below this
+        high") cannot say that two pivots belong to one leg.
         """
-        for level in reversed(self.levels):
-            if level.side != side or level.swept:
+        levels = list(self.levels)
+        endpoint_side = "low" if side == "high" else "high"
+        pairs: list[tuple[Level, Level]] = []
+        for pos, endpoint in enumerate(levels):
+            if endpoint.side != endpoint_side or endpoint.swept:
                 continue
-            if side == "low" and level.price < sweep_price:
-                return level
-            if side == "high" and level.price > sweep_price:
-                return level
-        return None
+            if index <= endpoint.index or index - endpoint.index > self.level_max_age:
+                continue
+            boundary = next(
+                (level for level in reversed(levels[:pos]) if level.side == side),
+                None,
+            )
+            if boundary is None or boundary.swept:
+                continue
+            if index - boundary.index > self.level_max_age:
+                continue
+            if side == "high" and boundary.price <= endpoint.price:
+                continue
+            if side == "low" and boundary.price >= endpoint.price:
+                continue
+            pairs.append((boundary, endpoint))
+        return pairs
+
+    def _sync_sweeps(self) -> None:
+        """Expose the latest active paired candidate on each side to the UI."""
+        for side in SIDES:
+            values = self._candidates[side]
+            self.sweeps[side] = max(
+                values,
+                key=lambda row: (row.index, row.opposite.index if row.opposite else -1),
+                default=None,
+            )
 
     def _expire(self, index: int) -> None:
         while self.levels and index - self.levels[0].index > self.level_max_age:
@@ -431,7 +498,15 @@ class Structure:
         self.setups += 1
         if sweep.opposite is not None:
             sweep.opposite.swept = True  # that liquidity is spent - no double trade
-        self.sweeps[sweep.side] = None  # one setup per sweep
+            # A break candle can also wick through this endpoint and momentarily
+            # look like a sweep in the other direction. Once it is the confirmed
+            # break of this setup, no candidate may reuse it as either endpoint.
+            for candidate_side in SIDES:
+                self._candidates[candidate_side] = [
+                    row for row in self._candidates[candidate_side]
+                    if row.boundary is not sweep.opposite and row.opposite is not sweep.opposite
+                ]
+        self.sweeps[sweep.side] = None  # refreshed from remaining candidates below
         return setup
 
     # ----------------------------------------------------------------- view

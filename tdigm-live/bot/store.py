@@ -205,7 +205,7 @@ class SignalStore:
             assert self._db is not None
             try:
                 existing = self._db.execute(
-                    "SELECT state, closed_ms FROM signals WHERE key = ?", (row["key"],)
+                    "SELECT state, closed_ms, payload FROM signals WHERE key = ?", (row["key"],)
                 ).fetchone()
                 if existing is None:
                     cols = ", ".join(COLUMNS)
@@ -225,9 +225,30 @@ class SignalStore:
                         if k not in ("first_seen", "created_ms")
                     }
                     if final:
-                        # keep the row exactly as it was decided - including the
-                        # JSON the page reads back
-                        for key in ("state", "valid", "closed_ms", "r_now", "target", "stop", "payload"):
+                        # The outcome is write-once, but a deeper re-scan may
+                        # correct immutable structural evidence (for example the
+                        # swept endpoint of the paired leg). Merge that evidence
+                        # into JSON while retaining the decided lifecycle.
+                        try:
+                            old_payload = json.loads(existing["payload"] or "{}")
+                            new_payload = json.loads(row["payload"] or "{}")
+                        except json.JSONDecodeError:
+                            old_payload, new_payload = {}, {}
+                        for key in (
+                            "state", "valid", "mitigated", "closed_ms", "state_since",
+                            "touched_ms", "bars", "r_now", "last_price", "be_ms",
+                            "entry", "stop", "stop0", "target", "target_2r", "rr",
+                            "zone", "breakeven_at_r", "chain_valid", "chain_errors",
+                            "integrity_checked_ms", "invalid_reason",
+                        ):
+                            if key in old_payload:
+                                new_payload[key] = old_payload[key]
+                        updates["payload"] = json.dumps(new_payload, ensure_ascii=False, default=str)
+                        for key in (
+                            "state", "valid", "mitigated", "closed_ms", "state_since",
+                            "touched_ms", "bars", "r_now", "entry", "target", "stop",
+                            "rr", "zone",
+                        ):
                             updates.pop(key, None)
                     sets = ", ".join(f"{k} = ?" for k in updates)
                     self._db.execute(
