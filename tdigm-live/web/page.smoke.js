@@ -51,11 +51,15 @@ async function main() {
   const dom = new JSDOM(html, { url: BASE + "/", pretendToBeVisual: true, runScripts: "outside-only" });
   const { window } = dom;
   const doc = window.document;
+  // A reload must restore the operator's view rather than silently resetting it.
+  window.localStorage.setItem("tdigm.ui.preferences.v2", JSON.stringify({
+    filters: { search: "", side: "both", state: "all", sort: "symbol", tfs: [], grades: [], sessions: [] },
+  }));
 
   // jsdom has no canvas; the page must survive a chart it cannot draw
   window.HTMLCanvasElement.prototype.getContext = () => ({
     setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
-    fill() {}, fillRect() {}, arc() {}, closePath() {}, setLineDash() {}, fillText() {},
+    fill() {}, fillRect() {}, strokeRect() {}, arc() {}, closePath() {}, setLineDash() {}, fillText() {},
     save() {}, restore() {}, measureText: () => ({ width: 10 }),
     set font(v) {}, set fillStyle(v) {}, set strokeStyle(v) {}, set lineWidth(v) {},
     set textBaseline(v) {},
@@ -81,6 +85,16 @@ async function main() {
 
   const rows = doc.querySelectorAll("#rows tr").length;
   if (!rows) throw new Error("the table is empty after boot - the archive never reached the page");
+  if (doc.getElementById("sort-select").value !== "symbol") {
+    throw new Error("saved page settings were reset during reload");
+  }
+  const sort = doc.getElementById("sort-select");
+  sort.value = "rr";
+  sort.dispatchEvent(new window.Event("change", { bubbles: true }));
+  const savedPrefs = JSON.parse(window.localStorage.getItem("tdigm.ui.preferences.v2") || "{}");
+  if (!savedPrefs.filters || savedPrefs.filters.sort !== "rr") {
+    throw new Error("a changed page setting was not persisted");
+  }
 
   const ws = sockets[sockets.length - 1];
   const snapshot = await (await fetch(BASE + "/api/state")).json();

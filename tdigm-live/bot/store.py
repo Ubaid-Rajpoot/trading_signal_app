@@ -244,7 +244,63 @@ class SignalStore:
     def record_many(self, payloads: Iterable[dict], market: str = "futures") -> int:
         return sum(1 for payload in payloads if self.record(payload, market))
 
+    def quarantine(self, key: str, problems: list[str]) -> bool:
+        """Mark an archive row non-tradeable without deleting its audit trail.
+
+        This is intentionally separate from ``record``: a structurally invalid
+        historical row must be quarantined even when its old lifecycle happened
+        to reach a final state.  Its original fields stay in JSON alongside the
+        integrity explanation, so the bad row remains inspectable.
+        """
+        if not self.enabled or self._db is None or not key:
+            return False
+        with self._lock:
+            try:
+                row = self._db.execute("SELECT payload FROM signals WHERE key = ?", (key,)).fetchone()
+                if row is None:
+                    return False
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {"key": key}
+                payload.update(
+                    {
+                        "valid": False,
+                        "state": "invalidated",
+                        "chain_valid": False,
+                        "chain_errors": list(problems),
+                    }
+                )
+                self._db.execute(
+                    "UPDATE signals SET valid = 0, state = 'invalidated', payload = ?, last_seen = ? WHERE key = ?",
+                    (json.dumps(payload, ensure_ascii=False, default=str), int(time.time() * 1000), key),
+                )
+                self._db.commit()
+                return True
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return False
+
     # ------------------------------------------------------------- reading
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Read one complete immutable signal payload by its archive key."""
+        if not self.enabled or self._db is None or not key:
+            return None
+        with self._lock:
+            try:
+                row = self._db.execute("SELECT payload FROM signals WHERE key = ?", (key,)).fetchone()
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return None
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        payload["stored"] = True
+        return payload
+
     def list(
         self,
         limit: int = 200,
@@ -290,7 +346,7 @@ class SignalStore:
             args.append(int(since))
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         sql = f"SELECT payload FROM signals{clause} ORDER BY created_ms DESC LIMIT ?"
-        args.append(max(1, min(2000, int(limit))))
+        args.append(max(1, min(50000, int(limit))))
         with self._lock:
             try:
                 rows = self._db.execute(sql, tuple(args)).fetchall()

@@ -140,20 +140,28 @@
     </div>
   </section>
 
-  <section class="chart-pane">
+  <section class="chart-pane" id="chart-panel">
     <div class="chart-head">
       <div>
         <h2 id="chart-title">chart</h2>
         <div class="muted small" id="chart-sub">pick a signal on the left</div>
+        <div class="chart-audit" id="chart-audit">select a setup</div>
       </div>
       <div class="chart-head-right">
         <span class="muted small" id="chart-tf"></span>
-        <button class="ghost" id="btn-refresh-chart" title="reload this chart">↻</button>
+        <div class="chart-tools" aria-label="chart controls">
+          <button class="ghost" id="btn-chart-in" title="zoom in">+</button>
+          <button class="ghost" id="btn-chart-out" title="zoom out">−</button>
+          <button class="ghost" id="btn-chart-reset" title="return to the selected setup">setup</button>
+          <button class="ghost" id="btn-chart-full" title="full screen">⛶</button>
+          <button class="ghost" id="btn-refresh-chart" title="reload setup history">↻</button>
+        </div>
       </div>
     </div>
     <div class="canvas-wrap">
-      <canvas id="chart"></canvas>
-      <div class="chart-hint" id="chart-hint">The swept level, body break, TDIGM centre-band HVB, entry, stop and draw are shown here.</div>
+      <canvas id="chart" title="drag to pan · wheel to zoom · drag the price axis to scale · double-click to reset"></canvas>
+      <div class="chart-ohlc" id="chart-ohlc"></div>
+      <div class="chart-hint" id="chart-hint">The setup-centred chart marks the H/L sweep, opposite body break and same-candle TDIGM HVB.</div>
     </div>
     <div class="story" id="story"></div>
   </section>

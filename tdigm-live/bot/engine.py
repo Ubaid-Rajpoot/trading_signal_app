@@ -21,6 +21,7 @@ universe of instruments would otherwise melt the process.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -49,6 +50,90 @@ from .structure import Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
+
+
+def sweep_chain_errors(payload: dict[str, Any], *, require_hvb: bool = True) -> list[str]:
+    """Return hard integrity failures for a TDIGM sweep signal.
+
+    Filters decide whether a *valid chain* is tradeable.  This function protects
+    the more fundamental invariant at the publication/database boundary:
+
+        H/L sweep -> later opposite body close -> same-candle directed HVB
+
+    Old archive rows did not retain the sweep candle OHLC, so they can still be
+    checked for identity and event ordering.  New rows carry OHLC and are also
+    checked mathematically against the swept level.
+    """
+    if str(payload.get("strategy") or "").lower() == "book":
+        return []
+    raw_setup = payload.get("setup") or {}
+    setup = raw_setup if isinstance(raw_setup, dict) else {}
+
+    def as_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    side = str(payload.get("side") or setup.get("side") or "").upper()
+    swept_side = str(setup.get("swept_side") or payload.get("swept_side") or "").lower()
+    swept_level = setup.get("swept_level", payload.get("swept_level"))
+    sweep_ms = as_int(setup.get("sweep_time") or payload.get("sweep_ms"))
+    break_ms = as_int(setup.get("break_time") or payload.get("created_ms") or payload.get("time"))
+    broke_level = setup.get("broke_level", payload.get("bos_level"))
+    hvb = str(payload.get("hvb") or payload.get("hvb_side") or "").lower()
+    hvb_ms = as_int(payload.get("hvb_ms") or payload.get("created_ms") or payload.get("time"))
+    lag = payload.get("hvb_lag")
+    errors: list[str] = []
+
+    if side not in {"LONG", "SHORT"}:
+        errors.append("signal side is missing")
+    expected_sweep = "low" if side == "LONG" else "high"
+    if swept_side != expected_sweep:
+        errors.append(f"{side or 'signal'} requires a preceding {expected_sweep} sweep")
+    try:
+        level = float(swept_level)
+    except (TypeError, ValueError):
+        level = 0.0
+    if not math.isfinite(level) or level <= 0:
+        errors.append("swept level is missing")
+    if sweep_ms <= 0:
+        errors.append("sweep time is missing")
+    if break_ms <= sweep_ms:
+        errors.append("sweep must precede the body-break candle")
+    try:
+        body_level = float(broke_level)
+    except (TypeError, ValueError):
+        body_level = 0.0
+    if not math.isfinite(body_level) or body_level <= 0:
+        errors.append("opposite body-break level is missing")
+
+    expected_hvb = "up" if side == "LONG" else "down"
+    if require_hvb:
+        if hvb != expected_hvb:
+            errors.append(f"{side or 'signal'} requires a same-candle {expected_hvb} HVB")
+        if hvb_ms != break_ms:
+            errors.append("HVB and body break are not on the same candle")
+        if lag not in (None, 0, "0"):
+            errors.append("HVB lag is not zero")
+
+    # Strong proof on rows produced by this version.  Legacy rows remain
+    # inspectable through their timestamps/level instead of being destroyed.
+    sweep_high = setup.get("sweep_high", payload.get("sweep_high"))
+    sweep_low = setup.get("sweep_low", payload.get("sweep_low"))
+    if swept_side == "high" and sweep_high is not None:
+        try:
+            if float(sweep_high) <= level:
+                errors.append("sweep candle high did not take the swept high")
+        except (TypeError, ValueError):
+            errors.append("sweep candle high is invalid")
+    if swept_side == "low" and sweep_low is not None:
+        try:
+            if float(sweep_low) >= level:
+                errors.append("sweep candle low did not take the swept low")
+        except (TypeError, ValueError):
+            errors.append("sweep candle low is invalid")
+    return list(dict.fromkeys(errors))
 
 
 @dataclass
@@ -256,6 +341,9 @@ class Engine:
         self._warm_locks: dict[str, asyncio.Lock] = {}
         self._last_stream_open: dict[str, int] = {}
         self.store: SignalStore | None = None
+        self.integrity_checked = 0
+        self.integrity_quarantined = 0
+        self.integrity_problems: dict[str, list[str]] = {}
         self.market = "futures"
         # ---- which decision engine runs (TDIGM sweep checklist by default)
         self.strategy = "book" if str(strategy).lower() in {"book", "narrative", "v6"} else "sweep"
@@ -411,16 +499,38 @@ class Engine:
         """
         if self.store is None or not self.store.enabled:
             return 0
+        # Audit the complete archive, not merely the rows that fit on the first
+        # page.  This answers whether a missing sweep is systemic and prevents a
+        # malformed legacy row from remaining tradeable just because it is old.
+        audit_rows = self.store.list(limit=50_000)
+        audited: dict[str, list[str]] = {}
+        require_hvb = bool(self.filters.config.get("hvb", True))
+        for row in audit_rows:
+            key = str(row.get("key") or "")
+            if not key:
+                continue
+            errors = sweep_chain_errors(row, require_hvb=require_hvb)
+            audited[key] = errors
+            self.integrity_checked += 1
+            if not errors:
+                continue
+            self.integrity_quarantined += 1
+            if len(self.integrity_problems) < 5000:
+                self.integrity_problems[key] = errors
+            self.store.quarantine(key, errors)
+
         recent = self.store.list(limit=limit)
         # A still-valid setup may be older than the newest archive page. Always
         # restore valid rows too so restart cannot turn "unmitigated" into a
         # stale JSON row that never receives another candle.
-        valid = self.store.list(limit=limit, valid=1)
+        valid = self.store.list(limit=50_000, valid=1)
         rows = list({row.get("key"): row for row in [*recent, *valid] if row.get("key")}.values())
         for row in rows:
             key = row.get("key")
             if not key or key in self.setup_payloads:
                 continue
+            errors = audited.get(str(key), sweep_chain_errors(row, require_hvb=require_hvb))
+            row.update({"chain_valid": not errors, "chain_errors": errors})
             self.setup_payloads[key] = row
             self._restore_stored_record(row)
         return len(rows)
@@ -1263,6 +1373,19 @@ class Engine:
 
     async def _publish(self, cell: Cell, alert: dict, bar: dict) -> None:
         kind = alert["kind"]
+        if kind == "signal" and self.strategy == "sweep":
+            errors = sweep_chain_errors(
+                alert, require_hvb=bool(self.filters.config.get("hvb", True))
+            )
+            if errors:
+                reason = "integrity: " + "; ".join(errors)
+                self.filters.rejections[reason] = self.filters.rejections.get(reason, 0) + 1
+                if not self._quiet:
+                    await self._emit(
+                        {"type": "filtered", "alert": {**alert, "filtered": errors, "chain_valid": False}}
+                    )
+                return
+            alert = {**alert, "chain_valid": True, "chain_errors": []}
         key = (cell.symbol, cell.timeframe, int(bar["close_time"]), kind)
         if key in self.seen:
             return
@@ -1389,7 +1512,7 @@ class Engine:
             swept_side=str(setup.get("swept_side") or ""),
             sweep_ms=int(setup.get("sweep_time") or 0),
             bos_level=float(setup.get("broke_level") or 0.0),
-            bos_ms=int(setup.get("broke_time") or 0),
+            bos_ms=int(setup.get("break_time") or alert.get("time") or 0),
             break_kind=str(setup.get("break_kind") or "SHIFT"),
             hvb_ms=int(alert["time"]) if alert.get("hvb") else None,
             hvb_side=alert.get("hvb"),
@@ -1413,8 +1536,11 @@ class Engine:
         # one object, so the feed, the card and the API cannot disagree
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
         payload["kind"] = "signal"
+        payload["strategy"] = "sweep"
         payload["key"] = key
         payload["setup"] = setup
+        payload["chain_valid"] = True
+        payload["chain_errors"] = []
         self.setup_payloads[key] = payload
         self._remember(payload)
         return payload
@@ -1491,45 +1617,127 @@ class Engine:
             counts[row["state"]] = counts.get(row["state"], 0) + 1
         return counts
 
-    def chart(self, symbol: str, timeframe: str, bars: int = 180) -> dict:
-        """Candles plus every marker the setup is made of, for one cell."""
+    async def chart_history(
+        self,
+        feed,
+        symbol: str,
+        timeframe: str,
+        *,
+        bars: int = 600,
+        at: int = 0,
+    ) -> list[dict]:
+        """Fetch an audit window centred on an old setup instead of on today.
+
+        A 1d signal from January cannot be audited with the cell's latest 180
+        candles in November.  Exchange history is therefore requested with an
+        explicit end time after the setup, leaving ample pre-sweep context and a
+        smaller amount of post-signal lifecycle context.  Unsupported MEXC 3m
+        and 2h windows are rebuilt from their canonical lower timeframe.
+        """
+        symbol = symbol.upper()
+        if timeframe not in TIMEFRAMES or not hasattr(feed, "history"):
+            return []
+        wanted = max(80, min(1000, int(bars)))
+        step = TIMEFRAMES[timeframe]
+        focus = max(0, int(at))
+        after = max(20, min(80, wanted // 4))
+        end_time = focus + after * step if focus else None
+        interval = feed.exchange_interval(timeframe) if hasattr(feed, "exchange_interval") else timeframe
+
+        async def fetch(name: str, limit: int) -> list[dict]:
+            try:
+                return await feed.history(symbol, name, limit, end_time=end_time) or []
+            except TypeError:
+                # A small third-party/test feed may still implement the older
+                # signature. It can provide latest data, just not time travel.
+                return await feed.history(symbol, name, limit) or []
+
+        if interval is not None:
+            return (await fetch(interval, wanted))[-wanted:]
+
+        source = "1m" if timeframe == "3m" else "1h" if timeframe == "2h" else None
+        if source is None:
+            return []
+        ratio = max(1, TIMEFRAMES[timeframe] // TIMEFRAMES[source])
+        raw = await fetch(source, wanted * ratio + ratio)
+        rollup = Rollup(timeframe)
+        out: list[dict] = []
+        for candle in raw:
+            out.extend(rollup.add(candle))
+        # Rollup only emits when the next bucket starts. Flush solely when the
+        # source bars prove that the final target bucket is actually complete.
+        if rollup.start is not None and raw:
+            target_end = int(rollup.start) + TIMEFRAMES[timeframe] - 1
+            if int(raw[-1].get("close_time") or 0) >= target_end:
+                out.extend(rollup.flush())
+        return out[-wanted:]
+
+    def chart(
+        self,
+        symbol: str,
+        timeframe: str,
+        bars: int = 180,
+        *,
+        candles_override: list[dict] | None = None,
+        selected: dict | None = None,
+    ) -> dict:
+        """Candles and an explicit, auditable sweep -> break -> HVB chain."""
         cell = self.cells.get((symbol.upper(), timeframe))
         if cell is None:
             return {"symbol": symbol, "timeframe": timeframe, "candles": [], "setups": []}
-        candles = list(cell.candles)[-max(20, min(400, bars)):]
+        limit = max(20, min(1000, bars))
+        candles = list(candles_override if candles_override is not None else cell.candles)[-limit:]
         first = int(candles[0]["open_time"]) if candles else 0
+        last = int(candles[-1]["close_time"]) if candles else 0
         rows = []
         for bar in candles:
             rows.append(
                 {
                     "t": int(bar["open_time"]),
+                    "ct": int(bar["close_time"]),
                     "o": bar["open"],
                     "h": bar["high"],
                     "l": bar["low"],
                     "c": bar["close"],
                     "v": bar.get("volume"),
+                    "closed": bar.get("closed", True),
                 }
             )
         setups = [
             row
             for row in self.setup_payloads.values()
             if row["symbol"] == symbol.upper() and row["timeframe"] == timeframe
-            and row["created_ms"] >= first
+            and first <= int(row["created_ms"]) <= last
         ]
-        setups.sort(key=lambda row: row["created_ms"])
+        if selected is not None and not any(row.get("key") == selected.get("key") for row in setups):
+            setups.append(selected)
+        setups.sort(key=lambda row: int(row.get("created_ms") or 0))
+        selected_row = selected or (setups[-1] if setups else None)
+        chain_errors = sweep_chain_errors(
+            selected_row, require_hvb=bool(self.filters.config.get("hvb", True))
+        ) if selected_row else []
+        if selected_row is not None:
+            selected_row = {**selected_row, "chain_valid": not chain_errors, "chain_errors": chain_errors}
         markers = self._markers(cell, candles, first)
+        focus_ms = int((selected_row or {}).get("created_ms") or 0)
+        focus_index = next(
+            (i for i, bar in enumerate(candles) if int(bar.get("close_time") or 0) >= focus_ms),
+            max(0, len(candles) - 1),
+        ) if candles else 0
         return {
             "symbol": symbol.upper(),
             "timeframe": timeframe,
             "candles": rows,
             "markers": markers,
             "setups": setups,
+            "selected": selected_row,
+            "focus_index": focus_index,
             "pools": self._chart_pools(symbol.upper()),
             "book": self._book_state(symbol.upper(), timeframe),
             "structure": cell.structure.as_dict(),
             "trend": cell.tmap_state or {},
             "warm": len(cell.candles) >= 120,
-            "bars": len(cell.candles),
+            "bars": len(candles),
         }
 
     # ----------------------------------------------------------- book drawing

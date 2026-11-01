@@ -51,6 +51,7 @@ def client(tmp_path):
     with TestClient(app) as test_client:
         test_client.config_path = config_path  # type: ignore[attr-defined]
         test_client.feed = feed  # type: ignore[attr-defined]
+        test_client.engine = engine  # type: ignore[attr-defined]
         yield test_client
 
 
@@ -66,6 +67,39 @@ def test_the_page_is_served(client):
     assert response.status_code == 200
     assert "TDIGM" in response.text
     assert "http" not in response.text.split("<script")[0].split("viewport")[0]  # no external assets
+
+
+def test_selected_chart_is_anchored_by_archive_key_and_exposes_the_chain(client):
+    created = 1_735_690_200_000
+    key = f"BTCUSDT|5m|{created}"
+    payload = {
+        "key": key, "kind": "signal", "strategy": "sweep", "symbol": "BTCUSDT",
+        "timeframe": "5m", "side": "SHORT", "created_ms": created, "time": created,
+        "state": "pending", "valid": True, "entry": 98.0, "stop": 102.0, "target": 90.0,
+        "swept_side": "high", "swept_level": 101.0, "sweep_ms": created - 300_000,
+        "bos_level": 99.0, "bos_ms": created, "hvb_side": "down", "hvb_ms": created,
+        "hvb_lag": 0,
+        "setup": {"side": "SHORT", "swept_side": "high", "swept_level": 101.0,
+                  "sweep_time": created - 300_000, "sweep_high": 102.0,
+                  "broke_level": 99.0, "break_time": created},
+    }
+    client.engine.store.record(payload)  # type: ignore[attr-defined]
+    body = client.get(
+        "/api/chart", params={"symbol": "BTCUSDT", "timeframe": "5m", "key": key, "at": created}
+    ).json()
+    assert body["selected"]["key"] == key
+    assert body["selected"]["chain_valid"] is True
+    assert body["focus_index"] >= 0
+
+
+def test_page_has_bounded_signal_scrolling_and_smc_style_chart_controls(client):
+    page = client.get("/").text
+    css = client.get("/app.css").text
+    script = client.get("/app.js").text
+    assert all(name in page for name in ("btn-chart-in", "btn-chart-out", "btn-chart-reset", "chart-audit"))
+    assert "min-height: 0" in css and "overscroll-behavior: contain" in css
+    assert "tdigm.ui.preferences.v2" in script and "savePreferences" in script
+    assert "BODY BREAK + HVB" in script and "HIGH SWEEP" in script
 
 
 def test_adding_a_symbol_writes_the_config_file(client):

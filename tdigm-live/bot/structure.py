@@ -81,7 +81,13 @@ class Level:
 
 @dataclass
 class Sweep:
-    """A liquidity level that price poked through."""
+    """A liquidity level that price poked through.
+
+    The sweep candle's immutable OHLC is retained with the event.  Besides
+    making the chart auditable months later, this lets the publication boundary
+    prove ``high > swept high`` / ``low < swept low`` instead of trusting that a
+    loosely shaped payload happened to contain a timestamp called ``sweep``.
+    """
 
     side: str  # which liquidity was taken: "high" or "low"
     level: float
@@ -89,6 +95,10 @@ class Sweep:
     time: int
     extreme: float  # the furthest the sweep went (the stop goes just beyond)
     opposite: Level | None = None  # the level that must break to confirm
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +106,10 @@ class Sweep:
             "level": self.level,
             "time": self.time,
             "extreme": self.extreme,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
             "opposite": self.opposite.as_dict() if self.opposite else None,
         }
 
@@ -126,8 +140,15 @@ class Setup:
             "swept_level": self.sweep.level,
             "sweep_time": self.sweep.time,
             "sweep_extreme": self.sweep.extreme,
+            "sweep_open": self.sweep.open,
+            "sweep_high": self.sweep.high,
+            "sweep_low": self.sweep.low,
+            "sweep_close": self.sweep.close,
             "broke_level": self.broke.price,
-            "broke_time": self.broke.time,
+            # The level's own time is useful context, but it is not the break
+            # event.  ``break_time`` is the body-close/HVB candle itself.
+            "broke_level_time": self.broke.time,
+            "break_time": self.time,
             "break_kind": self.break_kind,
             "bars_since_sweep": self.index - self.sweep.index,
         }
@@ -278,6 +299,10 @@ class Structure:
                 time=int(self.times[-1]),
                 extreme=high if side == "high" else low,
                 opposite=self._opposite_level("low" if side == "high" else "high", level.price),
+                open=float(bar["open"]),
+                high=high,
+                low=low,
+                close=price,
             )
             level.swept = True
             self.sweeps[side] = sweep

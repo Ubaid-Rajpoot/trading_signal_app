@@ -45,7 +45,17 @@ PAYLOAD = {
     "hvb_lag": 0,
     "break_kind": "MS",
     "swept_level": 104.0,
+    "swept_side": "high",
+    "sweep_ms": 1_699_996_400_000,
     "bos_level": 98.0,
+    "bos_ms": 1_700_000_000_000,
+    "hvb_ms": 1_700_000_000_000,
+    "strategy": "sweep",
+    "setup": {
+        "side": "SHORT", "swept_side": "high", "swept_level": 104.0,
+        "sweep_time": 1_699_996_400_000, "sweep_high": 105.0, "sweep_low": 99.0,
+        "broke_level": 98.0, "break_time": 1_700_000_000_000,
+    },
     "volume_ratio": 1.8,
     "trend_dir": -1,
     "trend_clean": True,
@@ -76,6 +86,17 @@ def test_a_setup_is_written_then_kept_up_to_date(tmp_path):
     assert rows[0]["state"] == "active" and rows[0]["mitigated"] is True
     assert store.counts()["total"] == 1
     assert store.counts()["valid"] == 1 and store.counts()["unmitigated"] == 0
+
+
+def test_one_signal_can_be_loaded_and_quarantined_without_deletion(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    store.record(PAYLOAD)
+    assert store.get(PAYLOAD["key"])["setup"]["sweep_high"] == 105.0
+    assert store.quarantine(PAYLOAD["key"], ["sweep time is missing"])
+    row = store.get(PAYLOAD["key"])
+    assert row["valid"] is False and row["state"] == "invalidated"
+    assert row["chain_errors"] == ["sweep time is missing"]
+    assert store.counts()["total"] == 1, "an integrity failure is retained for audit, not deleted"
 
 
 def test_a_decided_outcome_is_final(tmp_path):
@@ -168,6 +189,28 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     fresh._track_setups(cell, {"open": 103, "high": 105, "low": 102, "close": 104,
                                "close_time": PAYLOAD["created_ms"] + 3_600_000})
     assert fresh.setup_payloads[PAYLOAD["key"]]["state"] == "invalidated"
+
+
+def test_startup_audits_and_quarantines_a_legacy_signal_without_a_sweep(tmp_path):
+    path = tmp_path / "sig.sqlite3"
+    store = SignalStore(path)
+    bad = {**PAYLOAD, "key": "XRPUSDT|1d|1769644800000", "symbol": "XRPUSDT",
+           "timeframe": "1d", "sweep_ms": 0,
+           "setup": {"side": "SHORT", "swept_side": "high", "swept_level": 2.0,
+                     "broke_level": 1.8, "break_time": 1_769_644_800_000}}
+    store.record(bad)
+    engine = Engine(
+        symbols=["XRPUSDT"], timeframes=["1d"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(bad["key"])
+    assert engine.integrity_checked == 1 and engine.integrity_quarantined == 1
+    assert row["valid"] is False and row["state"] == "invalidated"
+    assert any("sweep time" in reason for reason in row["chain_errors"])
+    assert bad["key"] not in engine.registry
 
 
 def test_the_record_carries_an_honest_error_bar(tmp_path):

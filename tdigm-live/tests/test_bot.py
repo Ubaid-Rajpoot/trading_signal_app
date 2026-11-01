@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot.buckets import Rollup, bucket_start  # noqa: E402
-from bot.engine import Engine  # noqa: E402
+from bot.engine import Engine, sweep_chain_errors  # noqa: E402
 from bot.indicators import break_signal, centre_of, hvb_signal, rsi, sma, stdev, tdi  # noqa: E402
 
 
@@ -286,6 +286,45 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     assert setup.stop == 108.0, "the stop is just beyond the sweep extreme"
     assert setup.broke.price == 95.0, "the opposite swing low is what broke"
     assert setup.target is None, "no pre-sweep liquidity was left below the entry"
+    proof = setup.as_dict()
+    assert proof["sweep_time"] < proof["break_time"]
+    assert proof["sweep_high"] > proof["swept_level"]
+    assert proof["sweep_low"] == 101.0
+
+
+def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
+    valid = {
+        "kind": "signal", "side": "SHORT", "time": 20_000, "hvb": "down", "hvb_lag": 0,
+        "setup": {
+            "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
+            "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
+            "broke_level": 95.0, "break_time": 20_000,
+        },
+    }
+    assert sweep_chain_errors(valid) == []
+
+    missing = {**valid, "setup": {**valid["setup"], "sweep_time": 0}}
+    assert any("sweep time" in reason for reason in sweep_chain_errors(missing))
+    wrong_hvb = {**valid, "hvb": "up"}
+    assert any("down HVB" in reason for reason in sweep_chain_errors(wrong_hvb))
+    fake_wick = {**valid, "setup": {**valid["setup"], "sweep_high": 106.9}}
+    assert any("did not take" in reason for reason in sweep_chain_errors(fake_wick))
+
+
+@pytest.mark.asyncio
+async def test_publication_boundary_refuses_an_hvb_and_break_without_a_sweep():
+    engine = make_engine(hvb=True)
+    cell = engine.cells[("BTCUSDT", "5m")]
+    candle = bar(20_000, 95.0, high=100.0, low=94.0)
+    candle["timeframe"] = "5m"
+    malformed = {
+        "kind": "signal", "symbol": "BTCUSDT", "timeframe": "5m",
+        "side": "SHORT", "time": candle["close_time"], "hvb": "down", "hvb_lag": 0,
+        "setup": {"side": "SHORT", "broke_level": 96.0, "break_time": candle["close_time"]},
+    }
+    await engine._publish(cell, malformed, candle)
+    assert not engine.signals and not engine.setup_payloads
+    assert any("preceding high sweep" in reason for reason in engine.filters.rejections)
 
 
 def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
@@ -663,6 +702,56 @@ async def test_signal_carries_the_centre_band_and_a_chart_tail():
     assert alert["centre"] is not None
     assert len(alert["tdi_tail"]) >= 5
     assert all(len(pair) == 2 for pair in alert["tdi_tail"])
+
+
+@pytest.mark.asyncio
+async def test_old_signal_chart_is_fetched_around_the_setup_not_around_today():
+    focus = 1_769_644_800_000  # 2026-01-29 UTC
+    step = 86_400_000
+
+    class HistoricalFeed:
+        def __init__(self):
+            self.end_time = None
+
+        def exchange_interval(self, timeframe):
+            return timeframe
+
+        async def history(self, symbol, interval, limit=500, end_time=None):
+            self.end_time = end_time
+            start = end_time - limit * step
+            return [
+                {
+                    "symbol": symbol, "open_time": start + i * step,
+                    "close_time": start + (i + 1) * step - 1,
+                    "open": 2.0, "high": 2.1, "low": 1.9, "close": 2.0,
+                    "volume": 10.0, "closed": True,
+                }
+                for i in range(limit)
+            ]
+
+    engine = Engine(
+        symbols=["XRPUSDT"], timeframes=["1d"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    feed = HistoricalFeed()
+    candles = await engine.chart_history(feed, "XRPUSDT", "1d", bars=600, at=focus)
+    assert len(candles) == 600
+    assert feed.end_time > focus, "the window leaves post-signal context"
+    assert candles[0]["close_time"] < focus < candles[-1]["close_time"]
+
+    selected = {
+        "key": f"XRPUSDT|1d|{focus}", "symbol": "XRPUSDT", "timeframe": "1d",
+        "side": "SHORT", "created_ms": focus, "hvb_side": "down", "hvb_ms": focus,
+        "hvb_lag": 0, "swept_side": "high", "swept_level": 2.05,
+        "sweep_ms": focus - 3 * step, "bos_level": 1.95,
+        "setup": {"side": "SHORT", "swept_side": "high", "swept_level": 2.05,
+                  "sweep_time": focus - 3 * step, "sweep_high": 2.1,
+                  "broke_level": 1.95, "break_time": focus},
+    }
+    body = engine.chart("XRPUSDT", "1d", 600, candles_override=candles, selected=selected)
+    assert body["selected"]["chain_valid"] is True
+    assert 0 < body["focus_index"] < len(body["candles"]) - 1
 
 
 @pytest.mark.asyncio

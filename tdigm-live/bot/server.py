@@ -109,6 +109,7 @@ def create_app(
     warm_queue: asyncio.Queue[str] = asyncio.Queue()
     history_days = float(config.get("history_days", 0) or 0)
     rescan_state: dict[str, Any] = {"running": False, "result": None}
+    chart_cache: dict[tuple[str, str, int, int], tuple[float, list[dict]]] = {}
     warm_pending: set[str] = set()
 
     def queue_warm(symbols: list[str]) -> None:
@@ -296,6 +297,10 @@ def create_app(
             ),
             "candles_seen": engine.candles_seen,
             "signals": engine.kinds.get("signal", 0),
+            "integrity": {
+                "checked": engine.integrity_checked,
+                "quarantined": engine.integrity_quarantined,
+            },
             "symbols": len(engine.symbols),
             "timeframes": engine.timeframes,
             "notifications": notifier.counts(),
@@ -344,6 +349,19 @@ def create_app(
             "total": len(engine.setup_payloads),
             "market": getattr(feed, "market", "futures"),
             "strategy": engine.strategy,
+        }
+
+    @app.get("/api/integrity")
+    async def integrity(limit: int = 200) -> dict[str, Any]:
+        """Archive-chain audit: malformed rows are retained but never tradeable."""
+        rows = [
+            {"key": key, "errors": errors}
+            for key, errors in list(engine.integrity_problems.items())[:max(1, min(1000, limit))]
+        ]
+        return {
+            "checked": engine.integrity_checked,
+            "quarantined": engine.integrity_quarantined,
+            "problems": rows,
         }
 
     @app.get("/api/watch")
@@ -432,12 +450,60 @@ def create_app(
         )
 
     @app.get("/api/chart")
-    async def chart(symbol: str, timeframe: str, bars: int = 180) -> JSONResponse:
-        """Candles + the markers a setup is made of, for one instrument."""
-        return JSONResponse(
-            engine.chart(symbol, timeframe, bars),
-            headers={"Cache-Control": "no-store, max-age=0"},
+    async def chart(
+        symbol: str,
+        timeframe: str,
+        bars: int = 600,
+        key: str = "",
+        at: int = 0,
+        refresh: int = 0,
+    ) -> JSONResponse:
+        """TradingView-style audit window centred on the selected setup.
+
+        The old endpoint always returned the latest 180 bars. Selecting a valid
+        January daily setup in November therefore showed neither its sweep nor
+        its break, which looked exactly like a false signal. The archive key now
+        anchors exchange history around the event itself.
+        """
+        symbol = symbol.upper()
+        selected = (store.get(key) if key else None) or engine.setup_payloads.get(key)
+        if selected and (
+            str(selected.get("symbol") or "").upper() != symbol
+            or str(selected.get("timeframe") or "") != timeframe
+        ):
+            selected = None
+        focus = int((selected or {}).get("created_ms") or at or 0)
+        wanted = max(80, min(1000, int(bars)))
+        override: list[dict] | None = None
+        history_error: str | None = None
+        if focus:
+            cache_key = (symbol, timeframe, focus, wanted)
+            cached = chart_cache.get(cache_key)
+            if cached and not refresh and time.time() - cached[0] < 300:
+                override = cached[1]
+            else:
+                try:
+                    fetched = await engine.chart_history(
+                        feed, symbol, timeframe, bars=wanted, at=focus
+                    )
+                    if fetched:
+                        override = fetched
+                        chart_cache[cache_key] = (time.time(), fetched)
+                        if len(chart_cache) > 200:
+                            oldest = min(chart_cache, key=lambda item: chart_cache[item][0])
+                            chart_cache.pop(oldest, None)
+                except Exception as exc:
+                    history_error = f"{type(exc).__name__}: {exc}"
+        body = engine.chart(
+            symbol,
+            timeframe,
+            wanted,
+            candles_override=override,
+            selected=selected,
         )
+        body["history_error"] = history_error
+        body["historical_window"] = override is not None
+        return JSONResponse(body, headers={"Cache-Control": "no-store, max-age=0"})
 
     @app.post("/api/rescan")
     async def rescan(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:

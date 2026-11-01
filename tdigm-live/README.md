@@ -176,14 +176,18 @@ reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
   block — still valid), `active` (filled), then `win` / `stopped` / `expired` /
   `invalidated`. With the shipped `setup_max_bars: 0`, age alone never expires an
   untouched setup: it remains valid until mitigated or price invalidates it.
-* **Chart** on the right, drawn from real candles: every structure break (amber
-  `BOS`), every TDIGM HVB (purple dot), the **order block** (last opposite candle
-  before the displacement — the red box), the swept liquidity, entry, stop, 2R
-  and the structure target. Any matrix cell opens its chart.
-* **Filter bar** on top: symbol search, timeframe chips (1m … 1d), side, state,
-  sort, *valid only*, *HVB required*, and **↻ rescan** (re-read every
-  instrument's history with the current rules). The live default discovers all
-  active MEXC USDT perpetual contracts; `max_symbols: 2000` is only a safety cap.
+* **Setup-centred chart** on the right, drawn from real exchange candles. When
+  an old signal is selected the server fetches history around that signal—not
+  merely the latest 180 candles—so the swept H/L and break candle cannot vanish
+  off-screen. The sweep candle/level is amber, the entire setup window is
+  shaded, and the opposite body-break + same-candle HVB is outlined blue.
+  Entry/stop/target risk boxes, time/price axes, crosshair OHLC, drag-pan,
+  wheel/axis zoom, fullscreen and reset-to-setup match the SMC-Radar chart.
+* **Filters**: symbol search, timeframe chips (1m … 1d), side, grade, state and
+  sort. Browser preferences and the selected signal survive a reload via local
+  storage; strategy/filter/structure settings remain server-side in the atomic
+  `config.json`. The live default discovers all active MEXC USDT perpetual
+  contracts; `max_symbols: 2000` is only a safety cap.
 * **Futures only by default** — MEXC/Binance USDT-M perpetuals, not spot.
   `python run.py serve --market spot` if you ever want the other book.
 
@@ -203,7 +207,13 @@ life - `pending → active → win | stopped | expired`. A restart shows the arc
 **before a single candle arrives** and rehydrates every valid row into the live
 state machine, so later candles can mitigate or invalidate it. A decided outcome
 is never overwritten by a re-scan, and the numbers on the board (hit rate, R per decided trade, per grade)
-are computed from those rows rather than from memory:
+are computed from those rows rather than from memory.
+
+At startup the complete archive is integrity-checked for the mandatory chain
+`H/L sweep → later opposite body close → correctly directed same-candle HVB`.
+Malformed legacy rows are retained for audit but changed to `invalidated` and
+never rehydrated as tradeable. New signals also pass this check before they can
+reach SQLite. `/api/integrity` reports the checked and quarantined totals:
 
 > 107 setups recorded · 43 won · 54 stopped · hit rate 44% · +0.33R per decided trade
 

@@ -21,6 +21,28 @@
   var $ = function (id) { return document.getElementById(id); };
   var NF = window.TdigmNotify;
   var quiet = localStorage.getItem("tdigm.quiet") !== "0";
+  var PREFS_KEY = "tdigm.ui.preferences.v2";
+
+  function defaultFilters() {
+    return { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" };
+  }
+
+  function restoredPreferences() {
+    var raw = {};
+    try { raw = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}"); } catch (e) { raw = {}; }
+    var f = defaultFilters();
+    var saved = raw.filters || {};
+    f.search = typeof saved.search === "string" ? saved.search : "";
+    f.side = ["both", "long", "short"].indexOf(saved.side) >= 0 ? saved.side : "both";
+    f.state = typeof saved.state === "string" ? saved.state : "all";
+    f.sort = typeof saved.sort === "string" ? saved.sort : "new";
+    f.tfs = new Set(Array.isArray(saved.tfs) ? saved.tfs : []);
+    f.grades = new Set(Array.isArray(saved.grades) ? saved.grades : []);
+    f.sessions = new Set(Array.isArray(saved.sessions) ? saved.sessions : []);
+    return { filters: f, selected: typeof raw.selected === "string" ? raw.selected : null };
+  }
+
+  var restored = restoredPreferences();
 
   // ------------------------------------------------------------------ model
   var model = {
@@ -28,7 +50,8 @@
     live: new Set(),        // keys the engine currently holds
     order: [],              // keys, newest first (recomputed on render)
     selected: null,         // key
-    filters: { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" },
+    preferredSelected: restored.selected,
+    filters: restored.filters,
     state: null,            // last snapshot
     health: null,
     archive: {},
@@ -42,6 +65,19 @@
     chartTimer: 0,
     medianRr: null,
   };
+
+  function savePreferences() {
+    var f = model.filters;
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify({
+        selected: model.selected || model.preferredSelected || null,
+        filters: {
+          search: f.search, side: f.side, state: f.state, sort: f.sort,
+          tfs: Array.from(f.tfs), grades: Array.from(f.grades), sessions: Array.from(f.sessions),
+        },
+      }));
+    } catch (e) { /* private storage/full quota must never break the scanner */ }
+  }
 
   var queue = NF.createQueue({ minGapMs: quiet ? 60_000 : 8_000 });
   var toastQueue = queue;
@@ -103,9 +139,15 @@
       created_ms: Number(raw.created_ms || raw.time || 0),
       zone: raw.zone || null,
       swept_level: raw.swept_level,
+      swept_side: raw.swept_side,
+      sweep_ms: Number(raw.sweep_ms || (raw.setup || {}).sweep_time || 0),
       bos_level: raw.bos_level,
+      bos_ms: Number(raw.bos_ms || raw.created_ms || raw.time || 0),
       break_kind: raw.break_kind,
       hvb_side: raw.hvb_side,
+      hvb_ms: Number(raw.hvb_ms || raw.created_ms || raw.time || 0),
+      chain_valid: raw.chain_valid !== false,
+      chain_errors: raw.chain_errors || [],
       volume_ratio: raw.volume_ratio,
       reasons: raw.reasons || raw.confluences || [],
       evidence: raw.evidence || [],
@@ -234,6 +276,7 @@
       b.onclick = function () {
         if (set.has(value)) set.delete(value); else set.add(value);
         chipRow(host, values, set, label);
+        savePreferences();
         renderTable();
       };
       host.appendChild(b);
@@ -370,11 +413,22 @@
     if (!row) { host.innerHTML = ""; return; }
     var bits = [];
     var chain = [];
+    if (row.swept_level !== null && row.swept_level !== undefined) {
+      chain.push((row.swept_side === "low" ? "low sweep" : "high sweep") + " @ " + num(row.swept_level)
+        + (row.sweep_ms ? " [" + clock(row.sweep_ms) + "]" : ""));
+    }
+    if (row.bos_level !== null && row.bos_level !== undefined) {
+      chain.push("opposite body break @ " + num(row.bos_level) + " [" + clock(row.created_ms) + "]");
+    }
+    if (row.hvb_side) chain.push("same-candle HVB " + row.hvb_side);
     if (row.trap) chain.push("trap " + (row.trap.side || "") + " @ " + num(row.trap.level));
     if (row.ac) chain.push("imbalance " + num(row.ac.bottom) + "–" + num(row.ac.top));
     if (row.shift) chain.push("shift " + (row.shift.kind || "MS") + " @ " + num(row.shift.level));
     if (row.target) chain.push("draw @ " + num(row.target));
     if (chain.length) bits.push('<div class="chain">' + escapeHtml(chain.join("  →  ")) + "</div>");
+    if (row.chain_valid === false) {
+      bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
+    }
     var nums = [];
     ["entry", "stop", "target"].forEach(function (k) {
       if (row[k] !== null && row[k] !== undefined) nums.push(k + " <b>" + escapeHtml(num(row[k])) + "</b>");
@@ -488,8 +542,37 @@
   }
 
   // ------------------------------------------------------------------- chart
+  // The interaction model intentionally mirrors the chart in SMC-Radar:
+  // wheel zoom, drag pan, right-axis price scaling, crosshair/OHLC and empty
+  // right margin.  The selected setup—not today's candle—is the focus.
+  var chartView = {
+    data: null, selectedKey: "", span: 120, right: 0, zoomY: 1, panY: 0,
+    hover: null, drag: null, focus: 0,
+  };
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function timeframeMs(tf) {
+    return { "1m": 60000, "3m": 180000, "5m": 300000, "15m": 900000,
+      "30m": 1800000, "1h": 3600000, "2h": 7200000, "4h": 14400000,
+      "1d": 86400000, "1w": 604800000 }[tf] || 60000;
+  }
+
+  function barAtTime(candles, ms) {
+    if (!ms || !candles.length) return -1;
+    var lo = 0, hi = candles.length - 1, found = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (Number(candles[mid].ct || candles[mid].t) >= Number(ms)) { found = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return found;
+  }
+
   function selectRow(row) {
     model.selected = row ? row.key : null;
+    model.preferredSelected = model.selected;
+    savePreferences();
     Array.prototype.forEach.call(document.querySelectorAll("tr.sel"), function (tr) { tr.classList.remove("sel"); });
     var tr = row ? document.querySelector('tr[data-key="' + CSS.escape(row.key) + '"]') : null;
     if (tr) tr.classList.add("sel");
@@ -497,169 +580,335 @@
     $("chart-title").textContent = row.symbol + " " + row.timeframe + " · " + sideOf(row);
     $("chart-sub").textContent = clock(row.created_ms) + " UTC · " + stateOf(row) + (row.grade ? " · grade " + row.grade : "");
     renderStory(row);
-    loadChart(row.symbol, row.timeframe);
+    loadChart(row, false);
   }
 
-  function loadChart(symbol, timeframe) {
-    var key = symbol + "|" + timeframe;
+  function loadChart(row, force) {
+    if (!row) return;
+    var key = row.key;
     model.chartKey = key;
     model.chartBusy = true;
-    fetch("/api/chart?symbol=" + encodeURIComponent(symbol) + "&timeframe=" + encodeURIComponent(timeframe) + "&bars=180")
+    var url = "/api/chart?symbol=" + encodeURIComponent(row.symbol)
+      + "&timeframe=" + encodeURIComponent(row.timeframe)
+      + "&bars=600&key=" + encodeURIComponent(row.key)
+      + "&at=" + encodeURIComponent(row.created_ms)
+      + (force ? "&refresh=1" : "");
+    fetch(url)
       .then(function (r) { return r.json(); })
       .then(function (data) {
         model.chartBusy = false;
         if (model.chartKey !== key) return;
-        drawChart(data);
+        var changed = chartView.selectedKey !== key;
+        chartView.data = data;
+        chartView.selectedKey = key;
+        if (changed || force) resetChartView();
+        else drawChart();
       })
-      .catch(function () { model.chartBusy = false; });
+      .catch(function () {
+        model.chartBusy = false;
+        $("chart-hint").hidden = false;
+        $("chart-hint").textContent = "Could not load candles for this setup.";
+      });
   }
 
-  function drawChart(data) {
+  function resetChartView() {
+    var data = chartView.data || {};
+    var candles = data.candles || [];
+    chartView.zoomY = 1;
+    chartView.panY = 0;
+    chartView.hover = null;
+    chartView.span = Math.min(Math.max(60, Math.min(140, candles.length)), Math.max(20, candles.length));
+    chartView.focus = clamp(Number(data.focus_index) || 0, 0, Math.max(0, candles.length - 1));
+    // Put the break/HVB candle about two thirds across the frame, leaving both
+    // the preceding sweep and post-signal lifecycle in sight.
+    chartView.right = clamp(
+      chartView.focus + Math.round(chartView.span * 0.32),
+      Math.min(chartView.span - 1, Math.max(0, candles.length - 1)),
+      Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.18)
+    );
+    drawChart();
+  }
+
+  function chartCanvasSize() {
     var canvas = $("chart");
-    var wrap = canvas.parentElement;
-    var dpr = window.devicePixelRatio || 1;
-    var w = wrap.clientWidth || 600;
-    var h = wrap.clientHeight || 420;
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
+    var dpr = Math.min(2, window.devicePixelRatio || 1);
+    var w = Math.max(320, Math.round(canvas.clientWidth || canvas.parentElement.clientWidth || 600));
+    var h = Math.max(240, Math.round(canvas.clientHeight || canvas.parentElement.clientHeight || 420));
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    }
     var ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
+    return { canvas: canvas, ctx: ctx, w: w, h: h, l: 8, r: 76, t: 16, b: 28 };
+  }
 
-    var candles = (data && data.candles) || [];
-    $("chart-hint").hidden = candles.length > 0;
+  function priceText(v) { return num(v); }
+
+  function drawChart() {
+    var box = chartCanvasSize();
+    var ctx = box.ctx, w = box.w, h = box.h, padL = box.l, padR = box.r, padT = box.t, padB = box.b;
+    ctx.clearRect(0, 0, w, h);
+    var data = chartView.data || {};
+    var candles = data.candles || [];
+    var hint = $("chart-hint");
     if (!candles.length) {
-      $("chart-hint").hidden = false;
-      $("chart-hint").textContent = "No candles yet for " + (data && data.symbol || "") + " " + (data && data.timeframe || "") + " — the instrument is still warming.";
+      hint.hidden = false;
+      hint.textContent = data.history_error
+        ? "Historical window unavailable: " + data.history_error
+        : "No candles yet for " + (data.symbol || "") + " " + (data.timeframe || "") + ".";
       return;
     }
+    hint.hidden = true;
 
-    var pads = { l: 8, r: 74, t: 14, b: 22 };
-    var plotW = w - pads.l - pads.r;
-    var plotH = h - pads.t - pads.b;
+    var len = candles.length;
+    chartView.span = clamp(chartView.span, 20, Math.max(20, len));
+    var spanBars = Math.min(chartView.span, len);
+    var future = Math.round(spanBars * 0.18);
+    chartView.right = clamp(chartView.right, spanBars - 1, len - 1 + future);
+    var left = chartView.right - spanBars + 1;
+    var i0 = Math.max(0, Math.floor(left));
+    var i1 = Math.min(len - 1, Math.ceil(chartView.right));
+    var plotW = w - padL - padR;
+    var plotH = h - padT - padB;
+    var candleW = plotW / spanBars;
+    function x(i) { return padL + (i - left + 0.5) * candleW; }
+    var bodyW = Math.max(1, Math.min(13, candleW * 0.68));
 
-    // levels that belong on the price axis: pools, the setup, the trade
-    var levels = [];
-    var pools = data.pools || [];
-    pools.forEach(function (p) {
-      if (p && (p.level !== undefined) && p.level !== null) levels.push(Number(p.level));
-    });
-    var setups = data.setups || [];
-    setups.forEach(function (s) {
-      ["entry", "stop", "target"].forEach(function (k) { if (s[k] !== null && s[k] !== undefined) levels.push(Number(s[k])); });
-    });
-    var hi = -Infinity, lo = Infinity;
-    candles.forEach(function (c) { hi = Math.max(hi, c.h); lo = Math.min(lo, c.l); });
-    levels.forEach(function (v) { if (isFinite(v) && v > 0) { hi = Math.max(hi, v); lo = Math.min(lo, v); } });
-    var span = hi - lo || 1;
-    hi += span * 0.03; lo -= span * 0.03; span = hi - lo;
+    var selected = data.selected || null;
+    var rawSetup = selected && selected.setup || {};
+    var sweepTime = selected ? Number(selected.sweep_ms || rawSetup.sweep_time || 0) : 0;
+    var breakTime = selected ? Number(selected.created_ms || rawSetup.break_time || 0) : 0;
+    var sweepIndex = barAtTime(candles, sweepTime);
+    var breakIndex = barAtTime(candles, breakTime);
 
-    function x(i) { return pads.l + (i + 0.5) * (plotW / candles.length); }
-    function y(v) { return pads.t + (hi - v) / span * plotH; }
-    var cw = Math.max(1.5, (plotW / candles.length) * 0.66);
+    var lo = Infinity, hi = -Infinity;
+    for (var i = i0; i <= i1; i++) { lo = Math.min(lo, Number(candles[i].l)); hi = Math.max(hi, Number(candles[i].h)); }
+    if (!isFinite(lo) || !isFinite(hi)) return;
+    if (selected && breakIndex >= i0 && breakIndex <= i1) {
+      [selected.entry, selected.stop, selected.target, selected.swept_level, selected.bos_level].forEach(function (v) {
+        v = Number(v); if (isFinite(v) && v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      });
+    }
+    var rawSpan = hi - lo || Math.max(1, Math.abs(hi) * 0.01);
+    var centre = (hi + lo) / 2 + chartView.panY * rawSpan;
+    var half = (rawSpan * 1.08 / 2) / chartView.zoomY;
+    var pLo = centre - half, pHi = centre + half;
+    function y(v) { return padT + (pHi - Number(v)) / (pHi - pLo) * plotH; }
 
-    // grid: three price lines, labelled on the right
-    ctx.font = "10px ui-monospace, monospace";
+    // TradingView/SMC-Radar grid: time and price axes are part of the chart, not
+    // guessed from the signal list.
+    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textBaseline = "middle";
-    for (var g = 1; g <= 3; g++) {
-      var val = lo + span * (g / 4);
-      ctx.strokeStyle = "#161d27";
-      ctx.beginPath(); ctx.moveTo(pads.l, y(val)); ctx.lineTo(pads.l + plotW, y(val)); ctx.stroke();
-      ctx.fillStyle = "#5b6678";
-      ctx.fillText(num(val), pads.l + plotW + 8, y(val));
+    ctx.textAlign = "left";
+    for (var g = 0; g <= 4; g++) {
+      var price = pLo + (pHi - pLo) * g / 4;
+      var gy = y(price);
+      ctx.strokeStyle = "#1b2434"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(w - padR, gy); ctx.stroke();
+      ctx.fillStyle = "#6d7b93"; ctx.fillText(priceText(price), w - padR + 7, gy);
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    var ticks = Math.max(3, Math.min(7, Math.round(plotW / 105)));
+    var step = timeframeMs(data.timeframe);
+    for (var t = 0; t <= ticks; t++) {
+      var ti = Math.round(left + (spanBars - 1) * t / ticks);
+      if (ti < 0) continue;
+      var base = ti < len ? candles[ti].t : candles[len - 1].t + (ti - len + 1) * step;
+      var tx = x(ti);
+      ctx.strokeStyle = "#151d2b"; ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, h - padB); ctx.stroke();
+      var d = new Date(base);
+      var label = String(d.getUTCDate()).padStart(2, "0") + " "
+        + d.toLocaleString("en-US", { month: "short", timeZone: "UTC" }) + " "
+        + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+      ctx.fillStyle = "#6d7b93"; ctx.fillText(label, tx, h - padB + 7);
     }
 
-    // zones the setups came from
-    setups.forEach(function (s) {
-      var z = s.zone || {};
-      if (z.high === undefined || z.low === undefined) return;
-      ctx.fillStyle = (String(s.side).toUpperCase() === "SHORT") ? "rgba(255,92,122,.08)" : "rgba(46,230,168,.08)";
-      ctx.fillRect(pads.l, y(z.high), plotW, Math.max(1.5, y(z.low) - y(z.high)));
-    });
-
-    // candles
-    candles.forEach(function (c, i) {
-      var up = c.c >= c.o;
-      ctx.strokeStyle = up ? "#1c8f69" : "#a83b4f";
-      ctx.fillStyle = up ? "#2ee6a8" : "#ff5c7a";
-      ctx.beginPath();
-      ctx.moveTo(x(i), y(c.h)); ctx.lineTo(x(i), y(c.l)); ctx.stroke();
-      var top = y(Math.max(c.o, c.c));
-      var bottom = y(Math.min(c.o, c.c));
-      ctx.fillRect(x(i) - cw / 2, top, cw, Math.max(1, bottom - top));
-    });
-
-    // structure breaks and the TDIGM centre cross, at the candle they printed on
-    var index = {};
-    candles.forEach(function (c, i) { index[c.t] = i; });
-    var markers = data.markers || {};
-    (markers.bos || []).forEach(function (m) {
-      var i = index[m.t];
-      if (i === undefined) return;
-      ctx.strokeStyle = m.dir > 0 ? "rgba(46,230,168,.5)" : "rgba(255,92,122,.5)";
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(x(i), y(m.level)); ctx.lineTo(pads.l + plotW, y(m.level)); ctx.stroke();
+    // The exact setup window is unmistakable: amber sweep candle/level, a
+    // shaded time range, then a blue body-break + HVB candle.
+    if (selected && sweepIndex >= 0 && breakIndex >= 0) {
+      var sx = x(sweepIndex), bx = x(breakIndex);
+      ctx.fillStyle = "rgba(255,179,71,.055)";
+      ctx.fillRect(Math.min(sx, bx) - bodyW, padT, Math.max(bodyW * 2, Math.abs(bx - sx) + bodyW * 2), plotH);
+      ctx.strokeStyle = "rgba(255,179,71,.34)"; ctx.setLineDash([3, 4]);
+      ctx.strokeRect(Math.min(sx, bx) - bodyW, padT, Math.max(bodyW * 2, Math.abs(bx - sx) + bodyW * 2), plotH);
       ctx.setLineDash([]);
-      ctx.fillStyle = m.dir > 0 ? "#2ee6a8" : "#ff5c7a";
-      ctx.beginPath();
-      var yy = y(candles[i].h) - 6;
-      ctx.moveTo(x(i), yy); ctx.lineTo(x(i) - 4, yy - 6); ctx.lineTo(x(i) + 4, yy - 6);
-      ctx.closePath(); ctx.fill();
-    });
-    (markers.hvb || []).forEach(function (m) {
-      var i = index[m.t];
-      if (i === undefined) return;
-      ctx.fillStyle = "rgba(103,169,255,.85)";
-      ctx.beginPath();
-      ctx.arc(x(i), y(m.side === "up" ? candles[i].l : candles[i].h) + (m.side === "up" ? 6 : -6), 2.6, 0, Math.PI * 2);
-      ctx.fill();
-    });
+      ctx.fillStyle = "#ffb347"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      ctx.fillText("SETUP WINDOW", Math.min(sx, bx) + 4, padT + 4);
 
-    // the liquidity map: dotted lines, labelled with the pool's name
-    pools.slice(-14).forEach(function (p) {
-      var level = Number(p.level);
-      if (!isFinite(level)) return;
-      ctx.strokeStyle = "rgba(133,146,166,.22)";
-      ctx.setLineDash([2, 5]);
-      ctx.beginPath(); ctx.moveTo(pads.l, y(level)); ctx.lineTo(pads.l + plotW, y(level)); ctx.stroke();
-      ctx.setLineDash([]);
-      var label = String(p.kind || p.name || p.tier || "").slice(0, 14);
-      if (label) {
-        ctx.fillStyle = "#5b6678";
-        ctx.fillText(label, pads.l + 4, y(level) - 6);
+      var swept = Number(selected.swept_level || rawSetup.swept_level);
+      if (isFinite(swept)) {
+        ctx.strokeStyle = "rgba(255,179,71,.9)"; ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.moveTo(Math.max(padL, sx - candleW * 10), y(swept)); ctx.lineTo(bx, y(swept)); ctx.stroke();
+        ctx.setLineDash([]); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
+        ctx.fillText((selected.swept_side === "low" ? "swept low " : "swept high ") + priceText(swept), Math.max(padL + 2, sx - candleW * 9), y(swept) - 2);
+      }
+
+      var entry = Number(selected.entry), stop = Number(selected.stop), target = Number(selected.target);
+      var tradeEnd = Math.min(w - padR, bx + Math.max(candleW * 12, plotW * 0.24));
+      if (isFinite(entry) && isFinite(stop)) {
+        ctx.fillStyle = "rgba(255,92,122,.075)";
+        ctx.fillRect(bx, Math.min(y(entry), y(stop)), Math.max(2, tradeEnd - bx), Math.abs(y(stop) - y(entry)));
+      }
+      if (isFinite(entry) && isFinite(target)) {
+        ctx.fillStyle = "rgba(46,230,168,.075)";
+        ctx.fillRect(bx, Math.min(y(entry), y(target)), Math.max(2, tradeEnd - bx), Math.abs(y(target) - y(entry)));
+      }
+    }
+
+    // Candles use the same colours and spacing as SMC-Radar.
+    for (var ci = i0; ci <= i1; ci++) {
+      var c = candles[ci];
+      var bull = Number(c.c) >= Number(c.o);
+      var colour = bull ? "#2ee6a8" : "#ff5c7a";
+      ctx.strokeStyle = colour; ctx.globalAlpha = c.closed === false ? 1 : 0.84; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x(ci), y(c.h)); ctx.lineTo(x(ci), y(c.l)); ctx.stroke();
+      var top = Math.min(y(c.o), y(c.c));
+      var bottom = Math.max(y(c.o), y(c.c));
+      ctx.fillStyle = colour; ctx.fillRect(x(ci) - bodyW / 2, top, bodyW, Math.max(1, bottom - top));
+    }
+    ctx.globalAlpha = 1;
+
+    function outlineCandle(index, colour, label, above) {
+      if (index < i0 || index > i1 || !candles[index]) return;
+      var c = candles[index];
+      var top = y(c.h), bottom = y(c.l);
+      ctx.strokeStyle = colour; ctx.lineWidth = 2;
+      ctx.strokeRect(x(index) - bodyW * 0.9, top - 3, bodyW * 1.8, Math.max(8, bottom - top + 6));
+      ctx.fillStyle = colour; ctx.textAlign = "center";
+      ctx.textBaseline = above ? "bottom" : "top";
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillText(label, x(index), above ? top - 7 : bottom + 7);
+    }
+    if (selected) {
+      outlineCandle(sweepIndex, "#ffb347", selected.swept_side === "low" ? "LOW SWEEP" : "HIGH SWEEP", true);
+      outlineCandle(breakIndex, "#67a9ff", "BODY BREAK + HVB", false);
+    }
+
+    // Selected trade levels begin at the body-break candle; unlike the old
+    // chart they do not paint a full-width line that appears unrelated to time.
+    if (selected && breakIndex >= 0) {
+      var startX = Math.max(padL, x(breakIndex));
+      [[selected.entry, "#dfe6f2", "entry", []], [selected.stop, "#ff5c7a", "stop", [5, 4]],
+        [selected.target, "#2ee6a8", "target", [5, 4]], [selected.bos_level, "#b487ff", "body break", [2, 3]]]
+        .forEach(function (line) {
+          var value = Number(line[0]); if (!isFinite(value)) return;
+          var yy = y(value); if (yy < padT || yy > h - padB) return;
+          ctx.strokeStyle = line[1]; ctx.lineWidth = 1; ctx.setLineDash(line[3]);
+          ctx.beginPath(); ctx.moveTo(startX, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = line[1]; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+          ctx.fillText(line[2] + " " + priceText(value), startX + 4, yy - 2);
+        });
+    }
+
+    // Last visible price and crosshair/OHLC.
+    var last = candles[Math.min(i1, len - 1)];
+    if (last) {
+      var ly = y(last.c);
+      if (ly >= padT && ly <= h - padB) {
+        ctx.strokeStyle = "rgba(103,169,255,.45)"; ctx.beginPath(); ctx.moveTo(padL, ly); ctx.lineTo(w - padR, ly); ctx.stroke();
+        ctx.fillStyle = "#67a9ff"; ctx.fillRect(w - padR + 2, ly - 8, padR - 4, 16);
+        ctx.fillStyle = "#07101c"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(priceText(last.c), w - padR + 6, ly);
+      }
+    }
+
+    var hoverBar = last;
+    if (chartView.hover && chartView.hover.inside) {
+      var hv = chartView.hover;
+      ctx.strokeStyle = "rgba(200,215,240,.38)"; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(hv.x, padT); ctx.lineTo(hv.x, h - padB); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(padL, hv.y); ctx.lineTo(w - padR, hv.y); ctx.stroke(); ctx.setLineDash([]);
+      var hoverPrice = pHi - (hv.y - padT) / plotH * (pHi - pLo);
+      ctx.fillStyle = "#162033"; ctx.fillRect(w - padR + 2, hv.y - 7, padR - 4, 14);
+      ctx.fillStyle = "#c8d7f0"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(priceText(hoverPrice), w - padR + 5, hv.y);
+      hoverBar = candles[hv.i] || last;
+    }
+    if (hoverBar) {
+      var when = new Date(hoverBar.t).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+      $("chart-ohlc").innerHTML = escapeHtml(when) + " · O <b>" + escapeHtml(priceText(hoverBar.o))
+        + "</b> H <b>" + escapeHtml(priceText(hoverBar.h)) + "</b> L <b>" + escapeHtml(priceText(hoverBar.l))
+        + "</b> C <b class=\"" + (hoverBar.c >= hoverBar.o ? "pos" : "neg") + "\">" + escapeHtml(priceText(hoverBar.c)) + "</b>";
+    }
+
+    var audit = $("chart-audit");
+    if (selected) {
+      if (selected.chain_valid === false) {
+        audit.className = "chart-audit bad";
+        audit.textContent = "QUARANTINED · " + (selected.chain_errors || []).join(" · ");
+      } else if (data.history_error || sweepIndex < 0 || breakIndex < 0) {
+        audit.className = "chart-audit warn";
+        audit.textContent = "Chain recorded, but its historical candle window is unavailable"
+          + (data.history_error ? " · " + data.history_error : "");
+      } else {
+        audit.className = "chart-audit ok";
+        audit.textContent = "✓ high/low sweep → opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
+      }
+    } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
+    $("chart-tf").textContent = candles.length + " historical bars"
+      + (data.historical_window ? " · setup-centred" : " · latest")
+      + (data.history_error ? " · history fallback" : "");
+  }
+
+  function chartCoords(ev) {
+    var rect = $("chart").getBoundingClientRect();
+    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top, w: rect.width || 1, h: rect.height || 1 };
+  }
+
+  function attachChartInteractions() {
+    var canvas = $("chart");
+    canvas.addEventListener("wheel", function (ev) {
+      if (!chartView.data || !(chartView.data.candles || []).length) return;
+      ev.preventDefault();
+      var p = chartCoords(ev);
+      if (p.x > p.w - 76) chartView.zoomY = clamp(chartView.zoomY * (ev.deltaY > 0 ? 0.92 : 1.08), 0.25, 16);
+      else {
+        var old = chartView.span;
+        chartView.span = clamp(Math.round(old * (ev.deltaY > 0 ? 1.18 : 0.84)), 20, chartView.data.candles.length);
+        var frac = clamp((p.x - 8) / Math.max(1, p.w - 84), 0, 1);
+        var anchor = chartView.right - old + 1 + frac * old;
+        chartView.right = anchor + chartView.span - 1 - frac * chartView.span;
+      }
+      drawChart();
+    }, { passive: false });
+    canvas.addEventListener("mousedown", function (ev) {
+      if (!chartView.data) return;
+      var p = chartCoords(ev);
+      chartView.drag = p.x > p.w - 76
+        ? { mode: "scale", y: p.y, zoom: chartView.zoomY }
+        : { mode: "pan", x: p.x, y: p.y, right: chartView.right, panY: chartView.panY };
+      canvas.classList.toggle("panning", chartView.drag.mode === "pan");
+      ev.preventDefault();
+    });
+    window.addEventListener("mousemove", function (ev) {
+      if (!chartView.data || !(chartView.data.candles || []).length) return;
+      var p = chartCoords(ev);
+      if (chartView.drag) {
+        if (chartView.drag.mode === "scale") chartView.zoomY = clamp(chartView.drag.zoom * (1 + (p.y - chartView.drag.y) / 220), 0.25, 16);
+        else {
+          chartView.right = chartView.drag.right - (p.x - chartView.drag.x) / Math.max(1, p.w - 84) * chartView.span;
+          chartView.panY = chartView.drag.panY + (p.y - chartView.drag.y) / Math.max(1, p.h - 44) / Math.max(0.25, chartView.zoomY);
+        }
+        drawChart(); return;
+      }
+      if (p.x >= 0 && p.x < p.w - 76 && p.y >= 0 && p.y <= p.h) {
+        var left = chartView.right - chartView.span + 1;
+        var index = Math.round(left + (p.x - 8) / Math.max(1, p.w - 84) * chartView.span);
+        chartView.hover = { x: p.x, y: p.y, i: clamp(index, 0, chartView.data.candles.length - 1), inside: true };
+        drawChart();
       }
     });
-
-    // the trade: entry solid, stop dashed red, draw dashed green
-    setups.slice(-6).forEach(function (s) {
-      var short = String(s.side).toUpperCase() === "SHORT";
-      var colour = short ? "#ff5c7a" : "#2ee6a8";
-      if (s.entry !== undefined && s.entry !== null) {
-        ctx.strokeStyle = colour; ctx.lineWidth = 1.2;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.entry)); ctx.lineTo(pads.l + plotW, y(s.entry)); ctx.stroke();
-      }
-      if (s.stop !== undefined && s.stop !== null) {
-        ctx.strokeStyle = "#a83b4f"; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.stop)); ctx.lineTo(pads.l + plotW, y(s.stop)); ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      if (s.target !== undefined && s.target !== null) {
-        ctx.strokeStyle = "#1c8f69"; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.target)); ctx.lineTo(pads.l + plotW, y(s.target)); ctx.stroke();
-        ctx.setLineDash([]);
-      }
-    });
-    ctx.lineWidth = 1;
-
-    // last price, in the axis gutter
-    var last = candles[candles.length - 1];
-    ctx.fillStyle = "#dfe6f2";
-    ctx.fillRect(pads.l + plotW + 3, y(last.c) - 8, pads.r - 8, 16);
-    ctx.fillStyle = "#0b0e13";
-    ctx.fillText(num(last.c), pads.l + plotW + 7, y(last.c));
-
-    $("chart-hint").hidden = true;
-    $("chart-tf").textContent = (data.bars || candles.length) + " bars" + (data.warm ? "" : " · still warming");
+    window.addEventListener("mouseup", function () { chartView.drag = null; canvas.classList.remove("panning"); });
+    canvas.addEventListener("mouseleave", function () { if (!chartView.drag) { chartView.hover = null; drawChart(); } });
+    canvas.addEventListener("dblclick", resetChartView);
+    $("btn-chart-in").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 0.8), 20, (chartView.data.candles || []).length); drawChart(); };
+    $("btn-chart-out").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 1.25), 20, (chartView.data.candles || []).length); drawChart(); };
+    $("btn-chart-reset").onclick = resetChartView;
+    $("btn-chart-full").onclick = function () {
+      var panel = $("chart-panel");
+      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+      else if (panel.requestFullscreen) panel.requestFullscreen().catch(function () { panel.classList.toggle("fs"); });
+      else panel.classList.toggle("fs");
+      setTimeout(drawChart, 80);
+    };
   }
 
   // ------------------------------------------------------- notifications :: ui
@@ -727,14 +976,13 @@
     renderTable();
     if (added) buildFacets();
     if (!model.selected) {
-      var first = sorted()[0];
+      var first = model.rows.get(model.preferredSelected) || sorted()[0];
       if (first) selectRow(first);
     } else {
       var row = model.rows.get(model.selected);
       if (row) {
         renderStory(row);
-        // the chart follows the symbol when its candles move on
-        if (model.chartKey !== row.symbol + "|" + row.timeframe) loadChart(row.symbol, row.timeframe);
+        if (model.chartKey !== row.key) loadChart(row, false);
       }
     }
   }
@@ -753,7 +1001,7 @@
         renderTable();
         if (added) buildFacets();
         if (!model.selected) {
-          var first = sorted()[0];
+          var first = model.rows.get(model.preferredSelected) || sorted()[0];
           if (first) selectRow(first);
         }
       })
@@ -856,6 +1104,7 @@
   function wire() {
     $("search").addEventListener("input", function (e) {
       model.filters.search = e.target.value.trim();
+      savePreferences();
       renderTable();
     });
     document.addEventListener("keydown", function (e) {
@@ -873,20 +1122,22 @@
       btn.onclick = function () {
         model.filters.side = btn.dataset.side;
         Array.prototype.forEach.call($("seg-side").children, function (b) { b.classList.toggle("on", b === btn); });
+        savePreferences();
         renderTable();
       };
     });
 
-    $("state-select").onchange = function (e) { model.filters.state = e.target.value; renderTable(); };
-    $("sort-select").onchange = function (e) { model.filters.sort = e.target.value; renderTable(); };
+    $("state-select").onchange = function (e) { model.filters.state = e.target.value; savePreferences(); renderTable(); };
+    $("sort-select").onchange = function (e) { model.filters.sort = e.target.value; savePreferences(); renderTable(); };
 
     $("btn-reset").onclick = function () {
-      model.filters = { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" };
+      model.filters = defaultFilters();
       $("search").value = "";
       $("state-select").value = "all";
       $("sort-select").value = "new";
       Array.prototype.forEach.call($("seg-side").children, function (b) { b.classList.toggle("on", b.dataset.side === "both"); });
       buildFacets();
+      savePreferences();
       renderTable();
     };
 
@@ -899,7 +1150,7 @@
 
     $("btn-refresh-chart").onclick = function () {
       var row = model.selected ? model.rows.get(model.selected) : null;
-      if (row) loadChart(row.symbol, row.timeframe);
+      if (row) loadChart(row, true);
       else refreshArchive();
     };
 
@@ -928,18 +1179,28 @@
       paintQuiet();
     };
 
+    attachChartInteractions();
     var resizeTimer = 0;
     window.addEventListener("resize", function () {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(function () {
-        var row = model.selected ? model.rows.get(model.selected) : null;
-        if (row) loadChart(row.symbol, row.timeframe);
-      }, 200);
+      resizeTimer = setTimeout(drawChart, 120);
     });
   }
 
   // --------------------------------------------------------------------- boot
+  function paintSavedPreferences() {
+    $("search").value = model.filters.search;
+    $("state-select").value = model.filters.state;
+    if ($("state-select").value !== model.filters.state) model.filters.state = "all";
+    $("sort-select").value = model.filters.sort;
+    if ($("sort-select").value !== model.filters.sort) model.filters.sort = "new";
+    Array.prototype.forEach.call($("seg-side").children, function (b) {
+      b.classList.toggle("on", b.dataset.side === model.filters.side);
+    });
+  }
+
   function boot() {
+    paintSavedPreferences();
     wire();
     renderInbox();
     renderHeader();
