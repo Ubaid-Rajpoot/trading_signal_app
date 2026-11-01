@@ -92,7 +92,14 @@
 
     <button class="ghost wide" id="btn-reset">reset filters</button>
 
-    <div class="stats" id="stats"></div>
+    <div class="record" id="record">
+      <div class="record-head">
+        <span>measured record</span>
+        <span class="verdict" id="record-verdict">—</span>
+      </div>
+      <div class="record-body" id="record-body"></div>
+      <div class="record-note" id="record-note"></div>
+    </div>
   </aside>
 
   <section class="list">
@@ -123,6 +130,13 @@
         <b>Nothing matches yet.</b>
         <span id="empty-why">The engine is warming its liquidity map.</span>
       </div>
+      <div class="watch" id="watch">
+        <div class="watch-head">
+          <span>watching now</span>
+          <span class="muted small" id="watch-count"></span>
+        </div>
+        <div class="watch-list" id="watch-list"></div>
+      </div>
     </div>
   </section>
 
@@ -150,6 +164,8 @@
   <span id="status-feed">feed: —</span>
   <span class="sep">·</span>
   <span id="status-counts">—</span>
+  <span class="sep">·</span>
+  <span id="status-funnel" title="minutes of price action -> liquidity traps -> displacements -> published plans">—</span>
   <span class="sep">·</span>
   <span id="status-noise" title="events the policy dropped before they reached the screen">—</span>
   <span class="grow"></span>

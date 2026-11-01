@@ -307,6 +307,20 @@ def create_app(
             "strategy": engine.strategy,
         }
 
+    @app.get("/api/watch")
+    async def watch(limit: int = 40) -> dict[str, Any]:
+        """What the book is waiting for, so an empty table is explainable."""
+        rows = engine.watching(limit=max(1, min(200, limit)))
+        return {
+            "watching": rows,
+            "funnel": {
+                "traps": getattr(engine.book, "traps", 0),
+                "displacements": getattr(engine.book, "armed", 0),
+                "plans": len(engine.book.plans) if engine.book else 0,
+                "drops": engine.book.drops() if engine.book else {},
+            },
+        }
+
     @app.get("/api/signals")
     async def signals(
         limit: int = 300,

@@ -332,3 +332,103 @@ def test_the_shipped_config_is_loadable_and_sane():
     assert settings.min_rr >= 2, "a trade must still pay for itself several times over"
     assert settings.min_body_atr > 0
     assert settings.max_fee_r > 0, "fees are a rule, not a footnote"
+
+
+# ------------------------------------------------------- the liquidity index
+def test_the_sorted_index_finds_exactly_what_the_naive_scan_finds():
+    """The index is an optimisation, so it must be *identical*, not similar.
+
+    A touch is not a sweep (strict inequality), a candle that gaps over a pool
+    still takes it, and a pool is taken once. Replayed against the naive rule on
+    a random walk, both must agree bar for bar.
+    """
+    import random
+
+    random.seed(7)
+    price = 100.0
+    book = LiquidityMap()
+    naive = LiquidityMap()
+    for i in range(600):
+        drift = random.uniform(-1.2, 1.2)
+        price = max(1.0, price + drift)
+        bar = bar_at(i, price - 0.4, price + 0.6, price - 0.7, price, tf="1m")
+        if i % 37 == 0:
+            for side, level in (("high", price + 3), ("low", price - 3)):
+                book.add_pool(f"L{side}{i}", level, side, MEDIUM, int(bar["close_time"]))
+                naive.add_pool(f"L{side}{i}", level, side, MEDIUM, int(bar["close_time"]))
+        book.add(bar)
+        naive.add(bar)
+        assert [(p.name, p.swept_ms) for p in book.pools] == \
+               [(p.name, p.swept_ms) for p in naive.pools], f"diverged at bar {i}"
+
+
+def bar_at(i, o, h, lo, c, *, tf="5m", volume=10.0):
+    return bar(i, o, h, lo, c, tf=tf, volume=volume)
+
+
+def test_a_touch_is_not_a_sweep():
+    book = LiquidityMap()
+    book.add_pool("H", 101.0, "high", MEDIUM, 0)
+    candle = bar(0, 100.0, 101.0, 99.9, 100.5, tf="1m")
+    book.add(candle)
+    assert book.pools[0].swept_ms is None, "equality is acceptance, not a raid"
+    book.add(bar(1, 100.5, 101.2, 100.4, 100.6, tf="1m"))
+    assert book.pools[0].swept_ms is not None
+
+
+def test_the_map_does_not_grow_without_bound_on_a_long_replay():
+    book = LiquidityMap()
+    price = 100.0
+    for i in range(4000):
+        price += 0.01
+        book.add(bar(i, price, price + 1, price - 1, price, tf="1m"))
+        if i % 500 == 0:
+            book.prune(keep=400, swept_keep=50)
+    swept = [p for p in book.pools if p.swept_ms is not None]
+    assert len(swept) <= 50 + 10, "old swept pools are dropped, not carried forever"
+
+
+# --------------------------------------------------------------- the grade
+def _plan_for_grade(**overrides):
+    """A plan-shaped dict for the grade checklist, written out explicitly."""
+    from bot.book.narrative import Narrative
+
+    narrative = Narrative("BTCUSDT", BookSettings(entry_tf="15m", htf="1h"), _liquidity())
+    gap = type("G", (), {"high_volume": True, "kind": "bear", "bottom": 100.0, "top": 101.0})()
+    trap = type("T", (), {"grade": "major", "direction": -1})()
+    pool = type("P", (), {"grade": "major", "name": "PDL", "price": 96.0})()
+    kwargs = dict(gap=gap, trap=trap, pool=pool, shift={"time": 0, "level": 99.0, "kind": "MS"},
+                  bias=-1, entry=100.0, risk=1.0, rr=4.0, lag_bars=1, atr=0.5)
+    kwargs.update(overrides)
+    return narrative, kwargs
+
+
+def test_a_full_story_is_grade_a_and_says_which_checks_held():
+    narrative, kwargs = _plan_for_grade()
+    grade, reasons, missing = narrative._grade(**kwargs)
+    assert grade == "A"
+    assert len(reasons) == 6 and missing == []
+
+
+def test_one_missing_piece_is_grade_b_and_names_it():
+    narrative, kwargs = _plan_for_grade(bias=1)          # context disagrees
+    grade, reasons, missing = narrative._grade(**kwargs)
+    assert grade == "B"
+    assert missing == ["context"]
+
+
+def test_two_missing_pieces_is_grade_c():
+    narrative, kwargs = _plan_for_grade(bias=1, lag_bars=9)
+    grade, _, missing = narrative._grade(**kwargs)
+    assert grade == "C"
+    assert set(missing) == {"context", "location"}
+
+
+def test_the_grade_is_not_saturated():
+    """The old score called 345 out of 345 plans 'A'. A grade must discriminate."""
+    grades = set()
+    for bias in (-1, 1):
+        for lag in (1, 9):
+            narrative, kwargs = _plan_for_grade(bias=bias, lag_bars=lag)
+            grades.add(narrative._grade(**kwargs)[0])
+    assert grades == {"A", "B", "C"}

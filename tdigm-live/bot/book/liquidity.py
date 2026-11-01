@@ -19,6 +19,7 @@ gone cannot be a draw.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -93,6 +94,9 @@ class LiquidityMap:
 
     def __init__(self, keep_minor: bool = False) -> None:
         self.pools: list[Pool] = []
+        self._above: list[tuple[float, int, Pool]] = []
+        self._below: list[tuple[float, int, Pool]] = []
+        self._dirty = True
         self.keep_minor = keep_minor
         self._day: int | None = None
         self._week: int | None = None
@@ -186,13 +190,53 @@ class LiquidityMap:
                 self._session_low, self._session_low_time = low, ms
 
         # ---- mark every pool the candle traded through
-        for pool in self.pools:
-            if pool.swept_ms is not None:
-                continue
-            if pool.side == "high" and high > pool.price:
+        hits = self._inside(high, low)
+        if hits:
+            for pool in hits:
                 pool.swept_ms = ms
-            elif pool.side == "low" and low < pool.price:
-                pool.swept_ms = ms
+            self._dirty = True          # the map changed: rebuild on next use
+
+    # ------------------------------------------------------- sweep index
+    #
+    # The naive rule - "look at every pool on every candle" - is correct but
+    # quadratic: three years of 1m bars against a pool list that grows with
+    # every session is ~10^10 comparisons, and the live scanner pays it 30
+    # times over. Two sorted price lists make it O(k) in the pools a candle
+    # actually reaches, which is what a scanner needs.
+    def _reindex(self) -> None:
+        """Sorted (price, pool) lists, one per side. Rebuilt only when it changes.
+
+        A swept pool is struck off the list immediately, so the ranges scanned
+        below only ever shrink: the whole run costs O(pools x log pools), not
+        O(candles x pools).
+        """
+        self._above = sorted((p.price, i, p) for i, p in enumerate(self.pools)
+                             if p.swept_ms is None and p.side == "high")
+        self._below = sorted((p.price, i, p) for i, p in enumerate(self.pools)
+                             if p.swept_ms is None and p.side == "low")
+        self._dirty = False
+
+    def _inside(self, high: float, low: float) -> list[Pool]:
+        """Every unswept pool the candle traded through.
+
+        Strictly ``high > pool.price`` for the pools above and ``low <
+        pool.price`` for the pools below - a touch is not a sweep, which is the
+        book's own line between a raid and acceptance. A candle that gapped
+        right over a pool still takes it, which is why the scan is a range and
+        not a window.
+        """
+        if self._dirty:
+            self._reindex()
+        hits: list[Pool] = []
+        prices = self._above
+        stop = bisect.bisect_left(prices, (high, -1))          # price < high
+        for i in range(stop):
+            hits.append(prices[i][2])
+        prices = self._below
+        begin = bisect.bisect_right(prices, (low, float("inf")))  # price > low
+        for i in range(begin, len(prices)):
+            hits.append(prices[i][2])
+        return hits
 
     def _start_day(self, day: int, bar: dict, ms: int) -> None:
         self._day = day
@@ -224,11 +268,24 @@ class LiquidityMap:
         if level_ms is not None and level_ms < made_ms:
             pass
         self.pools.append(pool)
+        self._dirty = True
         return pool
 
-    def prune(self, keep: int = 400) -> None:
+    def prune(self, keep: int = 400, swept_keep: int = 2000) -> None:
+        """Keep the open map and a short tail of what was taken.
+
+        A swept pool can never be drawn again, so keeping every one of them is
+        only costing memory - on a long replay that is the difference between a
+        flat process and one that climbs.
+        """
+        swept = [p for p in self.pools if p.swept_ms is not None]
+        if len(swept) > swept_keep:
+            drop = {id(p) for p in swept[:len(swept) - swept_keep]}
+            self.pools = [p for p in self.pools if id(p) not in drop]
+            self._dirty = True
         if len(self.pools) > keep:
             self.pools = self.pools[-keep:]
+            self._dirty = True
 
     def live_session_extremes(self) -> dict:
         return {

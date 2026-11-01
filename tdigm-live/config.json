@@ -20,8 +20,6 @@
   "database": "data/tdigm.sqlite3",
   "history_days": 0,
   "timeframes": [
-    "1m",
-    "5m",
     "15m",
     "30m",
     "1h",
@@ -58,10 +56,12 @@
     "htf_required": true,
     "premium_discount": false,
     "sessions": [],
-    "warm_bars": 30000,
-    "fee_pct": 0.06,
+    "warm_bars": 120000,
+    "fee_pct": 0.1,
     "setup_max_bars": 240,
-    "breakeven_at_r": 2.0
+    "breakeven_at_r": 2.0,
+    "max_fee_r": 0.12,
+    "min_stop_pct": 0.0
   },
   "notify": {
     "toast_seconds": 60,

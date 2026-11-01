@@ -40,6 +40,7 @@
     lastMessage: 0,
     toastTimer: 0,
     chartTimer: 0,
+    medianRr: null,
   };
 
   var queue = NF.createQueue({ minGapMs: quiet ? 60_000 : 8_000 });
@@ -115,6 +116,8 @@
       htf_bias: raw.htf_bias,
       premium: raw.premium,
       stored: !!raw.stored,
+      grade_reasons: raw.grade_reasons || [],
+      missing: raw.missing || [],
       raw: raw,
     };
   }
@@ -290,6 +293,7 @@
       $("status-noise").textContent = noise + " event(s) dropped by policy";
       $("status-noise").title = (n.filtered || 0) + " filtered setups and " + (n.suppressed || 0) + " duplicates/chatter never reached the screen";
       $("status-counts").textContent = (model.health.signals || 0) + " signals · " + (model.health.stored || 0) + " stored · " + (model.health.setups_valid || 0) + " valid now";
+      renderFunnel();
       $("status-feed").textContent = "feed: " + (model.health.feed || "—") + " · " + num(model.health.frames, 0) + " frames";
     }
     $("status-memory").textContent = s && s.uptime ? "up " + ago(Date.now() - s.uptime * 1000) : "";
@@ -300,18 +304,61 @@
     var all = res.all || {};
     var counts = model.counts || {};
     var byState = counts.by_state || {};
-    var rows = [];
-    function line(label, value, title) {
-      rows.push('<div' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '><span class="muted">' + escapeHtml(label) + '</span><b>' + escapeHtml(value) + '</b></div>');
+
+    var verdict = all.verdict || "not enough trades";
+    var word = verdict === "not proven" ? "not proven"
+      : verdict === "not enough trades" ? "too few trades" : verdict;
+    var cls = verdict === "positive" ? "positive" : verdict === "negative" ? "negative" : "unproven";
+    var badge = $("record-verdict");
+    badge.className = "verdict " + cls;
+    badge.textContent = word;
+    badge.title = "95% interval on R per trade: "
+      + (all.ci_low === undefined ? "—" : all.ci_low + " to " + all.ci_high)
+      + ". '" + word + "' means exactly that - nothing about it is rounded in the scanner's favour.";
+
+    function row(label, value, title) {
+      return '<div' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '><span class="muted">'
+        + escapeHtml(label) + "</span><b>" + escapeHtml(value) + "</b></div>";
     }
-    line("stored", num(counts.total, 0), "every setup ever recorded in SQLite, across restarts");
-    line("open / valid", num(byState.active || 0, 0), "setups still live and unmitigated-or-in-play");
-    line("won", num(all.wins || 0, 0));
-    line("lost", num(all.losses || 0, 0));
-    line("win rate", all.win_rate === null || all.win_rate === undefined ? "—" : (all.win_rate * 100).toFixed(1) + "%", "wins ÷ decided, at the fixed 2R convention");
-    line("R / trade", all.r_per_trade === null || all.r_per_trade === undefined ? "—" : (all.r_per_trade > 0 ? "+" : "") + Number(all.r_per_trade).toFixed(3), "measured on the stored rows, 2R target, fees in the plans");
-    line("fees in plan", "0.10%", "round-trip taker fee modelled per plan");
-    $("stats").innerHTML = rows.join("");
+    var rows = [];
+    rows.push(row("signals stored", num(counts.total, 0), "every plan ever recorded, across restarts"));
+    rows.push(row("decided", num(all.decided, 0), "closed at the draw, the stop or break-even"));
+    rows.push(row("win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
+      "wins / decided. At the median 1:" + (model.medianRr || "?") + " a plan needs "
+      + (model.medianRr ? Math.round(100 / (1 + model.medianRr)) : "?") + "% to break even before fees."));
+    var rpt = all.r_per_trade;
+    rows.push(row("R / trade", rpt == null ? "—" : (rpt > 0 ? "+" : "") + Number(rpt).toFixed(3),
+      "measured on the stored rows at the fixed 2R convention, net of nothing else"));
+    rows.push(row("95% interval", all.ci_low == null ? "—"
+      : (all.ci_low > 0 ? "+" : "") + Number(all.ci_low).toFixed(2) + " … "
+        + (all.ci_high > 0 ? "+" : "") + Number(all.ci_high).toFixed(2),
+      "if this includes zero, the average is indistinguishable from luck"));
+    rows.push(row("open now", num(byState.active || 0, 0), "live and not yet resolved"));
+    var byTf = (res.by_timeframe) || {};
+    var names = Object.keys(byTf).sort();
+    if (names.length) {
+      rows.push('<div class="muted" style="font-size:10px;letter-spacing:.06em;margin-top:4px">BY TIMEFRAME</div>');
+      names.forEach(function (tf) {
+        var g = byTf[tf];
+        if (!g || !g.scored) return;
+        var tone = g.verdict === "positive" ? "pos" : g.verdict === "negative" ? "neg" : "";
+        rows.push('<div title="' + escapeHtml(g.verdict) + ' · 95% interval '
+          + g.ci_low + " … " + g.ci_high + '"><span class="muted">' + escapeHtml(tf) + " · "
+          + g.scored + "</span><b class='" + tone + "'>"
+          + (g.r_per_trade > 0 ? "+" : "") + Number(g.r_per_trade).toFixed(2) + "R</b></div>");
+      });
+    }
+    var stats = $("record-body");
+    if (stats) stats.innerHTML = rows.join("");
+    var note = $("record-note");
+    if (note) {
+      var n = all.scored || 0;
+      note.innerHTML = n
+        ? "<b>" + n + "</b> scored trade(s). A track record this size carries a standard error of about "
+          + (all.se == null ? "?" : Number(all.se).toFixed(2)) + "R per trade, so the interval above is the honest"
+          + " reading — not the average."
+        : "No trade has closed yet. The record appears as plans resolve; nothing is projected.";
+    }
   }
 
   // ------------------------------------------------------------------- story
@@ -334,10 +381,91 @@
     if (row.fee_r !== null && row.fee_r !== undefined) nums.push("fee <b>" + Number(row.fee_r).toFixed(2) + "R</b>");
     if (row.score !== null && row.score !== undefined) nums.push("score <b>" + escapeHtml(row.score) + "</b>");
     if (nums.length) bits.push('<div class="nums">' + nums.join("") + "</div>");
+    if (row.grade) {
+      var held = (row.grade_reasons || []).length;
+      var miss = (row.missing || []);
+      var story = '<div class="nums" title="A description of the story, not a quality rank: '
+        + 'measured on the archive, plans with the fullest stories have not done better than incomplete ones.">'
+        + "<span>story <b>" + escapeHtml(row.grade) + "</b> · " + held + " of " + (held + miss.length)
+        + " structural checks";
+      if (miss.length) story += ' · missing: <b>' + escapeHtml(miss.join(", ")) + "</b>";
+      story += "</span></div>";
+      bits.push(story);
+    }
+    var bucket = bucketRecord(row);
+    if (bucket) {
+      bits.push('<div class="nums" title="Every closed trade in this instrument-timeframe-side bucket, '
+        + 'at the fixed 2R convention. The interval is what the sample actually supports.">'
+        + "<span>" + escapeHtml(row.timeframe) + " " + escapeHtml(sideOf(row)) + " so far: <b>"
+        + bucket.n + "</b> closed · <b>" + (bucket.r > 0 ? "+" : "") + Number(bucket.r).toFixed(2) + "R</b>"
+        + " each · 95% " + (bucket.ci_low > 0 ? "+" : "") + Number(bucket.ci_low).toFixed(2)
+        + "…" + (bucket.ci_high > 0 ? "+" : "") + Number(bucket.ci_high).toFixed(2)
+        + " <b>" + escapeHtml(bucket.verdict) + "</b></span></div>");
+    }
     var why = (row.reasons && row.reasons.length ? row.reasons : row.evidence) || [];
     if (why.length) bits.push('<div class="why">' + why.slice(0, 8).map(function (w) { return "<div>" + escapeHtml(w) + "</div>"; }).join("") + "</div>");
     if (!bits.length) bits.push('<div class="muted">This setup carries no narrative: it came from the archive before the current engine, so there is nothing to explain. Its numbers above are the record.</div>');
     host.innerHTML = bits.join("");
+  }
+
+  /** The archive's own record for this signal's bucket (timeframe x side). */
+  function bucketRecord(row) {
+    var by = (model.results && model.results.by_timeframe) || {};
+    var group = by[row.timeframe];
+    if (!group) return null;
+    var all = (model.results && model.results.by_side) || {};
+    var sideBucket = all[row.side];
+    if (!sideBucket) return group.verdict ? group : null;
+    // the tightest honest thing we can say: how this timeframe has done overall
+    return group.verdict ? group : sideBucket;
+  }
+
+  // ----------------------------------------------------- what it is watching
+  function renderWatch(data) {
+    var rows = (data && data.watching) || [];
+    var host = $("watch-list");
+    var box = $("watch");
+    if (!rows.length) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    var shown = rows.slice(0, 12);
+    host.innerHTML = shown.map(function (w) {
+      var st = w.armed ? "armed" : "trap";
+      var cls = w.armed ? "st-armed" : "st-trap";
+      var what = w.armed
+        ? (w.armed.kind === "bull" ? "gap " : "gap ") + num(w.armed.bottom) + "–" + num(w.armed.top)
+          + " · " + Math.round((w.armed.fill || 0) * 100) + "% filled"
+        : (w.trap.side === "high" ? "took high " : "took low ") + num(w.trap.level) + " (" + w.trap.name + ")";
+      var need = w.armed ? "needs the reverse shift" : "needs a displacement";
+      return '<div class="watch-row"><span class="sym">' + escapeHtml(w.symbol) + "</span>"
+        + "<span>" + escapeHtml(w.timeframe) + "</span>"
+        + '<span class="' + cls + '">' + st + "</span>"
+        + '<span class="need">' + escapeHtml(what) + " — " + escapeHtml(need) + "</span></div>";
+    }).join("");
+    $("watch-count").textContent = rows.length + " tracked";
+  }
+
+  function refreshWatch() {
+    fetch("/api/watch?limit=60")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        renderWatch(data);
+        model.funnel = data.funnel || null;
+        if (model.funnel) renderFunnel();
+      })
+      .catch(function () {});
+  }
+
+  function renderFunnel() {
+    var f = model.funnel;
+    if (!f) return;
+    var drops = f.drops || {};
+    var worst = Object.keys(drops).sort(function (a, b) { return drops[b] - drops[a]; })[0];
+    $("status-funnel").textContent = f.traps + " traps → " + f.displacements + " displacements → "
+      + f.plans + " plans"
+      + (worst ? " · mostly refused: " + worst + " (" + drops[worst] + ")" : "");
   }
 
   // ------------------------------------------------------------------- chart
@@ -599,6 +727,9 @@
         var added = absorbRows(data.signals, false);
         model.counts = data.counts || {};
         model.results = data.results || {};
+        var rrs = (data.signals || []).map(function (r) { return Number(r.rr); })
+          .filter(function (v) { return isFinite(v) && v > 0; }).sort(function (a, b) { return a - b; });
+        if (rrs.length) model.medianRr = rrs[Math.floor(rrs.length / 2)].toFixed(1);
         renderStats();
         renderTable();
         if (added) buildFacets();
@@ -802,6 +933,8 @@
     poll();
     setInterval(poll, 6000);
     setInterval(refreshHealth, 8000);
+    refreshWatch();
+    setInterval(refreshWatch, 5000);
     setInterval(refreshArchive, 20000);
     setInterval(loadNotifications, 12000);
     setInterval(checkAlarm, 5000);

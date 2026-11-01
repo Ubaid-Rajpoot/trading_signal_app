@@ -151,6 +151,29 @@ class SetupRecord:
             return self.entry - 2 * risk
         return self.entry + 2 * risk
 
+    @property
+    def realized_r(self) -> float | None:
+        """The R the trade actually produced, once it is over.
+
+        A closed trade has no live mark: quoting one is how a stopped short from
+        April ended up on the page at "-28.9R" three months later, because price
+        had walked on and the number kept following it. This is the number the
+        record is measured on, so it has to be the realised one.
+        """
+        risk = self.risk0 or abs(self.entry - self.stop0)
+        if risk <= 0:
+            return None
+        if self.state == "win":
+            target = self.target if self.target is not None else self.target_2r
+            move = (self.entry - target) if self.side == "SHORT" else (target - self.entry)
+            return round(move / risk, 2)
+        if self.state in ("stopped", "invalidated"):
+            move = (self.stop0 - self.entry) if self.side == "SHORT" else (self.entry - self.stop0)
+            return round(-abs(move) / risk, 2)
+        if self.state == "breakeven":
+            return 0.0
+        return None            # expired: the trade never resolved, it is not an R
+
     def r_multiple(self, price: float | None = None) -> float | None:
         price = self.last_price if price is None else price
         risk = self.risk0 or abs(self.entry - self.stop)
@@ -179,7 +202,7 @@ class SetupRecord:
             "target": None if self.target is None else round(self.target, 8),
             "target_2r": round(self.target_2r, 8),
             "rr": self.rr,
-            "r_now": self.r_multiple(),
+            "r_now": self.realized_r if self.state in DONE else self.r_multiple(),
             "zone": self.zone,
             "swept_level": self.swept_level,
             "swept_side": self.swept_side,
@@ -210,6 +233,7 @@ class SetupRecord:
         and the stop, the **stop** is assumed to have been hit first.
         """
         if self.state in DONE:
+            # never again: a finished trade's numbers are history
             return False
         high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
         self.last_price = close

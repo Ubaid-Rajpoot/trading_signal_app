@@ -23,6 +23,10 @@ from .imbalance import Imbalance, algo_candle, candle_atr, premium_discount
 from .liquidity import MAJOR, MEDIUM, MINOR, LiquidityMap, Pool, session_of
 from .swings import Structure
 
+_TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+          "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+          "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000}
+
 _GRADE_POINTS = {"major": 3, "medium": 1, "minor": 0}
 
 
@@ -54,6 +58,7 @@ class BookSettings:
     max_rr: float = 100.0             # a 1:500 draw is a broken series
     stop_buffer_atr: float = 0.10
     min_stop_atr: float = 0.4
+    min_stop_pct: float = 0.0          # the stop must be wider than this % of price
 
     # context
     htf_required: bool = True
@@ -62,8 +67,8 @@ class BookSettings:
     target_min_grade: str = "auto"     # auto = medium intraday, major for 1h+
     target_fallback: str = MEDIUM      # second choice when no major pool is left
     max_setups_per_day: int = 0
-    fee_pct: float = 0.06              # round trip, % of notional (maker in, taker out)
-    max_fee_r: float = 0.20            # refuse a plan the rent would eat
+    fee_pct: float = 0.10              # round trip, % of notional (0.05% taker a side)
+    max_fee_r: float = 0.12            # refuse a plan the rent would eat
 
     @classmethod
     def from_config(cls, data: dict[str, Any] | None, **defaults: Any) -> "BookSettings":
@@ -135,6 +140,8 @@ class Plan:
     htf_bias: int
     premium: float | None
     fee_pct: float
+    grade_reasons: list[str] = field(default_factory=list)   # why it is that grade
+    missing: list[str] = field(default_factory=list)         # what it does not have
     meta: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -157,6 +164,8 @@ class Plan:
             "fee_r": round(self.fee_pct / 100 * self.entry / risk, 3) if risk > 0 else None,
             "score": self.score,
             "grade": self.grade,
+            "grade_reasons": list(self.grade_reasons),
+            "missing": list(self.missing),
             "session": self.session,
             "htf_bias": self.htf_bias,
             "premium": self.premium,
@@ -389,6 +398,11 @@ class Narrative:
         if risk < self.s.min_stop_atr * atr:
             self._drop("the stop is closer than any sane noise", gap)
             return
+        if self.s.min_stop_pct and risk < self.s.min_stop_pct / 100 * entry:
+            # a stop this tight is inside the spread and the fees: whatever the
+            # chart says, the trade cannot pay for itself
+            self._drop("the stop is too tight to pay the fees", gap)
+            return
 
         # ---- target: the draw on liquidity, major first (p.5)
         pool = self.liquidity.draw(direction, entry, self.s.target_min_grade)
@@ -437,7 +451,10 @@ class Narrative:
 
         confluences, score = self._story(armed, entry, stop, target, pool, shift,
                                          session, bias, premium)
-        grade = "A" if score >= 6 else "B" if score >= 4 else "C"
+        grade, grade_reasons, missing = self._grade(
+            gap=gap, trap=trap, pool=pool, shift=shift, bias=bias, entry=entry,
+            risk=abs(entry - stop), rr=rr, lag_bars=self._lag_bars(bar, shift), atr=atr,
+        )
         plan = Plan(
             symbol=self.symbol,
             timeframe=self.s.entry_tf,
@@ -455,6 +472,8 @@ class Narrative:
             confluences=confluences,
             score=score,
             grade=grade,
+            grade_reasons=grade_reasons,
+            missing=missing,
             session=session,
             htf_bias=bias,
             premium=premium,
@@ -464,6 +483,70 @@ class Narrative:
         self.setups.append(plan)
         out.append({"type": "setup", "setup": plan, "bar": bar})
         self.trap, self.armed = None, None
+
+    # ------------------------------------------------------------------ grade
+    #
+    # The old grade was a running total of "nice things present": every plan in
+    # three years scored 6+ and therefore every plan was grade A. A grade that
+    # never varies is not a grade; it is decoration on a signal the trader
+    # cannot rank.
+    #
+    # This one is a short, explicit checklist of the things the book actually
+    # asks for, each independently checkable at signal time:
+    #
+    #   cost      the trade can pay its own fees            (max_fee_r)
+    #   draw      the plan aims at 3R or better             (min_rr)
+    #   liquidity the trap took *major* liquidity, not a swing (p.5)
+    #   context   the higher timeframe agrees                (p.53)
+    #   location  the entry is not chasing the shift      (lag <= 2 bars)
+    #   payload   the displacement carried volume           (p.81)
+    #
+    # A = all six, B = one missing, C = two or more. The card prints exactly
+    # which ones held and which did not, so a B is comparable to another B
+    # instead of being a vague second prize. Measured results per grade are on
+    # the page, including the confidence interval, so the trader can see whether
+    # "A" has ever meant anything on this sample.
+    GRADE_CHECKS = (
+        ("cost", "the fees fit inside the risk"),
+        ("draw", "the draw is at least 3R away"),
+        ("liquidity", "major liquidity was taken, not a swing"),
+        ("context", "the higher timeframe agrees"),
+        ("location", "the entry is within 2 bars of the shift"),
+        ("payload", "the displacement carried volume"),
+    )
+
+    def _lag_bars(self, bar: dict, shift: dict[str, Any] | None) -> int:
+        if not shift or not shift.get("time"):
+            return 0
+        step = _TF_MS.get(self.s.entry_tf, 300_000)
+        return max(0, int((int(bar.get("close_time") or 0) - int(shift["time"])) // step))
+
+    def _grade(self, *, gap: Imbalance, trap: Trap, pool: Pool, shift: dict | None,
+               bias: int, entry: float, risk: float, rr: float, lag_bars: int,
+               atr: float) -> tuple[str, list[str], list[str]]:
+        held: list[str] = []
+        reasons: list[str] = []
+        missing: list[str] = []
+        fee_r = self.s.fee_pct / 100 * entry / risk if risk > 0 else 1.0
+        checks = {
+            "cost": fee_r <= (self.s.max_fee_r or 1.0),
+            "draw": rr >= 3.0,
+            "liquidity": trap.grade == MAJOR,
+            "context": bool(bias) and int(bias) == int(trap.direction),
+            "location": lag_bars <= 2,
+            "payload": bool(gap.high_volume),
+        }
+        for key, words in self.GRADE_CHECKS:
+            if checks[key]:
+                held.append(key)
+                reasons.append(words)
+            else:
+                missing.append(key)
+        if len(missing) == 0:
+            return "A", reasons, []
+        if len(missing) == 1:
+            return "B", reasons, missing
+        return "C", reasons, missing
 
     def _story(self, armed: Armed, entry: float, stop: float, target: float, pool: Pool,
                shift: dict[str, Any] | None, session: str | None, bias: int,

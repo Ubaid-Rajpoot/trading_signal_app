@@ -295,3 +295,37 @@ def test_mitigation_is_tracked_even_when_the_setup_is_old():
     assert old.state == "expired", "the hold window ran out"
     assert old.mitigated is False, "but nothing ever used the block"
     assert old.as_dict()["mitigated"] is False
+
+
+def test_a_closed_trade_reports_what_it_realised_not_where_price_went():
+    """The bug: a short stopped in April showed "-28.9R" in July.
+
+    A finished trade has no live mark. Its R is its outcome, and it must not
+    move when the market moves on - otherwise the page's record, which is the
+    whole point of the archive, is measuring the wrong thing.
+    """
+    from bot.setups import SetupRecord
+
+    record = SetupRecord(key="k", symbol="BTCUSDT", timeframe="1h", side="SHORT",
+                         created_ms=1, entry=100.0, stop=104.0, target=90.0, rr=2.5,
+                         zone=None, swept_level=0, swept_side="", sweep_ms=0,
+                         bos_level=0, bos_ms=0)
+    assert record.as_dict()["r_now"] in (None, 0.0)
+    record.state = "stopped"
+    assert record.as_dict()["r_now"] == -1.0
+    record.last_price = 200.0          # price walked on for months
+    assert record.as_dict()["r_now"] == -1.0
+    assert record.advance({"high": 210, "low": 190, "close": 200,
+                           "close_time": 10}, ) is False
+    assert record.as_dict()["r_now"] == -1.0
+
+
+def test_a_win_reports_its_planned_reward_in_r():
+    from bot.setups import SetupRecord
+
+    record = SetupRecord(key="k2", symbol="BTCUSDT", timeframe="1h", side="LONG",
+                         created_ms=1, entry=100.0, stop=95.0, target=120.0, rr=4.0,
+                         zone=None, swept_level=0, swept_side="", sweep_ms=0,
+                         bos_level=0, bos_ms=0)
+    record.state = "win"
+    assert record.realized_r == 4.0

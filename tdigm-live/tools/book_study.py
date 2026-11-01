@@ -193,6 +193,12 @@ def main() -> int:
     ap.add_argument("--scale-at-r", type=float, default=0.0,
                     help="bank half the position at +nR and move the stop to break-even")
     ap.add_argument("--scale-frac", type=float, default=0.5)
+    ap.add_argument("--fee-pct", type=float, default=0.10,
+                    help="round-trip taker fee, %% of notional (0.10 = 0.05%% a side, perp)")
+    ap.add_argument("--max-fee-r", type=float, default=0.12,
+                    help="refuse a plan whose fees are more than this fraction of its risk")
+    ap.add_argument("--min-stop-pct", type=float, default=0.0,
+                    help="refuse a plan whose stop is closer than this %% of price")
     ap.add_argument("--horizon-bars", type=int, default=2000)
     ap.add_argument("--json", default="")
     args = ap.parse_args()
@@ -225,6 +231,9 @@ def main() -> int:
         min_trap_grade=args.trap_grade,
         require_hvi=args.require_hvi,
         need_vector=args.require_vector,
+        fee_pct=args.fee_pct,
+        max_fee_r=args.max_fee_r,
+        min_stop_pct=args.min_stop_pct,
     )
     htf_map = {tf: args.htf for tf in timeframes} if args.htf else None
     runner = BookRunner([args.symbol], timeframes, settings, htf_map=htf_map)
@@ -243,7 +252,8 @@ def main() -> int:
           f"timeframes {timeframes}")
     print(f"mode={args.mode} minRR={args.min_rr} bodyATR={args.body_atr} fill={args.fill} "
           f"htf={'on' if args.htf_required else 'off'} premium={args.premium_discount} "
-          f"sessions={args.sessions or 'all'} target={args.target}")
+          f"sessions={args.sessions or 'all'} target={args.target} "
+          f"fee={args.fee_pct}% maxFeeR={args.max_fee_r}")
     print(f"funnel: {len(candles):,} minutes -> {runner.traps:,} traps -> "
           f"{runner.armed:,} displacements -> {len(runner.plans)} plans")
     drops = runner.drops()

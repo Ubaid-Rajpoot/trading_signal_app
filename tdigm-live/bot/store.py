@@ -89,6 +89,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("hvb_lag", "ALTER TABLE signals ADD COLUMN hvb_lag INTEGER"),
     ("mitigated", "ALTER TABLE signals ADD COLUMN mitigated INTEGER NOT NULL DEFAULT 0"),
     ("market", "ALTER TABLE signals ADD COLUMN market TEXT NOT NULL DEFAULT 'futures'"),
+    ("session", "ALTER TABLE signals ADD COLUMN session TEXT"),
 )
 
 # a decided outcome is final - these are never overwritten by a later "live" push
@@ -122,6 +123,7 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "market": str(payload.get("market") or market),
         "timeframe": str(payload.get("timeframe") or ""),
         "side": str(payload.get("side") or ""),
+        "session": payload.get("session"),
         "grade": payload.get("grade"),
         "state": str(payload.get("state") or "pending"),
         "valid": 1 if payload.get("valid") else 0,
@@ -354,23 +356,26 @@ class SignalStore:
         with self._lock:
             try:
                 rows = self._db.execute(
-                    "SELECT state, grade, timeframe, r_now, entry, stop, target FROM signals"
+                    "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target FROM signals"
                 ).fetchall()
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
 
         def r_of(row: sqlite3.Row) -> float:
-            """Risk units won or lost, at the fixed 2R convention.
+            """Risk units won or lost - the trade's own outcome, not a convention.
 
-            Everything measured in docs/ is scored against a 2R target, because
-            a setup's *next-liquidity* target is often absent or uncomfortably
-            close (it pays less than 1R on many rows). Scoring the archive the
-            same way keeps the number on the page comparable with the number in
-            the measurements, instead of quietly mixing two yardsticks.
+            The archive stores the realised R (the draw it was aiming at, or the
+            stop it hit). Quoting a fixed 2R instead would make the page's
+            record disagree with the same plan in the back-test, and two
+            yardsticks for one number is how a track record becomes a story.
+            Rows written before the field existed fall back to the convention.
             """
             if row["state"] == "breakeven":
                 return 0.0
+            stored = row["r_now"] if "r_now" in row.keys() else None
+            if stored is not None:
+                return float(stored)
             return 2.0 if row["state"] == "win" else -1.0
 
         def summarise(rows: list[sqlite3.Row]) -> dict[str, Any]:
@@ -379,6 +384,19 @@ class SignalStore:
             scratches = sum(1 for r in rows if r["state"] == "breakeven")
             decided = wins + losses
             total_r = sum(r_of(r) for r in rows if r["state"] in FINAL_STATES)
+            scored = [r_of(r) for r in rows if r["state"] in FINAL_STATES]
+            plain = len(scored)
+            mean = total_r / plain if plain else 0.0
+            # The honest error bar. With ~30 trades a +0.3R average has a 95%
+            # interval of roughly -0.3R..+0.9R, i.e. it could easily be nothing -
+            # and a page that prints the average without this is lying by
+            # omission.
+            se = 0.0
+            if plain > 1:
+                var = sum((x - mean) ** 2 for x in scored) / (plain - 1)
+                se = (var / plain) ** 0.5
+            t_stat = (mean / se) if se else 0.0
+            low, high = mean - 1.96 * se, mean + 1.96 * se
             return {
                 "n": len(rows),
                 "wins": wins,
@@ -388,11 +406,30 @@ class SignalStore:
                 "expired": sum(1 for r in rows if r["state"] == "expired"),
                 "win_rate": round(wins / decided, 4) if decided else None,
                 "r_per_trade": round(total_r / decided, 3) if decided else None,
+                "scored": plain,
+                "se": round(se, 4),
+                "t": round(t_stat, 2),
+                "ci_low": round(low, 3),
+                "ci_high": round(high, 3),
+                # one of: "not enough trades", "not proven" (interval crosses 0),
+                # "positive" / "negative" (interval away from 0)
+                "verdict": (
+                    "not enough trades" if plain < 10 else
+                    "not proven" if low <= 0.0 <= high else
+                    "positive" if low > 0 else "negative"
+                ),
             }
 
-        out: dict[str, Any] = {"all": summarise(list(rows)), "r_basis": "fixed 2R target"}
-        for grade in sorted({r["grade"] or "?" for r in rows}):
-            out[f"grade_{grade}"] = summarise([r for r in rows if (r["grade"] or "?") == grade])
+        out: dict[str, Any] = {"all": summarise(list(rows)),
+                                "r_basis": "realised R per trade (the draw it aimed at, or the stop)"}
+        # every dimension the page filters on is also a dimension the scanner is
+        # *judged* on: these are the buckets a trader would actually split by
+        for dimension in ("grade", "timeframe", "side", "session"):
+            buckets: dict[str, list] = {}
+            for row in rows:
+                buckets.setdefault(str(row[dimension] or "?"), []).append(row)
+            out[f"by_{dimension}"] = {name: summarise(group)
+                                      for name, group in sorted(buckets.items())}
         return out
 
     def close(self) -> None:

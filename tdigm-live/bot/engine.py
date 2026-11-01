@@ -43,7 +43,7 @@ from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_a
 from .regime import RegimePoint, RegimeTracker
 from .book.narrative import BookSettings
 from .book.runner import BookRunner
-from .setups import SetupRecord, order_block
+from .setups import DONE, SetupRecord, order_block
 from .store import SignalStore
 from .structure import Structure
 from .trend import TrendMap
@@ -1173,7 +1173,11 @@ class Engine:
             breakeven_at_r=float(self.book_config.get("breakeven_at_r", 2.0) or 0.0),
         )
         self.registry[key] = record
-        self.by_cell.setdefault((record.symbol, record.timeframe), []).append(record)
+        cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
+        # a key can only be tracked once: a duplicate would keep re-advancing from
+        # a different bar and overwrite the payload with a stale mark
+        if not any(existing.key == key for existing in cell_records):
+            cell_records.append(record)
         payload = {**plan, **record.as_dict()}
         payload["key"] = key
         payload["kind"] = "signal"
@@ -1233,7 +1237,11 @@ class Engine:
             max_bars=int(self.filters.config.get("setup_max_bars") or 240),
         )
         self.registry[key] = record
-        self.by_cell.setdefault((record.symbol, record.timeframe), []).append(record)
+        cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
+        # a key can only be tracked once: a duplicate would keep re-advancing from
+        # a different bar and overwrite the payload with a stale mark
+        if not any(existing.key == key for existing in cell_records):
+            cell_records.append(record)
         # the alert as the engine built it, plus the living state of the setup:
         # one object, so the feed, the card and the API cannot disagree
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
@@ -1250,7 +1258,7 @@ class Engine:
         if not records:
             return
         for record in records:
-            if record.state in ("win", "stopped", "expired", "invalidated"):
+            if record.state in DONE:
                 continue
             if not record.advance(bar):
                 continue
@@ -1271,6 +1279,26 @@ class Engine:
             rows = [row for row in rows if row.get("valid")]
         rows.sort(key=lambda row: -row["created_ms"])
         return rows[:limit]
+
+    def watching(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Every instrument/timeframe the narrative is currently tracking.
+
+        A scanner that only speaks when it publishes a plan looks broken during
+        the hours between plans - and with the fee gate in place there *are* such
+        hours. This is what it is waiting for: the pool it just took, or the
+        imbalance it is sitting in, and what it still needs to fire.
+        """
+        if self.book is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for symbol, state in self.book.states.items():
+            for timeframe, narrative in state.narratives.items():
+                if narrative.trap is None:
+                    continue
+                rows.append(narrative.state())
+                if len(rows) >= limit:
+                    return rows
+        return rows
 
     def setup_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
