@@ -169,7 +169,7 @@ ranging market still produces nothing.
 
 Measured on real BTCUSDT, Jan–Jun 2025: `docs/reports/v4-real-btcusdt.md`.
 
-## v5 — 5.0 (current)
+## v5 — 5.0
 
 The trader's drawing, encoded:
 
@@ -185,3 +185,33 @@ The trader's drawing, encoded:
 
 Measured on real BTCUSDT: 1h profitable (+15.4%, PF 3.9), 5m marginal, 15m/30m
 losing. Full write-up: `docs/reports/v5-real-btcusdt.md`.
+
+## v6 — the book engine (current)
+
+v1–v5 all shared one shape: *a candle pattern per timeframe, graded afterwards*.
+v6 throws that away and implements the narrative in
+`docs/reference/book/ict-institutional-smc-trading.pdf` top-down:
+
+* **Liquidity first.** PDH/PDL, PWH/PWL, PMH/PML and HTF swings are the pools;
+  a swept pool is struck off. Major pools are the draw for 1h+ entries, medium
+  ones for intraday entries.
+* **Direction from the higher timeframe**, rebuilt only when its candle closes.
+* **Trap, not break.** A wick through a pool that closes back inside is
+  manipulation (p.11); a close beyond it is acceptance and kills the idea.
+* **Displacement with an imbalance.** The algo candle must leave an FVG, on
+  volume; that gap is the zone, an HVI if the volume is obvious, and the stop
+  goes behind it (p.106).
+* **Entry on mitigation** of that gap (p.87), with the shift-confirmed variant
+  available and measured.
+* **Fees are a rule**: a plan whose round-trip cost exceeds 20% of its risk is
+  refused instead of warned about.
+* **Nothing pends forever**: a trap that produces no displacement in 30 bars,
+  or a setup with no entry in 40, expires with a counted reason.
+
+Code: `tdigm-live/bot/book/`; measurement: `tdigm-live/tools/book_study.py`;
+specification and results: **`docs/book-engine.md`**.
+
+Measured on real BTCUSDT 1m data, 2023-01-01 → 2024-12-31, four entry
+timeframes, real fees: 274 plans, 23.0% win, **+38.63R (0.14R/trade)**, split
++50.1R in 2023 and −11.9R in 2024. A faithful implementation with a measured,
+unstable, near-zero-to-slightly-positive result — not a proven edge.

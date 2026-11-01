@@ -70,6 +70,7 @@ def engine_over(symbols: list[str], timeframes: list[str]) -> Engine:
                       "slow_period": 9, "band_mult": 1.6185},
         filters={"structure": True, "hvb": False, "trend_context": False, "require_bos": False},
         structure={"pivot_len": 2, "sweep_max_wait": 60},
+        strategy="sweep",
     )
 
 

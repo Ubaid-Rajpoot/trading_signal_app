@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
 from . import config_store
+from .notify import NotificationBus
 from .store import SignalStore
 from .engine import Engine
 
@@ -65,7 +66,31 @@ def create_app(
     config_path: str | Path | None = None,
 ) -> FastAPI:
     hub = Hub()
-    engine.broadcast = hub.send_all
+    # every message the engine produces passes through the notification policy,
+    # so the page gets one quiet, deduplicated stream instead of a toast per event
+    notifier = NotificationBus(
+        dedupe_window=float(config.get("notify", {}).get("dedupe_seconds", 900)),
+        coalesce_window=float(config.get("notify", {}).get("coalesce_seconds", 120)),
+        toast_window=float(config.get("notify", {}).get("toast_seconds", 60)),
+        toast_burst=int(config.get("notify", {}).get("toast_burst", 2)),
+    )
+
+    async def publish(message: dict[str, Any]) -> None:
+        """Route one engine message: state and chat straight out, the rest via policy."""
+        kind = str(message.get("type") or "")
+        if kind == "state":
+            # the table is already ~90 kB: the alert list inside it is noise that
+            # the page never renders any more (the inbox has its own endpoint)
+            lean = {key: value for key, value in message.items() if key != "alerts"}
+            await hub.send_all(lean)
+            return
+        if kind == "notify":
+            await hub.send_all(message)
+            return
+        for envelope in notifier.absorb(message):
+            await hub.send_all({"type": "notify", **envelope})
+
+    engine.broadcast = publish
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "binance")
     max_symbols = int(config.get("max_symbols", 500))
@@ -124,7 +149,7 @@ def create_app(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # keep the server alive, surface the problem
-            await hub.send_all({"type": "log", "level": "error", "message": f"feed stopped: {exc}"})
+            await publish({"type": "log", "level": "error", "message": f"feed stopped: {exc}"})
             raise
 
     async def setup_pusher() -> None:
@@ -133,7 +158,7 @@ def create_app(
             await asyncio.sleep(0.5)
             while engine.setup_events:
                 payload = engine.setup_events.pop(0)
-                await hub.send_all({"type": "setup", "setup": payload})
+                await publish({"type": "setup", "setup": payload})
 
     async def retry_sweeper() -> None:
         """Every minute, try again for any instrument whose history never came.
@@ -166,7 +191,7 @@ def create_app(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # never take the page down over warm-up
-            await hub.send_all(
+            await publish(
                 {"type": "log", "level": "error", "message": f"warm-up failed: {exc}"}
             )
         await pump()
@@ -199,6 +224,18 @@ def create_app(
     async def index() -> FileResponse:
         return FileResponse(WEB_DIR / "index.html")
 
+    @app.get("/app.js")
+    async def app_js() -> FileResponse:
+        return FileResponse(WEB_DIR / "app.js", media_type="text/javascript")
+
+    @app.get("/app.css")
+    async def app_css() -> FileResponse:
+        return FileResponse(WEB_DIR / "app.css", media_type="text/css")
+
+    @app.get("/notify.js")
+    async def notify_js() -> FileResponse:
+        return FileResponse(WEB_DIR / "notify.js", media_type="text/javascript")
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         return {
@@ -222,6 +259,7 @@ def create_app(
             "signals": engine.kinds.get("signal", 0),
             "symbols": len(engine.symbols),
             "timeframes": engine.timeframes,
+            "notifications": notifier.counts(),
         }
 
     @app.get("/api/state")
@@ -233,6 +271,7 @@ def create_app(
             "connected": getattr(feed, "connected", None),
             "source": getattr(feed, "source", "live"),
             "market": getattr(feed, "market", "futures"),
+            "strategy": engine.strategy,
             "name": getattr(feed, "name", ""),
         }
         # the market the bot is configured for; `feed.market` may be "replay"
@@ -243,6 +282,19 @@ def create_app(
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
+    @app.get("/api/notifications")
+    async def notifications(since: int = 0, limit: int = 120) -> dict[str, Any]:
+        """The inbox: grouped, deduplicated, already filtered by policy."""
+        return {
+            "events": notifier.list(since=since, limit=max(1, min(400, limit))),
+            "counts": notifier.counts(),
+        }
+
+    @app.post("/api/notifications/read")
+    async def notifications_read() -> dict[str, Any]:
+        cleared = notifier.mark_read()
+        return {"ok": True, "cleared": cleared, "counts": notifier.counts()}
+
     @app.get("/api/setups")
     async def setups(valid: int = 0, limit: int = 300) -> dict[str, Any]:
         """Every setup the engine knows about, newest first, with its state."""
@@ -252,6 +304,21 @@ def create_app(
             "counts": engine.setup_counts(),
             "total": len(engine.setup_payloads),
             "market": getattr(feed, "market", "futures"),
+            "strategy": engine.strategy,
+        }
+
+    @app.get("/api/watch")
+    async def watch(limit: int = 40) -> dict[str, Any]:
+        """What the book is waiting for, so an empty table is explainable."""
+        rows = engine.watching(limit=max(1, min(200, limit)))
+        return {
+            "watching": rows,
+            "funnel": {
+                "traps": getattr(engine.book, "traps", 0),
+                "displacements": getattr(engine.book, "armed", 0),
+                "plans": len(engine.book.plans) if engine.book else 0,
+                "drops": engine.book.drops() if engine.book else {},
+            },
         }
 
     @app.get("/api/signals")

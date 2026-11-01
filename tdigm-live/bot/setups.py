@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 VALID = {"pending", "active"}
-DONE = {"win", "stopped", "expired", "invalidated"}
+DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
 
 
 def order_block(candles: list[dict], side: str, lookback: int = 12) -> dict[str, Any] | None:
@@ -113,9 +113,17 @@ class SetupRecord:
     last_price: float | None = None
     bars: int = 0
     max_bars: int = 240
+    breakeven_at_r: float = 0.0      # p.109: stop to break-even at +nR (0 = never)
+    be_ms: int | None = None         # when the stop was moved
+    risk0: float = 0.0               # the risk the setup was born with, for R maths
+    stop0: float = 0.0               # the stop as published (the live one can move)
 
     def __post_init__(self) -> None:
         self.state_since = self.created_ms
+        if not self.risk0:
+            self.risk0 = abs(self.entry - self.stop)
+        if not self.stop0:
+            self.stop0 = self.stop
         if self.zone is None:
             self.zone = {"high": self.entry, "low": self.entry, "mid": self.entry}
 
@@ -143,9 +151,32 @@ class SetupRecord:
             return self.entry - 2 * risk
         return self.entry + 2 * risk
 
+    @property
+    def realized_r(self) -> float | None:
+        """The R the trade actually produced, once it is over.
+
+        A closed trade has no live mark: quoting one is how a stopped short from
+        April ended up on the page at "-28.9R" three months later, because price
+        had walked on and the number kept following it. This is the number the
+        record is measured on, so it has to be the realised one.
+        """
+        risk = self.risk0 or abs(self.entry - self.stop0)
+        if risk <= 0:
+            return None
+        if self.state == "win":
+            target = self.target if self.target is not None else self.target_2r
+            move = (self.entry - target) if self.side == "SHORT" else (target - self.entry)
+            return round(move / risk, 2)
+        if self.state in ("stopped", "invalidated"):
+            move = (self.stop0 - self.entry) if self.side == "SHORT" else (self.entry - self.stop0)
+            return round(-abs(move) / risk, 2)
+        if self.state == "breakeven":
+            return 0.0
+        return None            # expired: the trade never resolved, it is not an R
+
     def r_multiple(self, price: float | None = None) -> float | None:
         price = self.last_price if price is None else price
-        risk = abs(self.entry - self.stop)
+        risk = self.risk0 or abs(self.entry - self.stop)
         if price is None or risk <= 0:
             return None
         move = (self.entry - price) if self.side == "SHORT" else (price - self.entry)
@@ -167,10 +198,11 @@ class SetupRecord:
             "bars": self.bars,
             "entry": round(self.entry, 8),
             "stop": round(self.stop, 8),
+            "stop0": round(self.stop0, 8),
             "target": None if self.target is None else round(self.target, 8),
             "target_2r": round(self.target_2r, 8),
             "rr": self.rr,
-            "r_now": self.r_multiple(),
+            "r_now": self.realized_r if self.state in DONE else self.r_multiple(),
             "zone": self.zone,
             "swept_level": self.swept_level,
             "swept_side": self.swept_side,
@@ -189,6 +221,8 @@ class SetupRecord:
             "trend_clean": self.trend_clean,
             "reasons": self.reasons,
             "last_price": self.last_price,
+            "breakeven_at_r": self.breakeven_at_r or None,
+            "be_ms": self.be_ms,
         }
 
     # --------------------------------------------------------------- lifecycle
@@ -199,6 +233,7 @@ class SetupRecord:
         and the stop, the **stop** is assumed to have been hit first.
         """
         if self.state in DONE:
+            # never again: a finished trade's numbers are history
             return False
         high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
         self.last_price = close
@@ -222,22 +257,38 @@ class SetupRecord:
                 return True
             return False
 
-        # active: the trade is on
+        # active: the trade is on. The stop and target are tested against the
+        # levels the trade is *actually* carrying on this bar - a break-even move
+        # made on this bar cannot be "hit" by the very bar that made it.
+        stop_level = self.stop
         hit_target = self.target is not None and (
             low <= self.target if self.side == "SHORT" else high >= self.target
         )
-        hit_stop = high >= self.stop if self.side == "SHORT" else low <= self.stop
+        hit_stop = high >= stop_level if self.side == "SHORT" else low <= stop_level
         if hit_stop:
-            self.state, self.state_since = "stopped", int(bar["close_time"])
+            # the stop had already been moved to break-even: a scratch, not a loss
+            self.state = "breakeven" if self.be_ms is not None else "stopped"
+            self.state_since = int(bar["close_time"])
             self.closed_ms = int(bar["close_time"])
             changed = True
         elif hit_target:
             self.state, self.state_since = "win", int(bar["close_time"])
             self.closed_ms = int(bar["close_time"])
             changed = True
-        elif self.bars >= limit and hit_target is False:
-            # no target in reach and it has been open far too long
-            self.state, self.state_since = "expired", int(bar["close_time"])
-            self.closed_ms = int(bar["close_time"])
-            changed = True
+        else:
+            if self.breakeven_at_r and self.be_ms is None:
+                risk = self.risk0 or abs(self.entry - self.stop)
+                reached = (low <= self.entry - self.breakeven_at_r * risk if self.side == "SHORT"
+                           else high >= self.entry + self.breakeven_at_r * risk)
+                if reached:
+                    # p.109 "move your SL to BE when the price breaks structure":
+                    # the stop goes to the entry and the R maths keeps the original risk
+                    self.be_ms = int(bar["close_time"])
+                    self.stop = self.entry
+                    changed = True
+            if self.bars >= limit:
+                # no target in reach and it has been open far too long
+                self.state, self.state_since = "expired", int(bar["close_time"])
+                self.closed_ms = int(bar["close_time"])
+                changed = True
         return changed

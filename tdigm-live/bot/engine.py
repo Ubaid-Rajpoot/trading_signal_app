@@ -41,7 +41,9 @@ from .confluence import (
 from .filters import Filters
 from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
 from .regime import RegimePoint, RegimeTracker
-from .setups import SetupRecord, order_block
+from .book.narrative import BookSettings
+from .book.runner import BookRunner
+from .setups import DONE, SetupRecord, order_block
 from .store import SignalStore
 from .structure import Structure
 from .trend import TrendMap
@@ -200,6 +202,8 @@ class Engine:
         structure: dict[str, Any] | None = None,
         broadcast: Callable[[dict], Awaitable[None]] | None = None,
         preview_max_symbols: int = 200,
+        strategy: str = "book",
+        book: dict[str, Any] | None = None,
     ) -> None:
         self.symbols = [s.upper() for s in symbols]
         self.timeframes = [tf for tf in timeframes if tf in TIMEFRAMES]
@@ -241,6 +245,31 @@ class Engine:
         self.warm_failures: dict[str, int] = {}
         self.store: SignalStore | None = None
         self.market = "futures"
+        # ---- which decision engine runs (round 21: the book's, by default)
+        self.strategy = "book" if str(strategy).lower() in {"book", "narrative", "v6"} else "sweep"
+        self.book_config = dict(book or {})
+        self.book: BookRunner | None = None
+        self._seeding = False
+        if self.strategy == "book":
+            self._build_book()
+
+    # ------------------------------------------------------------------ book
+    def _build_book(self) -> None:
+        """(Re)build the narrative engine around the current universe."""
+        settings = BookSettings.from_config(self.book_config,
+                                            entry_tf=self.timeframes[0])
+        self.book = BookRunner(self.symbols, self.timeframes, settings)
+        # how much 1m history the narrative replays at boot: the liquidity map
+        # needs days, not the 45 minutes the old sweep cells needed
+        self.book_warm_bars = max(500, int(self.book_config.get("warm_bars", 4000)))
+
+    def set_strategy(self, strategy: str, book: dict[str, Any] | None = None) -> str:
+        self.strategy = "book" if str(strategy).lower() in {"book", "narrative", "v6"} else "sweep"
+        if book is not None:
+            self.book_config = dict(book)
+        if self.strategy == "book" and self.book is None:
+            self._build_book()
+        return self.strategy
 
     @staticmethod
     def _interval_for(count: int) -> float:
@@ -279,7 +308,7 @@ class Engine:
             await self.broadcast(message)
 
     # ------------------------------------------------------------- symbols
-    def add_symbols(self, symbols: list[str]) -> list[str]:
+    def add_symbols(self, symbols: list[str]) -> list[str]:  # noqa: D401
         added = []
         for raw in symbols:
             symbol = str(raw).strip().upper()
@@ -287,6 +316,8 @@ class Engine:
                 continue
             self.symbols.append(symbol)
             self._add_cells(symbol)
+            if self.book is not None:
+                self.book.add_symbol(symbol)
             added.append(symbol)
         if added:
             self.state_interval = self._interval_for(len(self.symbols))
@@ -298,6 +329,9 @@ class Engine:
         if removed:
             self.symbols = [s for s in self.symbols if s not in drop]
             self.cells = {k: v for k, v in self.cells.items() if k[0] not in drop}
+            if self.book is not None:
+                for symbol in removed:
+                    self.book.states.pop(symbol, None)
             self.state_interval = self._interval_for(len(self.symbols))
         return removed
 
@@ -306,6 +340,10 @@ class Engine:
         keep = {s.upper() for s in available}
         self.symbols = [s for s in self.symbols if s in keep]
         self.cells = {k: v for k, v in self.cells.items() if k[0] in keep}
+        if self.book is not None:
+            self.book = BookRunner(self.symbols, self.timeframes,
+                                   BookSettings.from_config(self.book_config,
+                                                            entry_tf=self.timeframes[0]))
 
     def set_filters(self, filters: dict[str, Any]) -> None:
         self.filters = Filters(filters or {})
@@ -410,6 +448,7 @@ class Engine:
         """
         symbol = symbol.upper()
         empty = 0
+        book_mode = self.strategy == "book" and self.book is not None
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
             if cell is None or (len(cell.candles) >= 120 and not force):
@@ -438,7 +477,7 @@ class Engine:
                         else:
                             await asyncio.sleep(0.6 * (attempt + 1))
             if candles:
-                await self._replay(symbol, tf, candles)
+                await self._replay(symbol, tf, candles, evaluate=not book_mode)
                 self.warm_failures.pop(f"{symbol}:{tf}", None)
             current = self.cells.get((symbol, tf), cell)
             if len(current.candles) < 120:
@@ -454,9 +493,73 @@ class Engine:
                             "message": f"no {tf} history for {symbol} - it will be retried",
                         }
                     )
+        if book_mode:
+            await self._warm_book(feed, symbol, force=force)
         return empty
 
-    async def _replay(self, symbol: str, timeframe: str, candles: list[dict]) -> list[dict]:
+    async def _warm_book(self, feed, symbol: str, force: bool = False) -> int:
+        """Warm the book engine from history, so the page is not empty at boot.
+
+        The narrative needs what a single candle cannot give it: the previous
+        day's and week's highs and lows, the session ranges, a higher timeframe
+        with real swings, and enough 1m bars for a trap -> displacement ->
+        mitigation sequence to have happened already. So we fetch a deep 1m
+        window and replay it through **the same** ``BookRunner.on_candle`` the
+        live feed uses. A plan found here is stored and shown exactly like a live
+        one, marked ``seeded``.
+        """
+        state = self.book.states.get(symbol) if self.book else None
+        if state is None and self.book is not None:
+            state = self.book.add_symbol(symbol)
+        if state is None:
+            return 0
+        first = state.narratives.get(self.timeframes[0])
+        if first is not None and first.bars and not force:
+            return 0
+
+        async def fetch(interval: str, limit: int) -> list[dict]:
+            if not hasattr(feed, "history"):
+                return []
+            try:
+                name = feed.exchange_interval(interval) if hasattr(feed, "exchange_interval") else interval
+                if name is None:
+                    return []
+                return await feed.history(symbol, name, limit) or []
+            except Exception as exc:
+                await self._emit({"type": "log", "level": "warn",
+                                  "message": f"warm-up {symbol} {interval}: {exc}"})
+                return []
+
+        # deeper history = more of the page filled at boot, but every extra 1,000
+        # bars is one more REST page per instrument
+        warm_bars = self.book_warm_bars
+        if len(self.symbols) > 250:
+            warm_bars = min(warm_bars, 1500)
+        elif len(self.symbols) > 60:
+            warm_bars = min(warm_bars, 4000)
+        fine = await fetch("1m", warm_bars)
+        if not fine:
+            self.warm_failures.setdefault(f"{symbol}:1m", 1)
+            return 1
+
+        published = 0
+        self._seeding = True
+        try:
+            for candle in fine:
+                for plan in self.book.on_candle({**candle, "symbol": symbol}):
+                    if await self._publish_book(plan) is not None:
+                        published += 1
+        finally:
+            self._seeding = False
+        self.warm_failures.pop(f"{symbol}:1m", None)
+        self.backfilled += published
+        await self._emit({"type": "log", "level": "info",
+                          "message": f"warm-up {symbol}: {len(fine)} 1m bars replayed, "
+                                     f"{published} plan(s) already on the books"})
+        return 0
+
+    async def _replay(self, symbol: str, timeframe: str, candles: list[dict],
+                      evaluate: bool = True) -> list[dict]:
         """Feed closed history through the live pipeline once, and keep the result.
 
         This is the same code path as live - a fresh cell fed the same closed
@@ -489,6 +592,8 @@ class Engine:
                 point = self._append(fresh, bar)
                 self._track_setups(fresh, bar)
                 if point is None:
+                    continue
+                if not evaluate:
                     continue
                 structure = fresh.structure
                 setup = structure.last_setup
@@ -656,6 +761,7 @@ class Engine:
         self.candles_seen += 1
         self.last_event_at = time.time()
 
+        book = self.book if self.strategy == "book" else None
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
             if cell is None:
@@ -668,8 +774,16 @@ class Engine:
                 point = self._append(cell, bar)
                 # first: did this candle change the life of an existing setup?
                 self._track_setups(cell, bar)
+                if book is not None:
+                    # the decision belongs to the narrative engine; the cell is
+                    # kept for the chart only (candles, markers, TDI pane)
+                    continue
                 if point is not None:
                     await self._evaluate(cell, bar, point)
+
+        if book is not None:
+            for plan in book.on_candle(candle):
+                await self._publish_book(plan)
 
         await self._emit_state()
 
@@ -1005,6 +1119,79 @@ class Engine:
             return
         await self._emit({"type": "alert", "alert": alert})
 
+    # ---------------------------------------------------------- book engine
+    async def _publish_book(self, plan: dict) -> dict | None:
+        """A narrative plan becomes a tracked setup with a life of its own."""
+        key = f"{plan['symbol']}|{plan['timeframe']}|{plan['created_ms']}"
+        if key in self.registry:
+            return self.setup_payloads.get(key)
+        record = self._register_book(plan, key)
+        payload = self.setup_payloads[key]
+        self.signals.appendleft(payload)
+        self.alerts.appendleft(payload)
+        self.kinds["signal"] = self.kinds.get("signal", 0) + 1
+        self.cooldowns[(plan["symbol"], plan["timeframe"])] = time.time()
+        if self._quiet:
+            self._collected.append(payload)
+        else:
+            await self._emit({"type": "alert", "alert": payload})
+            self.setup_events.append(payload)
+        return payload
+
+    def _register_book(self, plan: dict, key: str) -> SetupRecord:
+        gap = plan.get("ac") or {}
+        zone = {"high": float(gap.get("top") or plan["entry"]),
+                "low": float(gap.get("bottom") or plan["entry"]),
+                "mid": (float(gap.get("top") or plan["entry"]) + float(gap.get("bottom") or plan["entry"])) / 2,
+                "kind": "fvg", "imbalance": gap.get("kind")}
+        trap = plan.get("trap") or {}
+        record = SetupRecord(
+            key=key,
+            symbol=plan["symbol"],
+            timeframe=plan["timeframe"],
+            side=plan["side"],
+            created_ms=int(plan["created_ms"]),
+            entry=float(plan["entry"]),
+            stop=float(plan["stop"]),
+            target=float(plan["target"]) if plan.get("target") else None,
+            rr=plan.get("rr"),
+            zone=zone,
+            swept_level=float(trap.get("level") or 0.0),
+            swept_side=str(trap.get("side") or ""),
+            sweep_ms=int(trap.get("time") or 0),
+            bos_level=float((plan.get("shift") or {}).get("level") or 0.0),
+            bos_ms=int((plan.get("shift") or {}).get("time") or 0),
+            break_kind=str((plan.get("shift") or {}).get("kind") or "MS"),
+            volume_ratio=(plan.get("ac") or {}).get("volume_ratio"),
+            score=plan.get("score"),
+            grade=plan.get("grade"),
+            reasons=list(plan.get("confluences") or []),
+            # the trade is on the moment the zone is mitigated - that IS the entry
+            state="active",
+            touched_ms=int(plan["created_ms"]),
+            max_bars=int(self.book_config.get("setup_max_bars", 240)),
+            breakeven_at_r=float(self.book_config.get("breakeven_at_r", 2.0) or 0.0),
+        )
+        self.registry[key] = record
+        cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
+        # a key can only be tracked once: a duplicate would keep re-advancing from
+        # a different bar and overwrite the payload with a stale mark
+        if not any(existing.key == key for existing in cell_records):
+            cell_records.append(record)
+        payload = {**plan, **record.as_dict()}
+        payload["key"] = key
+        payload["kind"] = "signal"
+        payload["strategy"] = "book"
+        if getattr(self, "_seeding", False):
+            # found while replaying history at start-up, not by the live feed
+            payload["seeded"] = True
+        payload["time"] = int(plan["created_ms"])
+        payload["price"] = float(plan["entry"])
+        payload["zone"] = record.zone
+        self.setup_payloads[key] = payload
+        self._remember(payload)
+        return record
+
     # -------------------------------------------------------------- setups
     def _register(self, alert: dict, bar: dict, cell: Cell | None = None) -> dict:
         """Turn a signal alert into a tracked setup with a zone and a state."""
@@ -1050,7 +1237,11 @@ class Engine:
             max_bars=int(self.filters.config.get("setup_max_bars") or 240),
         )
         self.registry[key] = record
-        self.by_cell.setdefault((record.symbol, record.timeframe), []).append(record)
+        cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
+        # a key can only be tracked once: a duplicate would keep re-advancing from
+        # a different bar and overwrite the payload with a stale mark
+        if not any(existing.key == key for existing in cell_records):
+            cell_records.append(record)
         # the alert as the engine built it, plus the living state of the setup:
         # one object, so the feed, the card and the API cannot disagree
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
@@ -1067,7 +1258,7 @@ class Engine:
         if not records:
             return
         for record in records:
-            if record.state in ("win", "stopped", "expired", "invalidated"):
+            if record.state in DONE:
                 continue
             if not record.advance(bar):
                 continue
@@ -1088,6 +1279,26 @@ class Engine:
             rows = [row for row in rows if row.get("valid")]
         rows.sort(key=lambda row: -row["created_ms"])
         return rows[:limit]
+
+    def watching(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Every instrument/timeframe the narrative is currently tracking.
+
+        A scanner that only speaks when it publishes a plan looks broken during
+        the hours between plans - and with the fee gate in place there *are* such
+        hours. This is what it is waiting for: the pool it just took, or the
+        imbalance it is sitting in, and what it still needs to fire.
+        """
+        if self.book is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for symbol, state in self.book.states.items():
+            for timeframe, narrative in state.narratives.items():
+                if narrative.trap is None:
+                    continue
+                rows.append(narrative.state())
+                if len(rows) >= limit:
+                    return rows
+        return rows
 
     def setup_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -1128,11 +1339,39 @@ class Engine:
             "candles": rows,
             "markers": markers,
             "setups": setups,
+            "pools": self._chart_pools(symbol.upper()),
+            "book": self._book_state(symbol.upper(), timeframe),
             "structure": cell.structure.as_dict(),
             "trend": cell.tmap_state or {},
             "warm": len(cell.candles) >= 120,
             "bars": len(cell.candles),
         }
+
+    # ----------------------------------------------------------- book drawing
+    def _chart_pools(self, symbol: str) -> list[dict]:
+        """The liquidity map, so the chart can draw the levels the trade aimed at."""
+        if self.book is None:
+            return []
+        state = self.book.states.get(symbol)
+        if state is None:
+            return []
+        return [pool.as_dict() for pool in state.liquidity.pools[-24:]]
+
+    def _book_state(self, symbol: str, timeframe: str) -> dict:
+        """What the narrative is waiting for right now (trap / armed / nothing)."""
+        if self.book is None:
+            return {}
+        state = self.book.states.get(symbol)
+        if state is None:
+            return {}
+        narrative = state.narratives.get(timeframe)
+        if narrative is None:
+            return {}
+        context = state.contexts.get(timeframe) or {}
+        return {**narrative.state(),
+                "bias": context.get("bias"),
+                "premium": context.get("premium"),
+                "htf": context.get("htf")}
 
     # ------------------------------------------------------------- preview
     def _preview(self, symbol: str, candle: dict) -> None:
@@ -1272,6 +1511,10 @@ class Engine:
             "setup_counts": self.setup_counts(),
             "setups_valid": sum(1 for row in self.setup_payloads.values() if row.get("valid")),
             "backfilled": self.backfilled,
+            "strategy": self.strategy,
+            "book": ({"traps": self.book.traps, "displacements": self.book.armed,
+                      "plans": len(self.book.plans), "drops": self.book.drops()}
+                     if self.book is not None else {}),
             "archive": (self.store.counts() if self.store else {}),
             "failed": len(self.warm_failures),
             "warming": self.warming(),

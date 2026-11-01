@@ -139,6 +139,7 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         filters={"trend_context": False, "require_bos": False},
         structure={"pivot_len": 2},
+        strategy="sweep",
     )
     engine.attach_store(store)
     engine.market = "futures"
@@ -151,9 +152,25 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
         tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
         filters={},
         structure={"pivot_len": 2},
+        strategy="sweep",
     )
     fresh.attach_store(SignalStore(tmp_path / "sig.sqlite3"))
     restored = fresh.load_stored()
     assert restored == 1
     assert fresh.setup_payloads[PAYLOAD["key"]]["symbol"] == "BTCUSDT"
     assert fresh.open_setups(valid_only=True), "the archive row is on the board at boot"
+
+
+def test_the_record_carries_an_honest_error_bar(tmp_path):
+    """An average without a confidence interval is a claim the page cannot back."""
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    for i in range(12):
+        row = dict(PAYLOAD, key=f"BTCUSDT|1h|{1_700_000_000_000 + i}", state="win")
+        store.record(row_of(row))
+    rows = store.results()["all"]
+    assert {"se", "t", "ci_low", "ci_high", "verdict", "scored"} <= set(rows)
+    assert rows["verdict"] in {"not enough trades", "not proven", "positive", "negative"}
+    if rows["scored"] < 10:
+        assert rows["verdict"] == "not enough trades"
+    else:
+        assert rows["ci_low"] <= rows["r_per_trade"] <= rows["ci_high"]

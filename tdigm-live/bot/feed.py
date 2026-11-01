@@ -112,7 +112,15 @@ class BaseFeed:
         return self.tf_map.get(timeframe, timeframe)
 
     # ------------------------------------------------------------- history
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(self, symbol: str, interval: str, limit: int = 500,
+                      end_time: int | None = None) -> list[dict]:
+        """Closed candles, oldest first.
+
+        ``end_time`` (ms) asks for candles that closed at or before it, which is
+        what makes pagination possible: the narrative engine needs thousands of
+        1m bars to warm its liquidity map, and the exchange only serves 1000 per
+        request. Feeds that cannot page simply ignore it.
+        """
         raise NotImplementedError
 
     async def _get_json(self, url: str, params: dict | None = None) -> object:
@@ -198,35 +206,56 @@ class BinanceFeed(BaseFeed):
     tf_map = BINANCE_TFS
     chunk_size = 400
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": min(limit, 1000)}
-        last: Exception | None = None
-        for host in BINANCE_HOSTS:
-            try:
-                rows = await self._get_json(f"{host}/api/v3/klines", params)
-                now_ms = int(time.time() * 1000)
-                candles = [
-                    {
-                        "symbol": symbol.upper(),
-                        "open_time": int(r[0]),
-                        "close_time": int(r[6]),
-                        "open": float(r[1]),
-                        "high": float(r[2]),
-                        "low": float(r[3]),
-                        "close": float(r[4]),
-                        "volume": float(r[5]),
-                        "trades": int(r[8]) if len(r) > 8 else 0,
-                        "closed": True,
-                    }
-                    for r in rows  # type: ignore[union-attr]
-                    if int(r[6]) < now_ms
-                ]
-                if candles:
-                    return candles
-                last = FeedError("exchange returned no closed candles")
-            except Exception as exc:
-                last = exc
-        raise FeedError(f"binance history {symbol} {interval}: {last}")
+    async def history(self, symbol: str, interval: str, limit: int = 500,
+                      end_time: int | None = None) -> list[dict]:
+        symbol = symbol.upper()
+        remaining = max(1, int(limit))
+        out: list[dict] = []
+        end = int(end_time) if end_time else None
+        now_ms = int(time.time() * 1000)
+        while remaining > 0:
+            params: dict[str, object] = {"symbol": symbol, "interval": interval,
+                                         "limit": min(remaining, 1000)}
+            if end:
+                params["endTime"] = end
+            last: Exception | None = None
+            rows = None
+            for host in BINANCE_HOSTS:
+                try:
+                    rows = await self._get_json(f"{host}/api/v3/klines", params)
+                    break
+                except Exception as exc:
+                    last = exc
+            if rows is None:
+                if out:
+                    break
+                raise FeedError(f"binance history {symbol} {interval}: {last}")
+            candles = [
+                {
+                    "symbol": symbol,
+                    "open_time": int(r[0]),
+                    "close_time": int(r[6]),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]),
+                    "trades": int(r[8]) if len(r) > 8 else 0,
+                    "closed": True,
+                }
+                for r in rows  # type: ignore[union-attr]
+                if int(r[6]) < now_ms
+            ]
+            if not candles:
+                break
+            out = candles + out
+            remaining -= len(candles)
+            if len(rows) < min(remaining + len(candles), 1000):  # type: ignore[arg-type]
+                break
+            end = int(rows[0][0]) - 1  # type: ignore[index]
+        if not out:
+            raise FeedError(f"binance history {symbol} {interval}: no closed candles")
+        return out
 
     async def stream(self, symbols: list[str]) -> None:
         if websockets is None:
@@ -634,27 +663,43 @@ class BinanceFuturesFeed(BaseFeed):
         super().__init__(symbols, **kwargs)
         self._last_candle: dict[str, dict] = {}
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": min(limit, 1000)}
-        rows = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/klines", params)
+    async def history(self, symbol: str, interval: str, limit: int = 500,
+                      end_time: int | None = None) -> list[dict]:
+        symbol = symbol.upper()
+        remaining = max(1, int(limit))
+        out: list[dict] = []
+        end = int(end_time) if end_time else None
         now_ms = int(time.time() * 1000)
-        candles = [
-            _kline(
-                symbol.upper(),
-                int(r[0]),
-                r[1],
-                r[2],
-                r[3],
-                r[4],
-                r[5],
-                int(r[8]) if len(r) > 8 else 0,
-            )
-            for r in rows  # type: ignore[union-attr]
-            if int(r[6]) < now_ms
-        ]
-        if not candles:
+        while remaining > 0:
+            params: dict[str, object] = {"symbol": symbol, "interval": interval,
+                                         "limit": min(remaining, 1000)}
+            if end:
+                params["endTime"] = end
+            rows = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/klines", params)
+            candles = [
+                _kline(
+                    symbol,
+                    int(r[0]),
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    int(r[8]) if len(r) > 8 else 0,
+                )
+                for r in rows  # type: ignore[union-attr]
+                if int(r[6]) < now_ms
+            ]
+            if not candles:
+                break
+            out = candles + out
+            remaining -= len(candles)
+            if len(rows) < min(remaining + len(candles), 1000):  # type: ignore[arg-type]
+                break
+            end = int(rows[0][0]) - 1  # type: ignore[index]
+        if not out:
             raise FeedError(f"binance futures returned no closed {interval} candles for {symbol}")
-        return candles
+        return out
 
     async def universe(self) -> list[dict]:
         info = await self._get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/exchangeInfo")
@@ -790,7 +835,8 @@ class ReplayFeed(BaseFeed):
             self._prefix[symbol] = rows
         return rows[:upto]
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(self, symbol: str, interval: str, limit: int = 500,
+                      end_time: int | None = None) -> list[dict]:
         """History = the bars this replay has already passed, aggregated.
 
         Never data from the future: only rows at or before the play head.

@@ -115,3 +115,188 @@ python tools/book_study.py data/btc
 # the live defaults, with the walk-forward
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,5m,15m,30m,1h --target range
 ```
+
+---
+
+# The book engine, measured (round 22)
+
+The gates above were the *old* engine: a sweep, a break, an HVB. `bot/book/` is
+the book's own chain instead — liquidity map → trap → displacement that leaves an
+imbalance → mitigation of that imbalance → the plan, with the draw on the next
+liquidity. Everything below is that engine on **BTCUSDT, 2023-01-01 →
+2024-12-31**, entry timeframes `5m,15m,30m,1h`, replayed through the live engine
+(`tools/book_study.py`), fees **0.06% round trip** (maker in, taker out) charged
+in the plan and tested in the walk-forward.
+
+```
+../.venv/bin/python -m tools.book_study data/btc --symbol BTCUSDT \
+    --mode shift --fill 1.0 --be-at-r 2.0
+```
+
+| entry recipe | n | win / BE / loss | total R | R / trade | median planned R:R |
+|---|---|---|---|---|---|
+| mitigation at 50% of the gap, stop to BE at +1R *(shipped before this round)* | 219 | 28 / 80 / 110 | +12.51 | +0.057 | 4.93 |
+| **full gap fill, then the reverse shift, BE at +2R** *(shipped now)* | 217 | 45 / 30 / 142 | **+42.79** | **+0.197** | 3.73 |
+
+Why the second one is the default: it is also the *book's* recipe (p.87 — follow
+the daily cycle, wait for the **full FVG fill**, then the reverse shift), so it is
+more faithful **and** better on this sample. Entering at half the gap on the fill
+alone is a shortcut the book does not make.
+
+The honest split of the winning row:
+
+| window | trades | total R | R / trade |
+|---|---|---|---|
+| 2023 | 94 | +46.0 | +0.49 |
+| 2024 | 123 | −3.2 | −0.03 |
+
+**All of the edge is in 2023.** Two years, one instrument, 217 trades is a thin
+sample, and a year-by-year split that flips sign is the definition of "not
+proven". Add to that:
+
+* **Break-even at +2R is an approximation.** The book says *move the stop to
+  break-even when price breaks structure* (p.109); the live engine cannot see a
+  structural break on the entry timeframe cheaply, so it uses a fixed R
+  multiple. +2R was chosen because +1R measured worse (+12.51R vs +42.79R) — on
+  the same data that selected everything else, so it is a fitted parameter, not
+  a discovered one. It is in `config.json` (`book.breakeven_at_r`) for exactly
+  that reason.
+* **One instrument.** The live scanner runs many; nothing here measures whether
+  the same recipe works on anything but BTC.
+* **Median planned R:R is 3.73, under the 1:4 preference.** The floor
+  (`book.min_rr`) is 3.0 and the trader asked for 1:4; at 4.0 the sample loses
+  about half its trades (this is the "≥1:4 preference vs signal count" trade-off
+  that has been stated in every round). The card shows the real number on every
+  plan — nothing is rounded up to look like it met a target.
+
+So: **the implementation is faithful and auditable; the edge is not established.**
+The engine is built so that this is checkable rather than believed — the numbers
+above come out of the same code the page runs, and the same command can be
+pointed at another instrument, another window, or a different exit.
+
+---
+
+# Round 23: the audit that says the signals were not right
+
+The previous round ended with "+42.79R, but the edge is not established". The
+complaint was that the scanner still does not give the right signals. It was
+right, and the reason was measurable. This round is the audit, and what it
+changed.
+
+Reproduce every number below:
+
+```
+python tools/book_study.py data/btc --symbol BTCUSDT --json /tmp/s.json   # 3 years
+python tools/book_audit.py /tmp/s.json --train 2022-07-01:2023-12-31 --holdout 2024-01-01:2025-06-30
+```
+
+## 1. The sample the last round was chosen on was two years; the truth needs three
+
+| window | plans | win% | total R | R / trade |
+|---|---|---|---|---|
+| 2022-07 → 2023-12 (chosen on) | 156 | 16.7% | +4.73 | +0.030 |
+| **2024-01 → 2025-06 (holdout)** | 189 | 17.5% | −0.78 | **−0.004** |
+| all three years | 345 | 17.1% | +3.95 | +0.011 |
+
+The +42.79R of the previous round was the 2023 calendar year sitting inside the
+sample. Add the year before and the year after and the engine is **flat**:
++0.011 R per trade with a standard error of 0.104. That is zero, and the
+previous document's "the edge is not proven" was too generous — the honest
+reading is *there is no measurable edge on this sample*.
+
+## 2. The fees were wrong, and they were the difference
+
+The engine charged **0.06%** round trip (maker in, taker out). A perp round trip
+is **0.10%** (0.05% taker a side), and a stop is always a taker. Median risk is
+0.44% of price, so the rent was **≈0.23R of every trade** — a quarter of the
+risk, on a strategy that wins 17% of the time.
+
+The engine's own guard (`max_fee_r`) existed but was calibrated to the fantasy
+fee, so it let them all through. Now:
+
+* `book.fee_pct = 0.10` (the real number), `book.max_fee_r = 0.12`: **a plan
+  whose fees are more than 12% of its risk is refused**, and the refusal is
+  counted (`the fees would eat the edge`, 11,701 refusals in three years).
+* Every R in these documents and on the page is therefore net of a real fee.
+
+Cost of being honest: **345 plans → 65**, and the win rate rises 17.1% → 24.6%.
+
+## 3. Which timeframes survive the cost gate
+
+| timeframes | plans / 3y | win% | R / trade | holdout R / trade |
+|---|---|---|---|---|
+| 5m,15m,30m,1h (before) | 65 | 24.6% | +0.254 | — |
+| 5m,15m,30m,1h,4h, fee ≤ 10% | 50 | 22.0% | +0.082 | +0.096 |
+| **15m,30m,1h,4h, fee ≤ 12% (now)** | **45** | **28.9%** | **+0.440** | **+0.372** |
+| major-liquidity traps only | 34 | 26.5% | +0.352 | +0.049 |
+
+5m is the loser: 23 of the 65 plans, 13% win, −5.28R. Its imbalances are too
+small to pay the fees at any stop the book allows, so it is the one timeframe
+that is switched off in `config.json` — all eleven remain available in
+`bot/buckets.py`, and turning one back on is one line.
+
+The shipped set is the only one that is positive in **both** halves of the
+split (+0.563R on train, +0.372R on holdout) — but at n=45 with a standard
+error of 0.29R, the t-statistic is **1.1**. It is a hypothesis that survived a
+split, not a proven edge, and the page says so.
+
+## 4. The grade was decoration, and it graded backwards
+
+The old grade was a running score of "nice things present". Across three years
+**every single plan scored 6+ and therefore every plan was grade A** — 345 of
+345. A label that never varies ranks nothing.
+
+The new grade is a six-item checklist, each check independently visible on the
+card (`cost`, `draw`, `liquidity`, `context`, `location`, `payload`). Measured
+on the 45 surviving plans:
+
+| grade | n | win | total R | R / trade |
+|---|---|---|---|---|
+| A (all six held) | 4 | 0 | −2.00 | −0.500 |
+| B (one missing) | 20 | 4 | +2.71 | +0.136 |
+| C (two or more) | 21 | 9 | +19.08 | +0.909 |
+
+**It runs backwards.** The fullest stories did worst; the plans missing
+"major liquidity" and "high volume" did best. With n=45 that is noise, but the
+direction is the opposite of the book's claim, and shipping a grade that
+implies the reverse of its own measurement would be exactly the dishonesty this
+round exists to remove.
+
+So the grade is kept as a **description** (what the setup is made of) and the
+page labels it as such, while the *ranking* comes from the archive: every
+signal's card now shows the measured record of its own bucket (timeframe/side:
+closed trades, realised R per trade, 95% interval, verdict). That number can
+disagree with the story, and when it does the trader sees both.
+
+## 5. The failure modes the audit found in the code
+
+| finding | evidence | fix |
+|---|---|---|
+| a closed trade kept a **live** mark | a short stopped in April displayed **−28.9R** in July | `SetupRecord.realized_r`: a finished trade reports what it realised; `advance()` refuses a finished record |
+| the archive mixed two yardsticks | page scored every win as +2R regardless of its draw | the record uses realised R, the same basis as the back-test |
+| sweep detection was quadratic | 3-year run = 10⁹ pool comparisons, 825 MB, minutes per config | sorted per-side price index + pruning: identical results (pinned by a test against the naive scan), ~40× faster |
+| the archive had no `session` column | could not measure the session split it displayed | migration + column |
+| a quiet scanner looked broken | one plan per ~3 weeks per instrument | `/api/watch`: what it is waiting for, per instrument and timeframe |
+
+## 6. What the page now says, and refuses to say
+
+* **measured record** in the sidebar: closed trades, win rate, R per trade,
+  the 95% interval, and a verdict that is one of *too few trades* / *not
+  proven* / *positive* / *negative*. It is computed from the archive, so it
+  updates as plans resolve and cannot be edited to look better.
+* **watching now**: the trap it has taken and the imbalance it is sitting in,
+  with what it still needs to fire — so an empty table is explainable instead
+  of looking dead.
+* **the funnel** in the status bar: traps → displacements → plans, plus the
+  most common refusal reason. With 12,904 fee refusals in three years, that
+  line is the honest explanation of why there are not more signals.
+
+## The verdict, in one line
+
+**The previous build published signals that, at real cost, were
+indistinguishable from noise, and labelled every one of them grade A.** This
+build refuses any plan that cannot pay its own fees, publishes on the four
+timeframes that survived a split-sample test, shows the measured record with
+its error bar, and says "not proven" where the sample does not support more.
+The recipe in the shipped set is +0.44R/trade on three years of BTC with a
+t-statistic of 1.1: a lead worth keeping, not a claim worth trading.
