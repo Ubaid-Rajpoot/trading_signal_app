@@ -93,13 +93,14 @@ def create_app(
     engine.broadcast = publish
     engine.source = getattr(feed, "source", "live")
     engine.exchange = getattr(feed, "name", "binance")
-    max_symbols = int(config.get("max_symbols", 500))
+    max_symbols = int(config.get("max_symbols", 2000))
     workers = max(1, int(config.get("workers", 30)))
-    db_path = (
-        os.environ.get("TDIGM_DB")
-        or config.get("database")
-        or str(Path(__file__).resolve().parents[1] / "data" / "tdigm.sqlite3")
-    )
+    db_override = os.environ.get("TDIGM_DB")
+    db_path = db_override or config.get("database") or "data/tdigm.sqlite3"
+    # A config-relative database is stable whether run.py is started from the
+    # repository root, tdigm-live/, systemd, or a container working directory.
+    if not db_override and config_path and not Path(str(db_path)).is_absolute():
+        db_path = str(Path(config_path).resolve().parent / str(db_path))
     store = SignalStore(None if config.get("database") == "" else db_path)
     engine.attach_store(store)
     restored = engine.load_stored()
@@ -117,6 +118,7 @@ def create_app(
         would rate-limit us and every row would look broken. They warm in the
         background and show 'warming' until they are ready.
         """
+        engine.prepare_warmup(symbols)
         for symbol in symbols:
             if symbol in warm_pending:
                 continue
@@ -202,15 +204,26 @@ def create_app(
                     _persist_symbols()
             except Exception as exc:
                 await publish({"type": "log", "level": "warn", "message": f"auto-universe fetch failed: {exc}"})
+        # Subscribe immediately.  Closed bars are buffered per symbol by the
+        # engine while that symbol's REST history is rebuilt, then drained in
+        # order.  A 700-contract deep scan therefore never creates a blind live
+        # window lasting several minutes.
+        engine.prepare_warmup(list(engine.symbols))
+        pump_task = asyncio.create_task(pump())
         try:
-            await engine.warmup(feed, concurrency=workers)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # never take the page down over warm-up
-            await publish(
-                {"type": "log", "level": "error", "message": f"warm-up failed: {exc}"}
-            )
-        await pump()
+            try:
+                await engine.warmup(feed, concurrency=workers)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never take the page down over warm-up
+                await publish(
+                    {"type": "log", "level": "error", "message": f"warm-up failed: {exc}"}
+                )
+            await pump_task
+        finally:
+            pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pump_task
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -229,6 +242,9 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             tasks.clear()
+            if hasattr(feed, "close"):
+                with contextlib.suppress(Exception):
+                    await feed.close()
 
     app = FastAPI(title="TDIGM liquidity scanner", lifespan=lifespan)
     # the table is ~90 kB of JSON and the page asks for it every few seconds
@@ -254,6 +270,7 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
+        store_counts = store.counts()
         return {
             "ok": True,
             "source": engine.source,
@@ -266,11 +283,17 @@ def create_app(
             "failed": len(engine.warm_failures),
             "market": str(config.get("market", "futures")),
             "setups": len(engine.setup_payloads),
-            "stored": store.counts().get("total", 0),
+            "stored": store_counts.get("total", 0),
             "store": store.enabled,
             "workers": workers,
             "rescanning": bool(rescan_state.get("running")),
-            "setups_valid": len(engine.open_setups(valid_only=True, limit=10_000)),
+            "setups_valid": store_counts.get(
+                "valid", len(engine.open_setups(valid_only=True, limit=10_000))
+            ),
+            "setups_unmitigated": store_counts.get(
+                "unmitigated",
+                sum(1 for row in engine.setup_payloads.values() if row.get("valid") and not row.get("mitigated")),
+            ),
             "candles_seen": engine.candles_seen,
             "signals": engine.kinds.get("signal", 0),
             "symbols": len(engine.symbols),
@@ -327,15 +350,23 @@ def create_app(
     async def watch(limit: int = 40) -> dict[str, Any]:
         """What the book is waiting for, so an empty table is explainable."""
         rows = engine.watching(limit=max(1, min(200, limit)))
-        return {
-            "watching": rows,
-            "funnel": {
-                "traps": getattr(engine.book, "traps", 0),
-                "displacements": getattr(engine.book, "armed", 0),
-                "plans": len(engine.book.plans) if engine.book else 0,
-                "drops": engine.book.drops() if engine.book else {},
-            },
-        }
+        if engine.book is not None:
+            funnel = {
+                "mode": "book",
+                "traps": engine.book.traps,
+                "displacements": engine.book.armed,
+                "plans": len(engine.book.plans),
+                "drops": engine.book.drops(),
+            }
+        else:
+            funnel = {
+                "mode": "sweep",
+                "sweeps": sum(cell.structure.sweep_count for cell in engine.cells.values()),
+                "setups": sum(cell.structure.setups for cell in engine.cells.values()),
+                "plans": engine.kinds.get("signal", 0),
+                "drops": dict(engine.filters.rejections),
+            }
+        return {"watching": rows, "funnel": funnel, "strategy": engine.strategy}
 
     @app.get("/api/signals")
     async def signals(
@@ -570,7 +601,7 @@ def create_app(
     # -------------------------------------------------------------- universe
     async def _universe(force: bool = False) -> dict[str, Any]:
         now = time.time()
-        if force or (universe_cache["items"] and now - universe_cache["at"] < 600):
+        if not force and universe_cache["items"] and now - universe_cache["at"] < 600:
             return universe_cache
         try:
             items = await feed.universe()

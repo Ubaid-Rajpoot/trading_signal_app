@@ -12,7 +12,7 @@ Here every published setup becomes a record with a state machine:
     active       price is in the zone (the entry is filled)        -> in a trade
     win          the target was reached
     stopped      the stop was hit
-    expired      too many bars went by without the zone being touched
+    expired      optional positive max-bars limit elapsed (disabled by default)
     invalidated  the stop was taken before the entry was ever filled
 
 ``valid`` means pending or active - a setup you can still act on. Everything
@@ -251,7 +251,7 @@ class SetupRecord:
                 self.state, self.state_since = "invalidated", int(bar["close_time"])
                 self.closed_ms = int(bar["close_time"])
                 return True
-            if self.bars >= limit:
+            if limit > 0 and self.bars >= limit:
                 self.state, self.state_since = "expired", int(bar["close_time"])
                 self.closed_ms = int(bar["close_time"])
                 return True
@@ -286,7 +286,7 @@ class SetupRecord:
                     self.be_ms = int(bar["close_time"])
                     self.stop = self.entry
                     changed = True
-            if self.bars >= limit:
+            if limit > 0 and self.bars >= limit:
                 # no target in reach and it has been open far too long
                 self.state, self.state_since = "expired", int(bar["close_time"])
                 self.closed_ms = int(bar["close_time"])

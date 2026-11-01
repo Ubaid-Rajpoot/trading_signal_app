@@ -75,6 +75,7 @@ def test_a_setup_is_written_then_kept_up_to_date(tmp_path):
     assert len(rows) == 1, "the same setup is one row, not two"
     assert rows[0]["state"] == "active" and rows[0]["mitigated"] is True
     assert store.counts()["total"] == 1
+    assert store.counts()["valid"] == 1 and store.counts()["unmitigated"] == 0
 
 
 def test_a_decided_outcome_is_final(tmp_path):
@@ -159,6 +160,14 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     assert restored == 1
     assert fresh.setup_payloads[PAYLOAD["key"]]["symbol"] == "BTCUSDT"
     assert fresh.open_setups(valid_only=True), "the archive row is on the board at boot"
+    assert PAYLOAD["key"] in fresh.registry, "a valid row is a live state machine, not stale JSON"
+
+    # A new post-restart candle invalidates the untouched short before entry and
+    # writes that state back through the same payload.
+    cell = fresh.cells[("BTCUSDT", "1h")]
+    fresh._track_setups(cell, {"open": 103, "high": 105, "low": 102, "close": 104,
+                               "close_time": PAYLOAD["created_ms"] + 3_600_000})
+    assert fresh.setup_payloads[PAYLOAD["key"]]["state"] == "invalidated"
 
 
 def test_the_record_carries_an_honest_error_bar(tmp_path):

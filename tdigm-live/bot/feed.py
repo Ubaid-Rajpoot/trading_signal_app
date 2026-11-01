@@ -85,6 +85,13 @@ class BaseFeed:
         self.status = "starting"
         self.last_message = 0.0
         self.frames = 0
+        # One pooled client for thousands of concurrent history pages. Opening a
+        # new TLS connection per request made a full futures-universe warm-up far
+        # slower and more likely to exhaust sockets.
+        self._http = httpx.AsyncClient(
+            timeout=20,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
+        )
         self._generation = 0  # bumped when the symbol list changes
 
     # ------------------------------------------------------------- symbols
@@ -109,7 +116,17 @@ class BaseFeed:
         return removed
 
     def exchange_interval(self, timeframe: str) -> str | None:
-        return self.tf_map.get(timeframe, timeframe)
+        """Return the engine's canonical interval when this feed supports it.
+
+        ``history()`` owns exchange-specific translation (``1h`` -> ``Min60``).
+        Returning ``Min60`` here and then passing it back into ``history()`` made
+        MEXC map the value a second time to ``None``—so every futures warm-up
+        failed even though direct history calls worked. ``None`` only means the
+        engine must aggregate a lower interval.
+        """
+        if timeframe in self.tf_map:
+            return timeframe if self.tf_map[timeframe] is not None else None
+        return timeframe
 
     # ------------------------------------------------------------- history
     async def history(self, symbol: str, interval: str, limit: int = 500,
@@ -127,8 +144,7 @@ class BaseFeed:
         delay = 1.0
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(timeout=20) as client:
-                    resp = await client.get(url, params=params)
+                resp = await self._http.get(url, params=params)
                 if resp.status_code == 200:
                     return resp.json()
                 if resp.status_code == 429 and attempt < retries - 1:
@@ -146,6 +162,10 @@ class BaseFeed:
                 await asyncio.sleep(delay)
                 delay *= 2.0
         raise FeedError(f"{url} -> max retries exceeded")
+
+    async def close(self) -> None:
+        """Release pooled REST connections on application shutdown."""
+        await self._http.aclose()
 
     # -------------------------------------------------------------- stream
     async def stream(self, symbols: list[str]) -> AsyncIterator[dict]:  # pragma: no cover
@@ -511,11 +531,30 @@ def plain_symbol(symbol: str) -> str:
     return str(symbol).upper().replace("_", "")
 
 
-def _kline(symbol: str, open_time: int, o, h, l, c, v, trades: int = 0, closed: bool = True) -> dict:
+def _kline(
+    symbol: str,
+    open_time: int,
+    o,
+    h,
+    l,
+    c,
+    v,
+    trades: int = 0,
+    closed: bool = True,
+    duration_ms: int = 60_000,
+) -> dict:
+    """Normalise one contract candle without lying about when it closed.
+
+    The old helper always added 59,999 ms, including to 4h and daily history.
+    Indicator values were unaffected, but signal timestamps (and therefore
+    archive keys) were hours early.  Live contract updates are 1m and keep the
+    default; REST callers pass the interval's real duration.
+    """
+    duration = max(1, int(duration_ms))
     return {
         "symbol": symbol,
         "open_time": int(open_time),
-        "close_time": int(open_time) + 59_999,
+        "close_time": int(open_time) + duration - 1,
         "open": _num(o),
         "high": _num(h),
         "low": _num(l),
@@ -536,49 +575,88 @@ class MexcFuturesFeed(BaseFeed):
     name = "mexc"
     market = "futures"
     tf_map = MEXC_FUTURES_TFS
-    chunk_size = 60
+    # MEXC limits subscriptions per connection.  Small shards also contain a
+    # reconnect to one part of the universe instead of taking every contract
+    # offline together.
+    chunk_size = 20
+    history_page_size = 2000  # documented maximum for contract klines
 
     def __init__(self, symbols: Iterable[str], **kwargs: object) -> None:
         super().__init__(symbols, **kwargs)
         self._last_candle: dict[str, dict] = {}
 
-    async def history(self, symbol: str, interval: str, limit: int = 500) -> list[dict]:
+    async def history(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 500,
+        end_time: int | None = None,
+    ) -> list[dict]:
+        """Return the requested depth, paging MEXC's 2,000-bar windows.
+
+        Previously ``limit=2500`` only made one request.  MEXC caps that response
+        at 2,000 rows, so the scanner claimed to scan a long history while
+        silently receiving less.  Windows now walk backwards, are de-duplicated,
+        and retain only closed bars.
+        """
         mapped = MEXC_FUTURES_TFS.get(interval, None)
         if not mapped:
-            raise FeedError(f"MEXC futures has no {interval} interval - aggregate 1m instead")
+            raise FeedError(f"MEXC futures has no {interval} interval - aggregate a lower interval instead")
         contract = contract_symbol(symbol)
-        now_s = int(time.time())
-        step = int(TIMEFRAMES[interval] / 1000) if interval in TIMEFRAMES else 60
-        start = now_s - step * (limit + 5)
-        rows = await self._get_json(
-            f"{MEXC_FUTURES_REST}/api/v1/contract/kline/{contract}",
-            {"interval": mapped, "start": start, "end": now_s},
-        )
-        data = (rows or {}).get("data") or {}  # type: ignore[union-attr]
-        times = data.get("time") or []
-        if not times:
-            raise FeedError(f"MEXC futures returned no {interval} candles for {contract}")
         symbol_plain = plain_symbol(contract)
-        candles = []
+        step_ms = int(TIMEFRAMES.get(interval, 60_000))
+        step_s = max(1, step_ms // 1000)
+        wanted = max(1, min(int(limit), 50_000))
         now_ms = int(time.time() * 1000)
-        for i, stamp in enumerate(times):
-            open_time = int(stamp) * 1000
-            if open_time + step * 1000 > now_ms:
-                continue  # still forming
-            candles.append(
-                _kline(
+        cursor_s = min(int(end_time // 1000) if end_time else now_ms // 1000, now_ms // 1000)
+        found: dict[int, dict] = {}
+        previous_earliest: int | None = None
+
+        while len(found) < wanted:
+            page_size = min(self.history_page_size, wanted - len(found))
+            # A two-bar overlap protects the boundary from inclusive/exclusive
+            # differences in the exchange's start/end interpretation.
+            start_s = cursor_s - step_s * (page_size + 2)
+            rows = await self._get_json(
+                f"{MEXC_FUTURES_REST}/api/v1/contract/kline/{contract}",
+                {"interval": mapped, "start": start_s, "end": cursor_s},
+            )
+            data = (rows or {}).get("data") or {}  # type: ignore[union-attr]
+            times = data.get("time") or []
+            columns = [data.get(name) or [] for name in ("open", "high", "low", "close", "vol")]
+            count = min([len(times), *(len(column) for column in columns)]) if times else 0
+            if count <= 0:
+                break
+
+            page_times: list[int] = []
+            for i in range(count):
+                open_time = int(times[i]) * 1000
+                page_times.append(open_time)
+                if open_time + step_ms > now_ms or open_time // 1000 > cursor_s:
+                    continue  # still forming or in an overlapping newer window
+                found[open_time] = _kline(
                     symbol_plain,
                     open_time,
-                    data["open"][i],
-                    data["high"][i],
-                    data["low"][i],
-                    data["close"][i],
-                    data["vol"][i],
+                    columns[0][i],
+                    columns[1][i],
+                    columns[2][i],
+                    columns[3][i],
+                    columns[4][i],
+                    duration_ms=step_ms,
                 )
-            )
+
+            earliest = min(page_times)
+            if previous_earliest is not None and earliest >= previous_earliest:
+                break  # a defensive stop for an exchange ignoring start/end
+            previous_earliest = earliest
+            cursor_s = earliest // 1000 - 1
+            if count < page_size:
+                break  # this contract has no older history
+
+        candles = [found[key] for key in sorted(found)]
         if not candles:
             raise FeedError(f"MEXC futures returned no closed {interval} candles for {contract}")
-        return candles[-limit:]
+        return candles[-wanted:]
 
     async def universe(self) -> list[dict]:
         detail = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/detail")
@@ -588,6 +666,14 @@ class MexcFuturesFeed(BaseFeed):
         for item in (detail or {}).get("data") or []:  # type: ignore[union-attr]
             symbol = item.get("symbol")
             if not symbol or item.get("quoteCoin") != "USDT":
+                continue
+            # MEXC: state 0 = enabled; 1 delivery, 2 completed, 3 offline,
+            # 4 paused. Hidden/offline contracts must not consume a socket and
+            # then fail every history request.
+            state = item.get("state")
+            if state is not None and str(state) != "0":
+                continue
+            if bool(item.get("isHidden", False)):
                 continue
             tick = stats.get(symbol)
             if not tick:
@@ -648,7 +734,29 @@ class MexcFuturesFeed(BaseFeed):
                     )
                     previous = self._last_candle.get(symbol)
                     if previous is not None and open_time > previous["open_time"]:
-                        await self._push({**previous, "closed": True})
+                        gap = open_time - int(previous["open_time"])
+                        if gap > 60_000:
+                            # The socket was away across one or more closes. Pull
+                            # the authoritative missing bars before resuming;
+                            # otherwise a reconnect creates a permanent hole and
+                            # can miss the exact break candle.
+                            try:
+                                missing = await self.history(
+                                    symbol, "1m", min(2000, gap // 60_000 + 2), end_time=open_time - 1
+                                )
+                                recovered = [
+                                    row for row in missing
+                                    if int(previous["open_time"]) <= int(row["open_time"]) < open_time
+                                ]
+                                if recovered:
+                                    for row in recovered:
+                                        await self._push(row)
+                                else:
+                                    await self._push({**previous, "closed": True})
+                            except Exception:
+                                await self._push({**previous, "closed": True})
+                        else:
+                            await self._push({**previous, "closed": True})
                     self._last_candle[symbol] = candle
                     await self._push(dict(candle))
             finally:
@@ -703,6 +811,7 @@ class BinanceFuturesFeed(BaseFeed):
                     r[4],
                     r[5],
                     int(r[8]) if len(r) > 8 else 0,
+                    duration_ms=int(TIMEFRAMES.get(interval, 60_000)),
                 )
                 for r in rows  # type: ignore[union-attr]
                 if int(r[6]) < now_ms

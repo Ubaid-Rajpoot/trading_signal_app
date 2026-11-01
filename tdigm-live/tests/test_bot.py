@@ -288,6 +288,18 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     assert setup.target is None, "no pre-sweep liquidity was left below the entry"
 
 
+def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
+    # The sweep candle itself closes below the opposite low.  Because the rule
+    # requires the break *subsequently*, a following candle that merely stays
+    # below 95 must not be mislabelled as the body-break candle.
+    rows = list(SHORT_PATTERN[:19])
+    rows[9] = (105.5, 101, 104)  # do not sweep the original 106 high early
+    rows[-1] = (108, 90, 91)     # sweep high + close below low on this one bar
+    rows.append((94, 89, 90))
+    _st, _pivots, sweeps, setups, _invalid = run_structure(rows)
+    assert sweeps and not setups
+
+
 def test_sweep_is_invalidated_when_price_keeps_going():
     # sweep the 107 high and then CLOSE above it: no reversal, no setup
     rows = SHORT_PATTERN[:19] + [(110, 103, 109)]
@@ -387,6 +399,17 @@ def test_hvb_min_points_filter():
     assert f.apply(candidate(hvb_points=6.0))[0]
 
 
+def test_hvb_must_point_the_same_way_as_the_structure_break():
+    f = Filters({
+        "hvb": True, "hvb_min_points": 0, "hvb_min_speed": 0,
+        "trend_context": False, "require_bos": False, "structure_direction": False,
+    })
+    ok, reasons = f.apply(candidate(side="SHORT", hvb="up"))
+    assert not ok
+    assert any("direction up opposes the short" in reason for reason in reasons)
+    assert f.apply(candidate(side="SHORT", hvb="down"))[0]
+
+
 def test_min_rr_filters_small_targets():
     f = Filters({"min_rr": 1.5})
     assert not f.apply(candidate(rr=0.4))[0]
@@ -470,7 +493,7 @@ def test_adding_and_removing_symbols_bumps_the_generation():
 def test_mexc_has_no_3m_candle_so_the_engine_must_aggregate():
     feed = MexcFeed(["BTCUSDT"])
     assert feed.exchange_interval("3m") is None
-    assert feed.exchange_interval("1h") == "60m"
+    assert feed.exchange_interval("1h") == "1h", "the feed translates to 60m inside history()"
     assert make_feed("binance", ["BTCUSDT"]).exchange_interval("1h") == "1h"
     with pytest.raises(Exception):
         make_feed("ftx", ["BTCUSDT"])
@@ -537,6 +560,28 @@ async def test_engine_emits_a_signal_for_the_complete_setup():
     assert alert["setup"]["stop"] == 108.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
     assert alert["filtered"] == []
+
+
+@pytest.mark.asyncio
+async def test_production_tdigm_settings_confirm_the_break_on_the_same_candle():
+    # A neutral, moving RSI baseline followed by the trader's sweep/body-break
+    # fixture. The final drop crosses the MBL down with speed on exactly the
+    # candle that closes below the opposite low.
+    prefix = []
+    for i in range(180):
+        close = 98 + (i % 10) * 0.15 - (i % 3) * 0.03
+        prefix.append((close + 0.3, close - 0.3, close))
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, prefix + SHORT_PATTERN + [(95, 93, 94)])
+    signals = [row for row in engine.setup_payloads.values() if row["side"] == "SHORT"]
+    assert signals
+    signal = signals[-1]
+    assert signal["hvb_side"] == "down"
+    assert signal["hvb_ms"] == signal["created_ms"]
+    assert signal["bos_ms"] <= signal["created_ms"]
 
 
 @pytest.mark.asyncio
@@ -838,7 +883,9 @@ def test_book_gates_reject_and_explain():
     cand = candidate(book=book)
 
     assert not Filters({"structure_direction": True}).apply(cand)[0]          # against structure
-    assert Filters({"structure_direction": True}).apply(candidate(book={**book, "external_trend": 1}))[0] is False
+    assert Filters({"structure_direction": True}).apply(
+        candidate(book={**book, "external_trend": 1})
+    )[0] is True  # unrelated book gates are optional unless explicitly enabled
     open_filters = {"structure_direction": False, "premium_discount": False,
                     "block_liquidity_pool": False, "require_fvg": False, "require_ms": False}
     assert Filters(open_filters).apply(candidate(book={**book, "external_trend": -1}))[0] is True

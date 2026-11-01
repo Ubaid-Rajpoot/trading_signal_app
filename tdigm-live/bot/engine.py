@@ -202,19 +202,24 @@ class Engine:
         structure: dict[str, Any] | None = None,
         broadcast: Callable[[dict], Awaitable[None]] | None = None,
         preview_max_symbols: int = 200,
-        strategy: str = "book",
+        strategy: str = "sweep",
         book: dict[str, Any] | None = None,
+        history_bars: int = 5000,
     ) -> None:
-        self.symbols = [s.upper() for s in symbols]
+        self.symbols = list(dict.fromkeys(s.upper() for s in symbols))
         self.timeframes = [tf for tf in timeframes if tf in TIMEFRAMES]
         self.tdi_settings = tdi_settings
         self.centre_reference = str(tdi_settings.get("hvb_reference", "mbl"))
         self.break_lookback = int(break_lookback)
-        self.hvb_min_points = float(hvb_min_points)
-        self.hvb_min_speed = 0.0
         self.structure_settings = dict(structure or {})
         self.broadcast = broadcast
         self.filters = Filters(filters or {})
+        # The active filter values are the one source of truth.  Previously the
+        # engine started at the obsolete top-level value (usually zero) until a
+        # user edited the settings page.
+        self.hvb_min_points = float(self.filters.config.get("hvb_min_points", hvb_min_points) or 0)
+        self.hvb_min_speed = float(self.filters.config.get("hvb_min_speed", 0) or 0)
+        self.history_bars = max(120, min(50_000, int(history_bars)))
         self.preview_max_symbols = int(preview_max_symbols)
         self.exchange = "binance"
 
@@ -243,9 +248,16 @@ class Engine:
         self._collected: list[dict] = []
         self.backfilled = 0
         self.warm_failures: dict[str, int] = {}
+        # Live sockets start immediately while REST history warms. Closed bars
+        # for a symbol being rebuilt are buffered and drained in order afterwards,
+        # so startup is concurrent without racing a fresh cell over live data.
+        self._warming_symbols: set[str] = set()
+        self._warm_backlog: dict[str, dict[int, dict]] = {}
+        self._warm_locks: dict[str, asyncio.Lock] = {}
+        self._last_stream_open: dict[str, int] = {}
         self.store: SignalStore | None = None
         self.market = "futures"
-        # ---- which decision engine runs (round 21: the book's, by default)
+        # ---- which decision engine runs (TDIGM sweep checklist by default)
         self.strategy = "book" if str(strategy).lower() in {"book", "narrative", "v6"} else "sweep"
         self.book_config = dict(book or {})
         self.book: BookRunner | None = None
@@ -318,6 +330,9 @@ class Engine:
             self._add_cells(symbol)
             if self.book is not None:
                 self.book.add_symbol(symbol)
+            for payload in self.setup_payloads.values():
+                if str(payload.get("symbol") or "").upper() == symbol:
+                    self._restore_stored_record(payload)
             added.append(symbol)
         if added:
             self.state_interval = self._interval_for(len(self.symbols))
@@ -386,7 +401,7 @@ class Engine:
         """Give the engine a database: every setup is written as it is found."""
         self.store = store
 
-    def load_stored(self, limit: int = 400) -> int:
+    def load_stored(self, limit: int = 2000) -> int:
         """Put the archive on the board before a single candle arrives.
 
         A restart used to mean an empty screen until the exchange answered - the
@@ -396,13 +411,68 @@ class Engine:
         """
         if self.store is None or not self.store.enabled:
             return 0
-        rows = self.store.list(limit=limit)
+        recent = self.store.list(limit=limit)
+        # A still-valid setup may be older than the newest archive page. Always
+        # restore valid rows too so restart cannot turn "unmitigated" into a
+        # stale JSON row that never receives another candle.
+        valid = self.store.list(limit=limit, valid=1)
+        rows = list({row.get("key"): row for row in [*recent, *valid] if row.get("key")}.values())
         for row in rows:
             key = row.get("key")
             if not key or key in self.setup_payloads:
                 continue
             self.setup_payloads[key] = row
+            self._restore_stored_record(row)
         return len(rows)
+
+    def _restore_stored_record(self, payload: dict) -> None:
+        """Rehydrate a valid archive row so live candles keep its state honest."""
+        key = str(payload.get("key") or "")
+        symbol = str(payload.get("symbol") or "").upper()
+        timeframe = str(payload.get("timeframe") or "")
+        if (
+            not key
+            or key in self.registry
+            or not payload.get("valid")
+            or (symbol, timeframe) not in self.cells
+        ):
+            return
+        try:
+            record = SetupRecord(
+                key=key,
+                symbol=symbol,
+                timeframe=timeframe,
+                side=str(payload.get("side") or "SHORT"),
+                created_ms=int(payload.get("created_ms") or payload.get("time") or 0),
+                entry=float(payload.get("entry") or 0),
+                stop=float(payload.get("stop") or 0),
+                target=None if payload.get("target") is None else float(payload["target"]),
+                rr=payload.get("rr"),
+                zone=payload.get("zone"),
+                swept_level=float(payload.get("swept_level") or 0),
+                swept_side=str(payload.get("swept_side") or ""),
+                sweep_ms=int(payload.get("sweep_ms") or 0),
+                bos_level=float(payload.get("bos_level") or 0),
+                bos_ms=int(payload.get("bos_ms") or 0),
+                break_kind=str(payload.get("break_kind") or "SHIFT"),
+                hvb_ms=payload.get("hvb_ms"),
+                hvb_side=payload.get("hvb_side"),
+                max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
+            )
+        except (TypeError, ValueError):
+            return
+        record.state = str(payload.get("state") or "pending")
+        record.state_since = int(payload.get("state_since") or record.created_ms)
+        record.touched_ms = payload.get("touched_ms")
+        record.closed_ms = payload.get("closed_ms")
+        record.last_price = payload.get("last_price")
+        record.bars = int(payload.get("bars") or 0)
+        record.stop0 = float(payload.get("stop0") or record.stop)
+        record.risk0 = abs(record.entry - record.stop0)
+        record.be_ms = payload.get("be_ms")
+        record.breakeven_at_r = float(payload.get("breakeven_at_r") or 0)
+        self.registry[key] = record
+        self.by_cell.setdefault((symbol, timeframe), []).append(record)
 
     def _remember(self, payload: dict) -> None:
         """Write-through to the database. Never allowed to break the scanner."""
@@ -424,6 +494,10 @@ class Engine:
                 self._append(cell, {**candle, "closed": True})
 
     def _append(self, cell: Cell, bar: dict) -> TdiPoint | None:
+        # The first websocket close after a REST warm-up often repeats the last
+        # historical candle. Never advance indicators or setup lifecycles twice.
+        if cell.last_close_time and int(bar["close_time"]) <= cell.last_close_time:
+            return None
         cell.candles.append(bar)
         cell.last_close_time = int(bar["close_time"])
         point = cell.tracker.add(float(bar["close"]))
@@ -433,7 +507,37 @@ class Engine:
         cell.tmap_state = cell.tmap.add(bar, atr=cell.regime_point.atr)
         return point
 
+    def prepare_warmup(self, symbols: list[str]) -> None:
+        """Mark symbols before the live pump starts, closing the startup race."""
+        self._warming_symbols.update(str(symbol).upper() for symbol in symbols)
+
     async def warm_symbol(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
+        """Warm one symbol atomically while its live closed bars wait in memory."""
+        symbol = symbol.upper()
+        lock = self._warm_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            self._warming_symbols.add(symbol)
+            try:
+                empty = await self._warm_symbol_history(feed, symbol, attempts=attempts, force=force)
+                # Bars can arrive while earlier buffered bars are being applied.
+                # Keep the symbol paused and drain until the queue is actually
+                # empty; at live speed this normally runs once.
+                while self._warm_backlog.get(symbol):
+                    pending = self._warm_backlog.pop(symbol, {})
+                    for candle in sorted(pending.values(), key=lambda row: int(row["open_time"])):
+                        await self._process_stream_candle(candle)
+                return empty
+            finally:
+                # Also drain on a failed REST warm-up.  Keep the pause in place
+                # during every await; once the final loop observes an empty
+                # backlog, discard is synchronous and no event can interleave.
+                while self._warm_backlog.get(symbol):
+                    pending = self._warm_backlog.pop(symbol, {})
+                    for candle in sorted(pending.values(), key=lambda row: int(row["open_time"])):
+                        await self._process_stream_candle(candle)
+                self._warming_symbols.discard(symbol)
+
+    async def _warm_symbol_history(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
         """Load enough history for one instrument, then read the setups it holds.
 
         Returns the number of cells that still came back empty. Two things matter
@@ -449,6 +553,10 @@ class Engine:
         symbol = symbol.upper()
         empty = 0
         book_mode = self.strategy == "book" and self.book is not None
+        # 3m and 2h are derived on MEXC. Share their deeper 1m/1h source
+        # windows with the native 1m/1h cells instead of downloading the same
+        # rows twice for every contract.
+        history_cache: dict[str, list[dict]] = {}
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
             if cell is None or (len(cell.candles) >= 120 and not force):
@@ -456,18 +564,35 @@ class Engine:
             candles: list[dict] = []
             for attempt in range(attempts):
                 interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
-                if interval is None:  # exchange has no such candle: build it from 1m
-                    if await self._warm_from_minutes(feed, symbol, tf):
+                if interval is None:  # exchange has no native candle: aggregate a lower one
+                    if await self._warm_from_lower(feed, symbol, tf, history_cache):
                         candles = []
                         break
                 else:
                     try:
-                        candles = await feed.history(symbol, interval, 2500)
+                        request_bars = self.history_bars
+                        if (
+                            tf == "1m"
+                            and "3m" in self.timeframes
+                            and feed.exchange_interval("3m") is None
+                        ):
+                            request_bars = min(50_000, (self.history_bars + 3) * 3)
+                        elif (
+                            tf == "1h"
+                            and "2h" in self.timeframes
+                            and feed.exchange_interval("2h") is None
+                        ):
+                            request_bars = min(50_000, (self.history_bars + 3) * 2)
+                        cached = history_cache.get(interval) or []
+                        candles = cached if len(cached) >= request_bars - 3 else await feed.history(
+                            symbol, interval, request_bars
+                        )
                         if candles:
+                            history_cache[interval] = candles
                             break
                     except Exception as exc:
                         if attempt == attempts - 1:
-                            if await self._warm_from_minutes(feed, symbol, tf):
+                            if await self._warm_from_lower(feed, symbol, tf, history_cache):
                                 candles = []
                                 break
                             self.warm_failures[f"{symbol}:{tf}"] = attempt + 1
@@ -477,7 +602,9 @@ class Engine:
                         else:
                             await asyncio.sleep(0.6 * (attempt + 1))
             if candles:
-                await self._replay(symbol, tf, candles, evaluate=not book_mode)
+                await self._replay(
+                    symbol, tf, candles[-self.history_bars:], evaluate=not book_mode
+                )
                 self.warm_failures.pop(f"{symbol}:{tf}", None)
             current = self.cells.get((symbol, tf), cell)
             if len(current.candles) < 120:
@@ -568,8 +695,8 @@ class Engine:
 
         Two details matter:
 
-        * the whole fetched history is replayed (600 bars), not just the 180 the
-          cell keeps, so a setup that confirmed 8 hours ago is still found;
+        * the whole configured history window is replayed, not just the 180 the
+          cell keeps for charts, so older unmitigated setups are still found;
         * the lifecycle runs over that history too, so an old setup is reported
           as expired/stopped instead of pretending to still be pending.
         """
@@ -584,7 +711,9 @@ class Engine:
             rollup=cell.rollup if timeframe != "1m" else None,
             regime_limits=cell.regime_limits,
         )
-        self.by_cell[(cell.symbol, cell.timeframe)] = []
+        # Keep restored valid records attached: replayed candles after their
+        # creation must continue their lifecycle. Duplicate keys are replaced by
+        # the live derivation in _register, never tracked twice.
         self._quiet += 1
         self._collected = []
         try:
@@ -628,6 +757,7 @@ class Engine:
         symbols = list(self.symbols)
         if not symbols:
             return
+        self.prepare_warmup(symbols)
         limit = max(1, min(int(concurrency), len(symbols)))
         gate = asyncio.Semaphore(limit)
 
@@ -652,6 +782,8 @@ class Engine:
         self.setup_payloads.clear()
         self.setup_events.clear()
         self.by_cell.clear()
+        self.seen.clear()
+        self.signals.clear()
 
     async def rescan(
         self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30
@@ -663,12 +795,13 @@ class Engine:
         """
         if reset:
             self.forget_setups()
-        found = 0
+        before = set(self.setup_payloads)
         warmed = 0
+        self.prepare_warmup(list(self.symbols))
         gate = asyncio.Semaphore(max(1, int(concurrency)))
 
         async def one(symbol: str) -> None:
-            nonlocal found, warmed
+            nonlocal warmed
             async with gate:
                 cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
                 missing = any(c is None or len(c.candles) < 120 for c in cells)
@@ -681,6 +814,7 @@ class Engine:
 
         await asyncio.gather(*(one(symbol) for symbol in self.symbols))
         await self._emit_state(force=True)
+        found = len(set(self.setup_payloads) - before)
         return {"symbols": len(self.symbols), "setups": found, "warmed": warmed}
 
     async def retry_failed(self, feed) -> int:
@@ -716,19 +850,31 @@ class Engine:
             found.extend(await self._replay(symbol, tf, list(cell.candles)))
         return found
 
-    async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> bool:
-        """Fall back to rolling 1m history up when the exchange has no such candle."""
+    async def _warm_from_lower(
+        self, feed, symbol: str, tf: str, history_cache: dict[str, list[dict]] | None = None
+    ) -> bool:
+        """Build a non-native timeframe from the nearest practical lower one.
+
+        MEXC has no 3m or 2h contract candles. Building 2h from 1m multiplied a
+        deep scan into hundreds of thousands of rows per contract; 1h is exact,
+        clock-aligned input for 2h and is two orders of magnitude cheaper.
+        """
         cell = self.cells.get((symbol, tf))
         if cell is None:
             return False
-        minutes = int(TIMEFRAMES[tf] / 60_000)
-        # enough 1m bars to fill this timeframe's window - a 1h cell needs
-        # 120 hours of minutes, not 1,000 bars (that was 16 candles)
-        need = min(60_000, (self.min_bars + 5) * minutes)
-        try:
-            bars = await feed.history(symbol, "1m", need)
-        except Exception:
-            return False
+        source = {"3m": "1m", "2h": "1h"}.get(tf, "1m")
+        source_ms = TIMEFRAMES[source]
+        target_ms = TIMEFRAMES[tf]
+        ratio = max(1, target_ms // source_ms)
+        need = min(50_000, (self.history_bars + 3) * ratio)
+        cache = history_cache if history_cache is not None else {}
+        bars = cache.get(source) or []
+        if source not in cache:
+            try:
+                bars = await feed.history(symbol, source, need)
+                cache[source] = bars
+            except Exception:
+                return False
         if not bars:
             return False
         rollup = Rollup(tf)
@@ -738,7 +884,7 @@ class Engine:
                 built.append(done)
         if not built:
             return False
-        await self._replay(symbol, tf, built)
+        await self._replay(symbol, tf, built[-self.history_bars:])
         return True
 
     def _prime_partial(self, cell: Cell, minutes: list[dict]) -> None:
@@ -751,13 +897,28 @@ class Engine:
 
     # ------------------------------------------------------------- candles
     async def on_candle(self, candle: dict) -> None:
+        """Accept one stream update, buffering closed bars during REST rebuilds."""
         symbol = candle["symbol"].upper()
-
-        # The forming candle is only used for the live preview - never for alerts.
         if not candle.get("closed", True):
-            self._preview(symbol, candle)
+            if symbol not in self._warming_symbols:
+                self._preview(symbol, candle)
             return
+        if symbol in self._warming_symbols:
+            self._warm_backlog.setdefault(symbol, {})[int(candle["open_time"])] = dict(candle)
+            return
+        await self._process_stream_candle(candle)
 
+    async def _process_stream_candle(self, candle: dict) -> None:
+        """Apply one unique, closed base candle after warm-up coordination."""
+        symbol = candle["symbol"].upper()
+        opened = int(candle["open_time"])
+        if opened <= self._last_stream_open.get(symbol, -1):
+            return  # reconnects can repeat the last closed kline
+        self._last_stream_open[symbol] = opened
+        await self._process_candle(candle)
+
+    async def _process_candle(self, candle: dict) -> None:
+        symbol = candle["symbol"].upper()
         self.candles_seen += 1
         self.last_event_at = time.time()
 
@@ -772,14 +933,15 @@ class Engine:
                 completed = cell.rollup.add(candle) if cell.rollup else []
             for bar in completed:
                 point = self._append(cell, bar)
+                if point is None:
+                    continue  # duplicate/out-of-order bar, no lifecycle advance
                 # first: did this candle change the life of an existing setup?
                 self._track_setups(cell, bar)
                 if book is not None:
                     # the decision belongs to the narrative engine; the cell is
                     # kept for the chart only (candles, markers, TDI pane)
                     continue
-                if point is not None:
-                    await self._evaluate(cell, bar, point)
+                await self._evaluate(cell, bar, point)
 
         if book is not None:
             for plan in book.on_candle(candle):
@@ -1198,11 +1360,16 @@ class Engine:
         setup = alert.get("setup") or {}
         side = alert.get("side") or setup.get("side") or "SHORT"
         key = f"{alert['symbol']}|{alert['timeframe']}|{alert['time']}"
+        if key in self.setup_payloads and self.setup_payloads[key].get("stored"):
+            # A row loaded from the archive: replace both its JSON and its
+            # rehydrated lifecycle object with the freshly derived record.
+            old = self.registry.pop(key, None)
+            if old is not None:
+                records = self.by_cell.get((old.symbol, old.timeframe), [])
+                self.by_cell[(old.symbol, old.timeframe)] = [row for row in records if row.key != key]
+            self.setup_payloads.pop(key, None)
         if key in self.registry:
             return self.setup_payloads[key]
-        if key in self.setup_payloads and self.setup_payloads[key].get("stored"):
-            # a row loaded from the archive: replace it with the live record
-            self.setup_payloads.pop(key, None)
         # the cell being evaluated - during a history replay that is the *fresh*
         # cell, not the one in self.cells yet
         source = cell or self.cells.get((alert["symbol"], alert["timeframe"]))
@@ -1234,7 +1401,7 @@ class Engine:
             trend_clean=((alert.get("context") or {}).get("external") or {}).get("clean"),
             grade=alert.get("grade"),
             reasons=_evidence(alert),
-            max_bars=int(self.filters.config.get("setup_max_bars") or 240),
+            max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
         )
         self.registry[key] = record
         cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
@@ -1260,6 +1427,8 @@ class Engine:
         for record in records:
             if record.state in DONE:
                 continue
+            if int(bar.get("close_time") or 0) <= record.created_ms:
+                continue  # history before this setup existed cannot age/fill it
             if not record.advance(bar):
                 continue
             payload = self.setup_payloads.get(record.key)
@@ -1289,8 +1458,24 @@ class Engine:
         imbalance it is sitting in, and what it still needs to fire.
         """
         if self.book is None:
-            return []
-        rows: list[dict[str, Any]] = []
+            rows: list[dict[str, Any]] = []
+            for cell in self.cells.values():
+                last = cell.candles[-1] if cell.candles else None
+                armed = cell.structure.armed(last["close"] if last else None)
+                if not armed:
+                    continue
+                rows.append(
+                    {
+                        "mode": "sweep",
+                        "symbol": cell.symbol,
+                        "timeframe": cell.timeframe,
+                        "structure": armed,
+                        "regime": self._regime_dict(cell),
+                    }
+                )
+            rows.sort(key=lambda row: -int((row.get("structure") or {}).get("sweep_time") or 0))
+            return rows[:limit]
+        rows = []
         for symbol, state in self.book.states.items():
             for timeframe, narrative in state.narratives.items():
                 if narrative.trap is None:
@@ -1502,6 +1687,7 @@ class Engine:
             "break_lookback": self.break_lookback,
             "hvb_min_points": self.hvb_min_points,
             "hvb_min_speed": self.hvb_min_speed,
+            "history_bars": self.history_bars,
             "structure_settings": self.structure_settings,
             "filters": self.filters.summary(),
             "kinds": dict(self.kinds),

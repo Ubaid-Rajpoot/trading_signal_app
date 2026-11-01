@@ -20,7 +20,7 @@ far as the bot was concerned.
 Warm-up now **replays** the fetched history through the same pipeline live uses:
 
 ```
-fetch 600 closed candles (per instrument per timeframe)
+fetch 5,000 closed candles (per instrument per timeframe; paged where needed)
   -> feed them through Cell (TDIGM, regime, structure, trend map)
   -> on every bar where the structure confirms a setup, run the real _evaluate
   -> run the setup lifecycle over the rest of the history
@@ -31,9 +31,12 @@ So a setup confirmed 8 hours ago is found, and it is found by the *same code*
 that will judge the next one. `tests/test_setups.py::test_backfill_and_live_agree_on_the_same_candle`
 pins that: replay and live must produce the identical setup from the same candle.
 
-**Window.** 600 bars per timeframe (6 days of 15m, 25 days of 1h, 100 days of 4h).
-That is ten times the 60-bar life of a setup, so nothing tradeable can be missed
-inside it. Older history is not scanned: a setup that old is not a setup anymore.
+**Window.** 5,000 bars per timeframe (about 52 days of 15m, 208 days of 1h,
+and 833 days of 4h, where the contract has that history). MEXC contract history
+is capped at 2,000 rows per response, so the feed pages backwards and de-duplicates
+windows. An untouched setup has no age-only expiry in the shipped configuration;
+it remains valid until mitigation or price invalidation, and every valid archive
+row is rehydrated after restart so new candles keep its state current.
 
 ## 2. A failed request is retried, and reported
 
@@ -43,9 +46,10 @@ Anything still empty is recorded in `warm_failures` and shown in the UI as
 `tests/test_setups.py::test_a_failed_history_request_is_retried_instead_of_left_empty`
 covers the 429-then-recovery case.
 
-This is the one that made "500 symbols, zero setups" possible: 500 instruments ×
-7 timeframes is 3,500 REST calls at start-up, and one rate-limited minute used to
-be permanent.
+This is one cause of "hundreds of symbols, zero setups": thousands of REST
+windows are needed at start-up, and one rate-limited minute used to be permanent.
+The live socket now starts immediately; per-symbol closed bars are buffered while
+that symbol warms, so the deep scan does not miss new signals.
 
 ## 3. Perpetuals, not spot
 
@@ -58,8 +62,9 @@ ones:
 | Binance | `fapi.binance.com/fapi/v1/klines` | `wss://fstream.binance.com` `@kline_1m` | `contractType: PERPETUAL`, `status: TRADING` |
 
 `python run.py serve --market spot` still works if you ever want the other book.
-Timeframes are now 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h (and 1d for a replay);
-anything the exchange has no interval for is rolled up from 1m.
+Timeframes are 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h and 1d. MEXC-native
+history is used where available; 3m is built from 1m and 2h from clock-aligned
+1h history. The live 1m stream rolls every configured timeframe locally.
 
 **Honest limitation:** the exchange hosts are not reachable from where this was
 developed, so the futures feeds are exercised against recorded payload shapes
@@ -77,11 +82,11 @@ A setup is not a moment. Each one becomes a record with a state:
 | **active** | price is in the zone (the entry is filled) | **yes** |
 | win | the target was reached | no |
 | stopped | the stop was hit | no |
-| expired | 60 bars went by without the zone being touched | no |
+| expired | optional positive `setup_max_bars` limit elapsed (disabled by default) | no |
 | invalidated | the stop was taken before the entry was ever filled | no |
 
-`valid` = pending or active, and that is exactly the "it hasn't been mitigated
-yet" test: mitigation means price traded back into the block. Nothing is deleted
+`valid` = pending or active; `unmitigated` specifically means pending because
+price has not traded back into the block. Nothing is deleted
 when a setup dies — the card keeps it, with the state and the bar it happened on,
 because "this idea died here" is information.
 
@@ -134,20 +139,20 @@ The bar above the setups list:
 * **HVB required** — only setups whose confirming candle printed an HVB;
 * **↻ rescan** — re-read every instrument's history and re-run the scan with the
   current rules (also runs automatically after a filter change);
-* **+ top 500** — add the 500 biggest contracts by 24h turnover, added in the
-  background and warmed as they land.
+* the exchange-universe controls remain available for manual overrides, while
+  `auto_universe: true` loads every active USDT perpetual at boot.
 
-`max_symbols` is 600 in `config.json`; raise it if you want the whole board.
-Adding 500 instruments does not block the page: cells show *warming*, and the
-sweep retries anything that fails.
+`max_symbols` is 2000 in `config.json`, deliberately above the expected MEXC
+futures universe. Adding the full universe does not block the page: cells show
+*warming*, live closes are buffered, and the retry sweep revisits failures.
 
 ## 7. Reproduce the numbers
 
 ```bash
 cd tdigm-live
 python run.py check                 # contract REST + websocket reachable?
-python run.py serve                 # LIVE perps, 7 timeframes
-python -m pytest tests -q           # 123 tests
+python run.py serve                 # LIVE perps, 9 timeframes
+python -m pytest tests -q           # deterministic offline suite
 ```
 
 The setup rules themselves are unchanged from round 17 and still measured in

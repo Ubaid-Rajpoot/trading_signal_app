@@ -39,8 +39,10 @@ _FLOAT_KEYS = {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_m
 _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
               "trend_context", "require_hh_hl", "require_bos", "volume_break"}
-# whole-number keys that must stay integers (they are counts of bars)
-_COUNT_KEYS = {"max_internal_depth", "setup_max_bars", "hvb_window"}
+# whole-number keys that must stay integers.  Depth starts at one; windows may
+# intentionally be zero (same-candle HVB, and no age-only setup expiry).
+_COUNT_KEYS = {"max_internal_depth"}
+_ZERO_COUNT_KEYS = {"setup_max_bars", "hvb_window"}
 
 
 def read(path: str | Path) -> dict[str, Any]:
@@ -51,7 +53,7 @@ def read(path: str | Path) -> dict[str, Any]:
     data.setdefault("filters", dict(DEFAULT_FILTERS))
     data.setdefault("structure", dict(DEFAULT_STRUCTURE))
     data.setdefault("exchange", "binance")
-    data.setdefault("max_symbols", 500)
+    data.setdefault("max_symbols", 2000)
     return data
 
 
@@ -121,6 +123,11 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
         elif key in _COUNT_KEYS:
             try:
                 merged[key] = max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+        elif key in _ZERO_COUNT_KEYS:
+            try:
+                merged[key] = max(0, int(value))
             except (TypeError, ValueError):
                 pass
         elif key in _INT_KEYS:

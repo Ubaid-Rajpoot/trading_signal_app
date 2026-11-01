@@ -162,6 +162,7 @@ class Structure:
         self._major_count = 0
         self.sweeps: dict[str, Sweep | None] = {"high": None, "low": None}
         self.last_setup: Setup | None = None
+        self.sweep_count = 0
         self.setups = 0
         self.invalidated = 0
         self.events: dict[str, Any] = {}
@@ -205,6 +206,11 @@ class Structure:
         price = float(bar["close"])
         high = float(bar["high"])
         low = float(bar["low"])
+        # A body break is a transition from the inside to a close beyond the
+        # level.  Merely remaining beyond a level that an earlier candle already
+        # crossed is not a new break (and used to create a false setup one bar
+        # late after a sweep candle closed through both sides).
+        previous_close = float(self.closes[-2]) if len(self.closes) >= 2 else price
 
         # 1. confirm the pivot `pivot_len` bars back (it now has enough bars to
         #    its right); a freshly confirmed pivot is what makes a level.
@@ -275,6 +281,7 @@ class Structure:
             )
             level.swept = True
             self.sweeps[side] = sweep
+            self.sweep_count += 1
             events["sweeps"].append(sweep)
             if events["sweep"] is None:
                 events["sweep"] = sweep
@@ -294,7 +301,12 @@ class Structure:
                     self.sweeps[side] = None
                     self.invalidated += 1
                     events["invalidated"] = True
-                elif sweep.opposite is not None and index > sweep.index and price < sweep.opposite.price:
+                elif (
+                    sweep.opposite is not None
+                    and index > sweep.index
+                    and previous_close >= sweep.opposite.price
+                    and price < sweep.opposite.price
+                ):
                     events["setup"] = self._make_setup("SHORT", bar, index, sweep)
             else:
                 sweep.extreme = min(sweep.extreme, low)
@@ -302,7 +314,12 @@ class Structure:
                     self.sweeps[side] = None
                     self.invalidated += 1
                     events["invalidated"] = True
-                elif sweep.opposite is not None and index > sweep.index and price > sweep.opposite.price:
+                elif (
+                    sweep.opposite is not None
+                    and index > sweep.index
+                    and previous_close <= sweep.opposite.price
+                    and price > sweep.opposite.price
+                ):
                     events["setup"] = self._make_setup("LONG", bar, index, sweep)
 
         self._expire(index)
@@ -443,6 +460,7 @@ class Structure:
             "major_levels": len(self.major_levels),
             "external_trend": self.external_trend,
             "break_kind": self.last_setup.break_kind if self.last_setup else None,
+            "sweep_count": self.sweep_count,
             "setups": self.setups,
             "invalidated": self.invalidated,
             "sweeps": {side: (s.as_dict() if s else None) for side, s in self.sweeps.items()},

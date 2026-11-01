@@ -327,11 +327,17 @@ def test_settings_load_from_the_config_block():
 
 def test_the_shipped_config_is_loadable_and_sane():
     config = json.loads((ROOT / "config.json").read_text())
-    assert config["strategy"] == "book"
+    assert config["strategy"] == "sweep", "the shipped app must run the trader's TDIGM checklist"
+    expected_tdi = {"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9}
+    assert expected_tdi.items() <= config["tdi"].items()
+    assert config["filters"]["hvb_window"] == 0, "HVB and body break are same-candle"
+    assert config["filters"]["setup_max_bars"] == 0, "unmitigated history stays valid"
+    assert {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"} <= set(config["timeframes"])
+    assert config["auto_universe"] and config["max_symbols"] >= 1000
+    # The optional book engine remains loadable for research, but it is not the
+    # live decision engine for this strategy.
     settings = BookSettings.from_config(config["book"])
-    assert settings.min_rr >= 2, "a trade must still pay for itself several times over"
-    assert settings.min_body_atr > 0
-    assert settings.max_fee_r > 0, "fees are a rule, not a footnote"
+    assert settings.min_rr >= 2 and settings.min_body_atr > 0 and settings.max_fee_r > 0
 
 
 # ------------------------------------------------------- the liquidity index

@@ -110,3 +110,34 @@ async def test_a_rescan_uses_the_same_pool():
     feed.peak = 0
     await engine.rescan(feed, concurrency=30)
     assert feed.peak == 30, f"rescan should also keep 30 in flight, saw {feed.peak}"
+
+
+@pytest.mark.asyncio
+async def test_live_closed_bars_wait_for_history_and_are_drained_in_order():
+    feed = TimedFeed(delay=0.05)
+    engine = engine_over(["BTCUSDT"], ["1m"])
+    engine.prepare_warmup(["BTCUSDT"])
+    warming = asyncio.create_task(engine.warm_symbol(feed, "BTCUSDT"))
+    while feed.in_flight == 0:
+        await asyncio.sleep(0)
+
+    live = bars()[-1] | {"symbol": "BTCUSDT"}
+    live["open_time"] += 60_000
+    live["close_time"] += 60_000
+    await engine.on_candle(live)
+    assert engine.candles_seen == 0, "the live close is buffered while its cell is rebuilt"
+
+    await warming
+    cell = engine.cells[("BTCUSDT", "1m")]
+    assert cell.last_close_time == live["close_time"]
+    assert engine.candles_seen == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_cannot_apply_the_same_closed_bar_twice():
+    engine = engine_over(["BTCUSDT"], ["1m"])
+    candle = bars(1)[0] | {"symbol": "BTCUSDT"}
+    await engine.on_candle(candle)
+    await engine.on_candle(dict(candle))
+    assert engine.candles_seen == 1
+    assert len(engine.cells[("BTCUSDT", "1m")].candles) == 1

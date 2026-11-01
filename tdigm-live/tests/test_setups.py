@@ -241,6 +241,14 @@ def test_a_setup_that_never_gets_filled_expires_instead_of_haunting_the_list():
     assert setup.state == "expired" and not setup.valid
 
 
+def test_zero_expiry_keeps_an_unmitigated_historical_setup_valid():
+    setup = record(max_bars=0)
+    for i in range(5_000):
+        setup.advance(bar_at(97.6, 97.0, 97.2, ms=2_000 + i))
+    assert setup.state == "pending"
+    assert setup.valid and not setup.mitigated
+
+
 def test_a_setup_invalidates_if_the_stop_goes_before_the_entry():
     setup = record()
     assert setup.advance(bar_at(104.5, 102.0, 104.0)) is True

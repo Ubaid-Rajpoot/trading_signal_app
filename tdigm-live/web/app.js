@@ -282,7 +282,7 @@
     }
     $("source-text").textContent = label;
     if (s) {
-      $("strategy-tag").textContent = s.strategy === "book" ? "book engine" : (s.strategy || "engine");
+      $("strategy-tag").textContent = s.strategy === "book" ? "book engine" : "TDIGM setup";
       $("stat-symbols").textContent = (s.symbols ? s.symbols.length : 0) + " symbols · " + (s.warming || 0) + " warming" + (s.failed ? " · " + s.failed + " failed" : "");
       var tf = s.timeframes && s.timeframes.length ? s.timeframes.join(" ") : "";
       $("stat-candle").textContent = (s.candles_seen !== null && s.candles_seen !== undefined ? num(s.candles_seen, 0) + " candles" : "") + (tf ? " · " + tf : "");
@@ -290,9 +290,12 @@
     if (model.health) {
       var n = model.health.notifications || {};
       var noise = (n.filtered || 0) + (n.suppressed || 0);
-      $("status-noise").textContent = noise + " event(s) dropped by policy";
-      $("status-noise").title = (n.filtered || 0) + " filtered setups and " + (n.suppressed || 0) + " duplicates/chatter never reached the screen";
-      $("status-counts").textContent = (model.health.signals || 0) + " signals · " + (model.health.stored || 0) + " stored · " + (model.health.setups_valid || 0) + " valid now";
+      $("status-noise").textContent = noise + " notice(s) hidden";
+      $("status-noise").title = (n.filtered || 0) + " rejected setup notices and " + (n.suppressed || 0)
+        + " duplicate/chatter notices hidden. No market frames or confirmed signals are dropped here.";
+      $("status-counts").textContent = (model.health.signals || 0) + " signals · " + (model.health.stored || 0)
+        + " stored · " + (model.health.setups_valid || 0) + " valid now · "
+        + (model.health.setups_unmitigated || 0) + " unmitigated";
       renderFunnel();
       $("status-feed").textContent = "feed: " + (model.health.feed || "—") + " · " + num(model.health.frames, 0) + " frames";
     }
@@ -432,13 +435,23 @@
     box.hidden = false;
     var shown = rows.slice(0, 12);
     host.innerHTML = shown.map(function (w) {
-      var st = w.armed ? "armed" : "trap";
-      var cls = w.armed ? "st-armed" : "st-trap";
-      var what = w.armed
-        ? (w.armed.kind === "bull" ? "gap " : "gap ") + num(w.armed.bottom) + "–" + num(w.armed.top)
-          + " · " + Math.round((w.armed.fill || 0) * 100) + "% filled"
-        : (w.trap.side === "high" ? "took high " : "took low ") + num(w.trap.level) + " (" + w.trap.name + ")";
-      var need = w.armed ? "needs the reverse shift" : "needs a displacement";
+      var st, cls, what, need;
+      if (w.mode === "sweep") {
+        var s = w.structure || {};
+        st = "swept";
+        cls = "st-trap";
+        what = (s.swept_side === "high" ? "took high " : "took low ") + num(s.swept_level);
+        need = "body close " + (s.watching_side === "low" ? "below " : "above ") + num(s.watching)
+          + " with matching HVB";
+      } else {
+        st = w.armed ? "armed" : "trap";
+        cls = w.armed ? "st-armed" : "st-trap";
+        what = w.armed
+          ? "gap " + num(w.armed.bottom) + "–" + num(w.armed.top)
+            + " · " + Math.round((w.armed.fill || 0) * 100) + "% filled"
+          : (w.trap.side === "high" ? "took high " : "took low ") + num(w.trap.level) + " (" + w.trap.name + ")";
+        need = w.armed ? "needs the reverse shift" : "needs a displacement";
+      }
       return '<div class="watch-row"><span class="sym">' + escapeHtml(w.symbol) + "</span>"
         + "<span>" + escapeHtml(w.timeframe) + "</span>"
         + '<span class="' + cls + '">' + st + "</span>"
@@ -463,9 +476,15 @@
     if (!f) return;
     var drops = f.drops || {};
     var worst = Object.keys(drops).sort(function (a, b) { return drops[b] - drops[a]; })[0];
-    $("status-funnel").textContent = f.traps + " traps → " + f.displacements + " displacements → "
-      + f.plans + " plans"
-      + (worst ? " · mostly refused: " + worst + " (" + drops[worst] + ")" : "");
+    if (f.mode === "sweep") {
+      $("status-funnel").textContent = (f.sweeps || 0) + " sweeps → " + (f.setups || 0)
+        + " body breaks → " + (f.plans || 0) + " TDIGM signals"
+        + (worst ? " · top rejection: " + worst + " (" + drops[worst] + ")" : "");
+    } else {
+      $("status-funnel").textContent = (f.traps || 0) + " traps → " + (f.displacements || 0)
+        + " displacements → " + (f.plans || 0) + " plans"
+        + (worst ? " · mostly refused: " + worst + " (" + drops[worst] + ")" : "");
+    }
   }
 
   // ------------------------------------------------------------------- chart

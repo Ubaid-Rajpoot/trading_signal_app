@@ -65,16 +65,17 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "require_bos": True,
     "bos_max_age": 240,
     "max_internal_depth": 2,
-    # how long a published setup stays tradeable before it is "expired"
-    "setup_max_bars": 240,
+    # 0 = an untouched setup remains valid until price invalidates it.  This is
+    # essential for historical discovery: age alone is not mitigation.
+    "setup_max_bars": 0,
     "volume_break": False,
     "volume_mult": 1.5,
     "volume_period": 20,
     "confirm_mode": "all",
     "confirm_min_score": 60,
     "hvb": True,
-    # the HVB may print on the break candle or up to N bars after it
-    "hvb_window": 3,
+    # strict strategy rule: HVB and body break belong to the same closed candle
+    "hvb_window": 0,
     "hvb_min_points": 1.0,
     "hvb_min_speed": 1.5,
     "regime": True,
@@ -87,7 +88,8 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "structure_direction": True,
     "require_ms": False,
     "require_fvg": False,
-    "block_liquidity_pool": True,
+    # optional book confluence, not part of the trader's TDIGM checklist
+    "block_liquidity_pool": False,
     "pool_tolerance": 0.25,
     "pool_count": 3,
     "structure_atr_min": 0.0,
@@ -211,11 +213,16 @@ class Filters:
             need = float(cfg.get("hvb_min_points") or 0)
             need_speed = float(cfg.get("hvb_min_speed") or 0)
             if candidate.get("hvb"):
-                # the engine already applies both gates; a filter edited from the
-                # page has to bite on the spot too, so re-check the numbers
+                # Direction is part of confluence, not just the existence of a
+                # cross.  A bearish structure break with an upward TDI cross was
+                # previously accepted because any non-empty ``hvb`` was truthy.
+                expected = "up" if side == "long" else "down"
+                actual = str(candidate.get("hvb") or "").lower()
                 power = abs(float(candidate.get("hvb_points") or 0.0))
                 speed = candidate.get("hvb_speed")
-                if need > 0 and power < need:
+                if side and actual != expected:
+                    reasons.append(f"HVB direction {actual} opposes the {side} setup (needs {expected})")
+                elif need > 0 and power < need:
                     reasons.append(f"HVB broke the centre by only {power:.2f} points (needs {need:g})")
                 elif need_speed > 0 and speed is not None and speed < need_speed:
                     reasons.append(f"HVB too slow ({speed:.1f}x its average step, needs {need_speed:g}x)")
@@ -323,7 +330,10 @@ class Filters:
         parts = {
             "trend": bool(external.get("direction") is not None and external["direction"] * want > 0
                           and external.get("clean")),
-            "hvb": bool(candidate.get("hvb")),
+            "hvb": bool(
+                candidate.get("hvb")
+                and str(candidate.get("hvb")).lower() == ("up" if side == "long" else "down")
+            ),
             "bos": bool(external.get("bos_direction") is not None
                         and external["bos_direction"] * want > 0),
             "volume": bool(ratio is not None and float(ratio) >= 1.5),

@@ -334,11 +334,17 @@ class SignalStore:
                 by_grade = {row[0] or "?": row[1] for row in self._db.execute(
                     "SELECT grade, COUNT(*) FROM signals GROUP BY grade")}
                 total = self._db.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+                valid = self._db.execute("SELECT COUNT(*) FROM signals WHERE valid = 1").fetchone()[0]
+                unmitigated = self._db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE valid = 1 AND mitigated = 0"
+                ).fetchone()[0]
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
         return {
             "total": int(total),
+            "valid": int(valid),
+            "unmitigated": int(unmitigated),
             "by_state": by_state,
             "by_grade": by_grade,
             "recorded": self.recorded,

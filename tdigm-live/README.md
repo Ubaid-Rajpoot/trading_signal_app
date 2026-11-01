@@ -1,8 +1,9 @@
 # TDIGM · liquidity scanner
 
-A standalone real-time scanner. It watches a list of instruments on **MEXC** (or
-Binance) that **you** choose, builds **every timeframe** from the live 1-minute
-stream, and tells you exactly one thing:
+A standalone real-time scanner. In the shipped live configuration it discovers
+**every active MEXC USDT perpetual** automatically, shards the contracts across
+live sockets, and scans 1m/3m/5m/15m/30m/1h/2h/4h/1d concurrently. It tells you
+exactly one thing:
 
 > **this instrument, on this timeframe, just closed a candle that took a
 > high/low liquidity level, then broke the opposite side, with an HVB on the
@@ -10,6 +11,9 @@ stream, and tells you exactly one thing:
 > liquidity it is aiming at.**
 
 No orders, no account, no backtest, no other strategy. It is a scanner.
+
+The latest defect-by-defect review and the exact verification boundary are in
+[`docs/audit-2026-11-01.md`](docs/audit-2026-11-01.md).
 
 ```
 BTCUSDT   15m   SHORT   entry 102,431.50   stop 103,988.20   target 100,902.00   R:R 0.98
@@ -170,14 +174,16 @@ reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
 * **Setups** on the left, newest first, each with entry / stop / target / 2R /
   R:R / score and a **state**: `pending` (price has not come back into the order
   block — still valid), `active` (filled), then `win` / `stopped` / `expired` /
-  `invalidated`. Nothing is deleted when it dies; the state and the bar are kept.
+  `invalidated`. With the shipped `setup_max_bars: 0`, age alone never expires an
+  untouched setup: it remains valid until mitigated or price invalidates it.
 * **Chart** on the right, drawn from real candles: every structure break (amber
   `BOS`), every TDIGM HVB (purple dot), the **order block** (last opposite candle
   before the displacement — the red box), the swept liquidity, entry, stop, 2R
   and the structure target. Any matrix cell opens its chart.
-* **Filter bar** on top: symbol search, timeframe chips (1m … 4h), side, state,
-  sort, *valid only*, *HVB required*, **↻ rescan** (re-read every instrument's
-  history with the current rules), **+ top 500** contracts by turnover.
+* **Filter bar** on top: symbol search, timeframe chips (1m … 1d), side, state,
+  sort, *valid only*, *HVB required*, and **↻ rescan** (re-read every
+  instrument's history with the current rules). The live default discovers all
+  active MEXC USDT perpetual contracts; `max_symbols: 2000` is only a safety cap.
 * **Futures only by default** — MEXC/Binance USDT-M perpetuals, not spot.
   `python run.py serve --market spot` if you ever want the other book.
 
@@ -194,8 +200,9 @@ The page used to be a window on the process: a setup that printed at 03:10 was
 gone from the app after a restart. Everything is now written to SQLite
 (`data/tdigm.sqlite3`, WAL) the moment it is found, and updated through its whole
 life - `pending → active → win | stopped | expired`. A restart shows the archive
-**before a single candle arrives**, a decided outcome is never overwritten by a
-re-scan, and the numbers on the board (hit rate, R per decided trade, per grade)
+**before a single candle arrives** and rehydrates every valid row into the live
+state machine, so later candles can mitigate or invalidate it. A decided outcome
+is never overwritten by a re-scan, and the numbers on the board (hit rate, R per decided trade, per grade)
 are computed from those rows rather than from memory:
 
 > 107 setups recorded · 43 won · 54 stopped · hit rate 44% · +0.33R per decided trade
@@ -207,34 +214,34 @@ against the fixed 2R target, the convention every measurement below uses.
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
 
-### Thirty instruments at a time
+### Concurrent history and live scanning
 
-Warm-up and rescan run a pool of **30** (`workers` in `config.json`); the runtime
-"+symbols" queue is drained by the same 30 consumers from one FIFO, so no
-instrument starves the ones behind it. Measured: 30 in flight, for warm-up and for
-a rescan, with a rate-limited instrument neither stopping the queue nor
-disappearing silently (`tests/test_parallel.py`). Honest limit: this sandbox has 2
-cores and the per-bar replay is pure Python, so what is verified is the pool and
-the non-blocking behaviour, not a 30× CPU speed-up.
+Warm-up and rescan use the bounded `workers` pool (shipped as **24**); the runtime
+"+symbols" queue is drained by the same worker count from one FIFO, so no
+instrument starves behind a slow contract. Tests exercise a 30-worker override
+and prove 30 requests are actually in flight, a failing symbol does not stop the
+queue, and live closes are buffered while history is being rebuilt
+(`tests/test_parallel.py`). The bound is deliberate: unbounded requests would
+trigger MEXC rate limits and make coverage worse, not faster.
 
-### Sparsity: what changed
+### Current live policy (strict, not silently loosened)
 
-Two defaults moved, both measured over BTCUSDT 2023-01 → 2025-06, 5m/15m/30m/1h,
-fixed 2R:
+The deployed strategy follows the supplied checklist, even though that is
+sparser than accepting near misses:
 
-| variant | signals | win% | R/trade |
-|---|---|---|---|
-| HVB on the break candle (old) | 68 | 41.7% | 0.25 |
-| HVB within 3 bars of the break | 72 | 40.6% | 0.22 |
-| **+ external HH/HL gate off (new default)** | **107** | **42.6%** | **0.28** |
+* `strategy: "sweep"` — the separate book/mitigation research engine is not the
+  live decision engine;
+* `hvb_window: 0` — the directional TDIGM centre-band HVB must occur on the
+  **same closed candle** as the opposite-side body break;
+* `trend_context: true` plus ADX/ER regime checks — continuation agrees with the
+  external trend and ranging markets are rejected;
+* `setup_max_bars: 0` — an untouched historical setup does not disappear just
+  because time passed;
+* optional book-only gates (FVG, volume bar, liquidity pool blocking) are off
+  because they are not part of the stated setup.
 
-`hvb_window: 3` (the TDI cross and the structure break are two measurements; the
-same candle was the biggest reason a real setup never appeared) and
-`trend_context`/`require_hh_hl` **off** - the gate removed a third of the signals
-without paying for it in expectancy. The trend evidence is still on every card and
-is what makes a setup **grade A** instead of **grade B**; the archive reports both
-grades separately. Relaxing `max_internal_depth` was measured too and rejected
-(89 signals, 0.18R/trade). Details: [`docs/archive.md`](docs/archive.md).
+Signal volume comes from scanning the whole futures universe, nine timeframes and
+5,000 bars per timeframe—not by changing “same candle” into “within three bars”.
 
 ### The book's confluences (p.42, p.53, p.87)
 
@@ -279,10 +286,12 @@ python run.py universe --exchange mexc --top 30     # list pairs by 24h turnover
 
 ### Start-up: the page is up in a second, the history fills behind it
 
-Warm-up (600 candles per timeframe per instrument) runs **after** the server is
-accepting requests, in a small parallel pool. A 120-instrument universe no longer
-looks like a dead server while it loads: the page opens immediately, every row
-says *warming*, and rows fill in as their history lands.
+Warm-up (5,000 candles per timeframe per instrument) runs **after** the server is
+accepting requests, in a 24-worker pool. The live socket pump starts immediately;
+closed candles arriving while a symbol is rebuilt are buffered per symbol and
+replayed in timestamp order. Thus a full-universe deep scan does not create a
+blind live window. MEXC's 2,000-row REST cap is paged rather than silently
+truncating the requested history.
 
 `python run.py replay data/btc 60` starts 7,800 minutes into the files and serves
 that prefix as history, so **all five timeframes are warm in the first seconds**
@@ -314,10 +323,11 @@ Open **＋ Instruments**:
 
 Or edit `config.json` / pass `--symbols BTCUSDT,ETHUSDT` on the command line.
 
-`max_symbols` (default 500) is a guard rail: each instrument costs roughly
-`timeframes × 180 candles` of memory. Raising it is fine; the page tells you when
-the limit stopped an add. Above 200 instruments the per-tick live preview is
-switched off (the table still updates; only the "forming candle" preview goes).
+`max_symbols` is a guard rail (shipped value **2000**, above the current MEXC
+futures universe): each instrument costs roughly `timeframes × 180 candles` of
+resident chart state. Above `preview_max_symbols` instruments the expensive
+per-tick forming-candle preview is switched off; closed-candle scanning and
+instant signals remain on.
 
 ### Replay — no internet needed
 
@@ -482,27 +492,30 @@ simulation is claimed here.
 
 ```jsonc
 {
-  "symbols": ["BTCUSDT", "ETHUSDT"],     // editable from the page
-  "exchange": "mexc",                    // "mexc" or "binance"
-  "max_symbols": 500,
-  "timeframes": ["1m", "5m", "15m", "30m", "1h"],   // add "3m" if you want it
+  "symbols": ["BTCUSDT", "ETHUSDT"],     // fallback if universe discovery is unavailable
+  "exchange": "mexc", "market": "futures",
+  "auto_universe": true, "max_symbols": 2000, "workers": 24,
+  "strategy": "sweep", "history_bars": 5000,
+  "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"],
   "tdi":   { "rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185 },
   "structure": { "pivot_len": 5, "sweep_max_wait": 60, "level_max_age": 180, "max_levels": 40, "target_mode": "range" },
-  "filters": { "structure": true, "hvb": true, "break": false, "min_rr": 0, "sides": ["long", "short"], "trend": "off", ... },
+  "filters": { "structure": true, "hvb": true, "hvb_window": 0, "regime": true,
+               "trend_context": true, "setup_max_bars": 0, "sides": ["long", "short"], ... },
   "break_lookback": 20,
   "server": { "host": "0.0.0.0", "port": 8700 }
 }
 ```
 
-MEXC note: MEXC spot has 1m/5m/15m/30m/60m candles (no 3m), so a 3m timeframe is
-built locally from 1m — the code always builds every timeframe from 1m anyway.
+MEXC futures note: native contract history is used for 1m/5m/15m/30m/1h/4h/1d.
+MEXC has no native 3m or 2h contract candles, so 3m is aggregated from 1m and 2h
+from clock-aligned 1h bars. Live candles are always rolled up from the 1m stream.
 
 ---
 
 ## What "works" means here
 
 ```bash
-python -m pytest tests -q      # 134 tests, no network needed
+python -m pytest tests -q      # full deterministic suite, no network needed
 ```
 
 Covered: batch TDIGM equals the incremental one; Wilder's RSI; the 5m/15m rollup
@@ -544,7 +557,7 @@ tdigm-live/
   tools/scan_history.py  the measurement tool used for the numbers above
   bot/store.py           the SQLite archive: every setup, for good
   tools/backfill_archive.py  fill the archive from recorded candles
-  tests/                 134 tests
+  tests/                 deterministic strategy, feed, archive and concurrency tests
 ```
 
 ## Troubleshooting
@@ -555,5 +568,5 @@ tdigm-live/
 | page says `disconnected` | browser lost the websocket; it reconnects by itself. Check the server terminal. |
 | instruments stay `warming` | TDIGM needs ~110 candles per timeframe. Live warms from REST at start; replay needs those candles to play. |
 | very few alerts | that is the strategy. Untick "setups only" to see the sweeps; loosen HVB or `min_rr` in ⚙. |
-| "add all" stops early | `max_symbols` (500). Raise it in `config.json` if your machine has the RAM. |
+| "add all" stops early | `max_symbols` safety cap (shipped as 2000). Raise it only if an exchange lists more active contracts. |
 | MEXC stream silent but REST fine | MEXC occasionally rate-limits new sockets; the feed reconnects with backoff. Try `--exchange binance` to compare. |
