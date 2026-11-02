@@ -78,17 +78,18 @@ A setup is not a moment. Each one becomes a record with a state:
 
 | state | meaning | still tradeable? |
 |---|---|---|
-| **pending** | price has not come back into the order block yet | **yes** |
-| **active** | price is in the zone (the entry is filled) | **yes** |
-| win | the target was reached | no |
-| stopped | the stop was hit | no |
+| **pending** | neither the order block nor eligible breaker has been touched; no trade/target exists | **yes** |
+| **active** | mitigation fixed the entry and armed the 1:4 target | **yes** |
+| win | the post-mitigation 4R target was reached | no |
+| stopped | the stop was reached after mitigation | no |
 | expired | optional positive `setup_max_bars` limit elapsed (disabled by default) | no |
-| invalidated | the stop was taken before the entry was ever filled | no |
+| invalidated | stop was reached while still unmitigated; no trade was filled | no |
 
-`valid` = pending or active; `unmitigated` specifically means pending because
-price has not traded back into the block. Nothing is deleted
-when a setup dies — the card keeps it, with the state and the bar it happened on,
-because "this idea died here" is information.
+`valid` = pending or active. `unmitigated` specifically means pending. Every row
+stores `state_reason`, so “invalidated” is never an unexplained label: an integrity
+quarantine names the broken proof, while a lifecycle invalidation says that the
+stop preceded every eligible zone. Unfilled invalidations do not enter the win
+rate. Nothing is deleted when a setup dies.
 
 ### The order block
 
@@ -101,9 +102,24 @@ that broke structure** — the classic definition, and the red box on your chart
 
 If there is no opposite candle in the previous 12 bars (a straight run), the
 break candle itself becomes the zone and the card says so.
-`bot/setups.py::order_block` is the only implementation, and
-`tests/test_setups.py::test_order_block_is_the_last_opposite_candle_before_the_break`
-pins it.
+`bot/setups.py::order_block` is the only implementation.
+
+### The aggressive-shift breaker block
+
+The book's pp.88–89 place the breaker on the left of an aggressive market
+structure shift and explicitly say that an aggressive momentum shift makes the
+breaker strong. For this paired-leg strategy that is deterministic: the candle
+that formed the same-leg endpoint now being body-broken is the breaker candidate.
+It is enabled only when the directed break candle body is at least
+`breaker_body_atr` (default 1.0) times the preceding ATR and the zone lies between
+displacement close and stop. A normal break does not invent a breaker.
+
+The order block and breaker are parallel mitigation choices. The first proximal
+edge touched after confirmation fills the setup. For SHORT that is a zone's low;
+for LONG it is its high. At that moment—and not at the break close—the engine
+freezes risk and computes `target = entry ± 4 × |entry − stop|`. If a mitigation
+candle also reaches stop and target, stop wins; if it reaches a zone and stop,
+the row is `stopped`, not the factually wrong “unfilled invalidated”.
 
 ## 5. What the page draws
 
@@ -113,9 +129,10 @@ For the selected setup, on real candles:
 |---|---|
 | amber `BOS↑` / `BOS↓` | every 20-bar structure break in the window (not just the one in the setup) |
 | purple dot | every TDIGM HVB — the price line crossing the centre band — in the window |
-| red/green box | the order block, from the last opposite candle before the break |
+| blue box | order block, from the last opposite candle before displacement |
+| purple box | paired-endpoint breaker, only for an aggressive shift |
 | dashed purple | the liquidity level that was swept |
-| dashed white / red / green | entry, stop, 2R, and the structure target |
+| dashed white / red / green | mitigation entry, stop, and fixed 4R target; entry/target begin at mitigation |
 | vertical line | the candle the setup confirmed on |
 
 The markers are computed with the same functions the live engine uses

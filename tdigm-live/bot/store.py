@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS signals (
     stop         REAL,
     target       REAL,
     target_2r    REAL,
+    target_rr    REAL,
+    target_rr_price REAL,
     rr           REAL,
     r_now        REAL,
     score        REAL,
@@ -70,6 +72,9 @@ CREATE TABLE IF NOT EXISTS signals (
     state_since  INTEGER,
     touched_ms   INTEGER,
     closed_ms    INTEGER,
+    lifecycle_version INTEGER NOT NULL DEFAULT 1,
+    mitigation_kind TEXT,
+    state_reason TEXT,
     bars         INTEGER DEFAULT 0,
     evidence     TEXT,
     payload      TEXT,
@@ -90,10 +95,16 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("mitigated", "ALTER TABLE signals ADD COLUMN mitigated INTEGER NOT NULL DEFAULT 0"),
     ("market", "ALTER TABLE signals ADD COLUMN market TEXT NOT NULL DEFAULT 'futures'"),
     ("session", "ALTER TABLE signals ADD COLUMN session TEXT"),
+    ("target_rr", "ALTER TABLE signals ADD COLUMN target_rr REAL"),
+    ("target_rr_price", "ALTER TABLE signals ADD COLUMN target_rr_price REAL"),
+    ("lifecycle_version", "ALTER TABLE signals ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1"),
+    ("mitigation_kind", "ALTER TABLE signals ADD COLUMN mitigation_kind TEXT"),
+    ("state_reason", "ALTER TABLE signals ADD COLUMN state_reason TEXT"),
 )
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
+CURRENT_LIFECYCLE_VERSION = 2
 
 
 def _num(value: Any) -> float | None:
@@ -132,6 +143,8 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "stop": _num(payload.get("stop")),
         "target": _num(payload.get("target")),
         "target_2r": _num(payload.get("target_2r")),
+        "target_rr": _num(payload.get("target_rr")),
+        "target_rr_price": _num(payload.get("target_rr_price")),
         "rr": _num(payload.get("rr")),
         "r_now": _num(payload.get("r_now")),
         "score": _num(payload.get("score")),
@@ -150,6 +163,9 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "state_since": _int(payload.get("state_since")),
         "touched_ms": _int(payload.get("touched_ms")),
         "closed_ms": _int(payload.get("closed_ms")),
+        "lifecycle_version": _int(payload.get("lifecycle_version")) or 1,
+        "mitigation_kind": payload.get("mitigation_kind"),
+        "state_reason": payload.get("state_reason"),
         "bars": _int(payload.get("bars")) or 0,
         "evidence": json.dumps(payload.get("reasons") or [], ensure_ascii=False),
         "payload": json.dumps(payload, ensure_ascii=False, default=str),
@@ -205,7 +221,7 @@ class SignalStore:
             assert self._db is not None
             try:
                 existing = self._db.execute(
-                    "SELECT state, closed_ms, payload FROM signals WHERE key = ?", (row["key"],)
+                    "SELECT state, closed_ms, lifecycle_version, payload FROM signals WHERE key = ?", (row["key"],)
                 ).fetchone()
                 if existing is None:
                     cols = ", ".join(COLUMNS)
@@ -219,13 +235,18 @@ class SignalStore:
                     # a decided outcome is final: a re-scan replaying the same
                     # setup must not turn "win" back into "pending"
                     final = existing["state"] in FINAL_STATES
+                    lifecycle_upgrade = int(row.get("lifecycle_version") or 1) > int(
+                        existing["lifecycle_version"] or 1
+                    )
                     updates = {
                         k: v
                         for k, v in row.items()
                         if k not in ("first_seen", "created_ms")
                     }
-                    if final:
-                        # The outcome is write-once, but a deeper re-scan may
+                    if final and not lifecycle_upgrade:
+                        # The outcome is write-once within one lifecycle rule, but
+                        # a version upgrade deliberately replays and re-scores it.
+                        # A deeper re-scan may
                         # correct immutable structural evidence (for example the
                         # swept endpoint of the paired leg). Merge that evidence
                         # into JSON while retaining the decided lifecycle.
@@ -237,8 +258,10 @@ class SignalStore:
                         for key in (
                             "state", "valid", "mitigated", "closed_ms", "state_since",
                             "touched_ms", "bars", "r_now", "last_price", "be_ms",
-                            "entry", "stop", "stop0", "target", "target_2r", "rr",
-                            "zone", "breakeven_at_r", "chain_valid", "chain_errors",
+                            "entry", "stop", "stop0", "risk0", "target", "target_2r",
+                            "target_rr", "target_rr_price", "rr", "zone", "zones",
+                            "mitigation_kind", "mitigation_zone", "state_reason",
+                            "breakeven_at_r", "chain_valid", "chain_errors",
                             "integrity_checked_ms", "invalid_reason",
                         ):
                             if key in old_payload:
@@ -246,8 +269,9 @@ class SignalStore:
                         updates["payload"] = json.dumps(new_payload, ensure_ascii=False, default=str)
                         for key in (
                             "state", "valid", "mitigated", "closed_ms", "state_since",
-                            "touched_ms", "bars", "r_now", "entry", "target", "stop",
-                            "rr", "zone",
+                            "touched_ms", "bars", "r_now", "entry", "target", "target_rr",
+                            "target_rr_price", "stop", "rr", "zone", "mitigation_kind",
+                            "state_reason",
                         ):
                             updates.pop(key, None)
                     sets = ", ".join(f"{k} = ?" for k in updates)
@@ -290,11 +314,13 @@ class SignalStore:
                         "state": "invalidated",
                         "chain_valid": False,
                         "chain_errors": list(problems),
+                        "state_reason": "integrity quarantine: " + "; ".join(problems),
                     }
                 )
                 self._db.execute(
-                    "UPDATE signals SET valid = 0, state = 'invalidated', payload = ?, last_seen = ? WHERE key = ?",
-                    (json.dumps(payload, ensure_ascii=False, default=str), int(time.time() * 1000), key),
+                    "UPDATE signals SET valid = 0, state = 'invalidated', state_reason = ?, payload = ?, last_seen = ? WHERE key = ?",
+                    (payload["state_reason"], json.dumps(payload, ensure_ascii=False, default=str),
+                     int(time.time() * 1000), key),
                 )
                 self._db.commit()
                 return True
@@ -440,6 +466,10 @@ class SignalStore:
                 unmitigated = self._db.execute(
                     "SELECT COUNT(*) FROM signals WHERE valid = 1 AND mitigated = 0"
                 ).fetchone()[0]
+                current_version = self._db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE lifecycle_version >= ?",
+                    (CURRENT_LIFECYCLE_VERSION,),
+                ).fetchone()[0]
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
@@ -447,6 +477,7 @@ class SignalStore:
             "total": int(total),
             "valid": int(valid),
             "unmitigated": int(unmitigated),
+            "current_lifecycle": int(current_version),
             "by_state": by_state,
             "by_grade": by_grade,
             "recorded": self.recorded,
@@ -464,7 +495,10 @@ class SignalStore:
         with self._lock:
             try:
                 rows = self._db.execute(
-                    "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target FROM signals"
+                    "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target, "
+                    "target_rr, mitigated, lifecycle_version FROM signals "
+                    "WHERE lifecycle_version >= ?",
+                    (CURRENT_LIFECYCLE_VERSION,),
                 ).fetchall()
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
@@ -473,26 +507,26 @@ class SignalStore:
         def r_of(row: sqlite3.Row) -> float:
             """Risk units won or lost - the trade's own outcome, not a convention.
 
-            The archive stores the realised R (the draw it was aiming at, or the
-            stop it hit). Quoting a fixed 2R instead would make the page's
-            record disagree with the same plan in the back-test, and two
-            yardsticks for one number is how a track record becomes a story.
-            Rows written before the field existed fall back to the convention.
+            Lifecycle-v2 rows store realised post-mitigation R: +4R at the
+            fixed target, -1R at the stop, and 0R at break-even. Unfilled
+            invalidations never enter this sample. Rows missing ``r_now`` fall
+            back to their configured target-R value.
             """
             if row["state"] == "breakeven":
                 return 0.0
             stored = row["r_now"] if "r_now" in row.keys() else None
             if stored is not None:
                 return float(stored)
-            return 2.0 if row["state"] == "win" else -1.0
+            return float(row["target_rr"] or 4.0) if row["state"] == "win" else -1.0
 
         def summarise(rows: list[sqlite3.Row]) -> dict[str, Any]:
-            wins = sum(1 for r in rows if r["state"] == "win")
-            losses = sum(1 for r in rows if r["state"] == "stopped")
-            scratches = sum(1 for r in rows if r["state"] == "breakeven")
+            trades = [r for r in rows if bool(r["mitigated"])]
+            wins = sum(1 for r in trades if r["state"] == "win")
+            losses = sum(1 for r in trades if r["state"] == "stopped")
+            scratches = sum(1 for r in trades if r["state"] == "breakeven")
             decided = wins + losses
-            total_r = sum(r_of(r) for r in rows if r["state"] in FINAL_STATES)
-            scored = [r_of(r) for r in rows if r["state"] in FINAL_STATES]
+            total_r = sum(r_of(r) for r in trades if r["state"] in FINAL_STATES)
+            scored = [r_of(r) for r in trades if r["state"] in FINAL_STATES]
             plain = len(scored)
             mean = total_r / plain if plain else 0.0
             # The honest error bar. With ~30 trades a +0.3R average has a 95%
@@ -507,6 +541,7 @@ class SignalStore:
             low, high = mean - 1.96 * se, mean + 1.96 * se
             return {
                 "n": len(rows),
+                "mitigated": len(trades),
                 "wins": wins,
                 "losses": losses,
                 "decided": decided,
@@ -528,8 +563,12 @@ class SignalStore:
                 ),
             }
 
-        out: dict[str, Any] = {"all": summarise(list(rows)),
-                                "r_basis": "realised R per trade (the draw it aimed at, or the stop)"}
+        out: dict[str, Any] = {
+            "all": summarise(list(rows)),
+            "r_basis": "fixed 1:4 target after mitigation; invalidated/unfilled setups excluded",
+            "lifecycle_version": CURRENT_LIFECYCLE_VERSION,
+            "target_rr": 4.0,
+        }
         # every dimension the page filters on is also a dimension the scanner is
         # *judged* on: these are the buckets a trader would actually split by
         for dimension in ("grade", "timeframe", "side", "session"):

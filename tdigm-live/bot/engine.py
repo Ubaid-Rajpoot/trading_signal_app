@@ -44,7 +44,14 @@ from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_a
 from .regime import RegimePoint, RegimeTracker
 from .book.narrative import BookSettings
 from .book.runner import BookRunner
-from .setups import DONE, SetupRecord, order_block
+from .setups import (
+    DEFAULT_TARGET_RR,
+    DONE,
+    LIFECYCLE_VERSION,
+    SetupRecord,
+    breaker_block,
+    order_block,
+)
 from .store import SignalStore
 from .structure import Structure
 from .trend import TrendMap
@@ -569,6 +576,12 @@ class Engine:
                 target=None if payload.get("target") is None else float(payload["target"]),
                 rr=payload.get("rr"),
                 zone=payload.get("zone"),
+                zones=list(payload.get("zones") or []),
+                target_rr=float(payload.get("target_rr") or DEFAULT_TARGET_RR),
+                lifecycle_version=int(payload.get("lifecycle_version") or 1),
+                mitigation_kind=payload.get("mitigation_kind"),
+                mitigation_zone=payload.get("mitigation_zone"),
+                state_reason=payload.get("state_reason"),
                 swept_level=float(payload.get("swept_level") or 0),
                 swept_side=str(payload.get("swept_side") or ""),
                 sweep_ms=int(payload.get("sweep_ms") or 0),
@@ -577,6 +590,8 @@ class Engine:
                 break_kind=str(payload.get("break_kind") or "SHIFT"),
                 hvb_ms=payload.get("hvb_ms"),
                 hvb_side=payload.get("hvb_side"),
+                state=str(payload.get("state") or "pending"),
+                touched_ms=payload.get("touched_ms"),
                 max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
             )
         except (TypeError, ValueError):
@@ -588,7 +603,10 @@ class Engine:
         record.last_price = payload.get("last_price")
         record.bars = int(payload.get("bars") or 0)
         record.stop0 = float(payload.get("stop0") or record.stop)
-        record.risk0 = abs(record.entry - record.stop0)
+        record.risk0 = (
+            float(payload.get("risk0") or abs(record.entry - record.stop0))
+            if record.touched_ms is not None else 0.0
+        )
         record.be_ms = payload.get("be_ms")
         record.breakeven_at_r = float(payload.get("breakeven_at_r") or 0)
         self.registry[key] = record
@@ -1453,6 +1471,12 @@ class Engine:
             target=float(plan["target"]) if plan.get("target") else None,
             rr=plan.get("rr"),
             zone=zone,
+            zones=[zone],
+            target_rr=float(plan.get("rr") or DEFAULT_TARGET_RR),
+            lifecycle_version=LIFECYCLE_VERSION,
+            mitigation_kind="fvg",
+            mitigation_zone=zone,
+            state_reason="FVG mitigation confirmed the book entry",
             swept_level=float(trap.get("level") or 0.0),
             swept_side=str(trap.get("side") or ""),
             sweep_ms=int(trap.get("time") or 0),
@@ -1509,17 +1533,40 @@ class Engine:
         # cell, not the one in self.cells yet
         source = cell or self.cells.get((alert["symbol"], alert["timeframe"]))
         candles = list(source.candles) if source is not None else []
+        stop = float(setup.get("stop") or 0.0)
+        block = order_block(candles, side)
+        breaker = breaker_block(
+            candles,
+            side,
+            int(setup.get("broke_level_time") or 0),
+            stop,
+            min_body_atr=float(self.filters.config.get("breaker_body_atr") or 1.0),
+        )
+        zones = [zone for zone in (breaker, block) if zone is not None]
+        # Until a zone is actually mitigated this is only the nearest planned
+        # fill. The lifecycle will replace it with the touched zone's proximal
+        # edge and create the 1:4 target at that moment.
+        if zones:
+            planned_entry = (
+                min(float(zone["low"]) for zone in zones) if side == "SHORT"
+                else max(float(zone["high"]) for zone in zones)
+            )
+        else:
+            planned_entry = float(setup.get("entry") or alert.get("price") or 0.0)
         record = SetupRecord(
             key=key,
             symbol=alert["symbol"],
             timeframe=alert["timeframe"],
             side=side,
             created_ms=int(alert["time"]),
-            entry=float(setup.get("entry") or alert.get("price") or 0.0),
-            stop=float(setup.get("stop") or 0.0),
-            target=None if setup.get("target") is None else float(setup["target"]),
-            rr=setup.get("rr"),
-            zone=order_block(candles, side),
+            entry=planned_entry,
+            stop=stop,
+            target=None,
+            rr=None,
+            zone=block,
+            zones=zones,
+            target_rr=float(self.filters.config.get("setup_target_rr") or DEFAULT_TARGET_RR),
+            lifecycle_version=LIFECYCLE_VERSION,
             swept_level=float(setup.get("swept_level") or 0.0),
             swept_side=str(setup.get("swept_side") or ""),
             sweep_ms=int(setup.get("sweep_time") or 0),
@@ -1537,6 +1584,14 @@ class Engine:
             grade=alert.get("grade"),
             reasons=_evidence(alert),
             max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
+        )
+        if breaker is not None:
+            record.reasons.append(
+                f"aggressive {breaker['body_atr']:.2f} ATR shift armed a "
+                f"{breaker['kind'].replace('_', ' ')}"
+            )
+        record.reasons.append(
+            f"target is fixed at 1:{record.target_rr:g} only after order-block or breaker mitigation"
         )
         self.registry[key] = record
         cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])

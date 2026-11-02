@@ -25,7 +25,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot.engine import Engine  # noqa: E402
-from bot.setups import SetupRecord, order_block  # noqa: E402
+from bot.setups import SetupRecord, breaker_block, order_block  # noqa: E402
 
 # 160 quiet bars, then the sweep -> break pattern from tests/test_bot.py
 RISE = [(90 + i * 0.06 + 0.3, 90 + i * 0.06 - 0.3, 90 + i * 0.06) for i in range(160)]
@@ -193,11 +193,12 @@ def record(**kwargs) -> SetupRecord:
         timeframe="1h",
         side="SHORT",
         created_ms=1_000,
-        entry=100.0,
+        entry=99.0,  # provisional proximal edge; no trade exists yet
         stop=104.0,
-        target=92.0,
-        rr=2.0,
-        zone={"high": 101.0, "low": 99.0, "mid": 100.0},
+        target=None,
+        rr=None,
+        target_rr=4.0,
+        zone={"high": 101.0, "low": 99.0, "mid": 100.0, "type": "order_block"},
         swept_level=104.0,
         swept_side="high",
         sweep_ms=900,
@@ -219,18 +220,21 @@ def test_a_setup_is_pending_until_price_comes_back_into_the_zone():
     assert setup.state == "pending", "still valid: the zone has not been mitigated"
     assert setup.advance(bar_at(100.5, 99.2, 100.0)) is True
     assert setup.state == "active" and setup.touched_ms == 2_000
+    assert setup.target == 79.0 and setup.rr == 4.0
+    assert "fixed 1:4 target armed" in setup.state_reason
 
 
-def test_active_setup_wins_or_loses_and_the_stop_wins_ties():
+def test_active_setup_arms_4r_after_mitigation_then_wins_or_stops():
     setup = record()
-    setup.advance(bar_at(100.5, 99.2, 100.0))          # filled
-    assert setup.advance(bar_at(99.0, 91.8, 92.5)) is True
-    assert setup.state == "win"
+    setup.advance(bar_at(100.5, 99.2, 100.0))          # filled at zone.low = 99
+    assert setup.entry == 99.0 and setup.target == 79.0 and setup.rr == 4.0
+    assert setup.advance(bar_at(99.0, 78.8, 79.5)) is True
+    assert setup.state == "win" and setup.realized_r == 4.0
 
     stopped = record()
     stopped.advance(bar_at(100.5, 99.2, 100.0))
-    # one candle touches both the target and the stop: assume the stop
-    assert stopped.advance(bar_at(104.5, 91.5, 100.0)) is True
+    # one candle touches both the 4R target and the stop: assume the stop
+    assert stopped.advance(bar_at(104.5, 78.5, 100.0)) is True
     assert stopped.state == "stopped", "both in one bar is a loss, not a win"
 
 
@@ -249,10 +253,71 @@ def test_zero_expiry_keeps_an_unmitigated_historical_setup_valid():
     assert setup.valid and not setup.mitigated
 
 
-def test_a_setup_invalidates_if_the_stop_goes_before_the_entry():
+def test_a_setup_invalidates_only_if_the_stop_goes_before_mitigation():
     setup = record()
+    assert setup.target is None and setup.r_multiple(79.0) is None
     assert setup.advance(bar_at(104.5, 102.0, 104.0)) is True
     assert setup.state == "invalidated" and not setup.valid
+    assert setup.mitigated is False and setup.realized_r is None
+    assert "before" in setup.state_reason and "no trade" in setup.state_reason
+
+
+def test_mitigation_and_stop_on_one_candle_is_stopped_not_unfilled_invalidation():
+    setup = record()
+    # Travelling from below, price must cross the order-block edge before the
+    # higher stop. It was filled, so this is a stopped trade, not invalidated.
+    assert setup.advance(bar_at(104.5, 98.5, 103.0)) is True
+    assert setup.mitigated and setup.state == "stopped"
+    assert setup.realized_r == -1.0
+
+
+def test_an_eligible_breaker_can_mitigate_before_the_order_block():
+    setup = record(
+        zones=[
+            {"high": 101.0, "low": 100.0, "type": "breaker_block", "kind": "bearish_breaker"},
+            {"high": 103.0, "low": 102.0, "type": "order_block", "kind": "supply"},
+        ],
+        zone={"high": 103.0, "low": 102.0, "type": "order_block", "kind": "supply"},
+        entry=100.0,
+    )
+    assert setup.advance(bar_at(100.5, 99.8, 100.2)) is True
+    assert setup.state == "active" and setup.mitigation_kind == "breaker_block"
+    assert setup.entry == 100.0 and setup.target == 84.0
+
+
+def test_long_breaker_touch_arms_the_4r_trade_like_the_bnb_example():
+    setup = record(
+        side="LONG", stop=703.7, entry=704.8,
+        zone={"high": 703.9, "low": 703.75, "type": "order_block", "kind": "demand"},
+        zones=[
+            {"high": 704.8, "low": 704.6, "type": "breaker_block", "kind": "bullish_breaker"},
+            {"high": 703.9, "low": 703.75, "type": "order_block", "kind": "demand"},
+        ],
+    )
+    assert setup.advance(bar_at(705.2, 704.65, 705.0)) is True
+    assert setup.state == "active" and setup.mitigation_kind == "breaker_block"
+    assert setup.entry == 704.8
+    assert setup.target == pytest.approx(709.2)  # 704.8 + 4 * (704.8 - 703.7)
+
+
+def test_aggressive_same_leg_endpoint_becomes_a_breaker_block():
+    candles = [
+        {"open": 99, "high": 101, "low": 98, "close": 100, "close_time": 1},
+        # The candle that formed the paired endpoint on the left.
+        {"open": 100, "high": 102, "low": 99, "close": 101, "close_time": 2},
+    ]
+    for i in range(3, 17):
+        candles.append({"open": 100, "high": 101, "low": 99, "close": 100,
+                        "close_time": i})
+    candles.append({"open": 100, "high": 100.2, "low": 94, "close": 95, "close_time": 17})
+    zone = breaker_block(candles, "SHORT", 2, 105.0, min_body_atr=1.0)
+    assert zone is not None
+    assert zone["type"] == "breaker_block" and zone["kind"] == "bearish_breaker"
+    assert zone["low"] == 99.0 and zone["high"] == 102.0
+    assert zone["body_atr"] >= 1.0
+
+    quiet = {**candles[-1], "open": 96.0, "close": 95.0}
+    assert breaker_block(candles[:-1] + [quiet], "SHORT", 2, 105.0, min_body_atr=1.0) is None
 
 
 @pytest.mark.asyncio
@@ -315,9 +380,9 @@ def test_a_closed_trade_reports_what_it_realised_not_where_price_went():
     from bot.setups import SetupRecord
 
     record = SetupRecord(key="k", symbol="BTCUSDT", timeframe="1h", side="SHORT",
-                         created_ms=1, entry=100.0, stop=104.0, target=90.0, rr=2.5,
+                         created_ms=1, entry=100.0, stop=104.0, target=84.0, rr=4.0,
                          zone=None, swept_level=0, swept_side="", sweep_ms=0,
-                         bos_level=0, bos_ms=0)
+                         bos_level=0, bos_ms=0, state="active", touched_ms=1)
     assert record.as_dict()["r_now"] in (None, 0.0)
     record.state = "stopped"
     assert record.as_dict()["r_now"] == -1.0
@@ -334,6 +399,6 @@ def test_a_win_reports_its_planned_reward_in_r():
     record = SetupRecord(key="k2", symbol="BTCUSDT", timeframe="1h", side="LONG",
                          created_ms=1, entry=100.0, stop=95.0, target=120.0, rr=4.0,
                          zone=None, swept_level=0, swept_side="", sweep_ms=0,
-                         bos_level=0, bos_ms=0)
+                         bos_level=0, bos_ms=0, state="active", touched_ms=1)
     record.state = "win"
     assert record.realized_r == 4.0

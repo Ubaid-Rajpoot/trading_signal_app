@@ -52,8 +52,10 @@ exact leg's high.
 | extension | price may continue beyond the swept endpoint; the candidate remains paired and the stop follows the run's final extreme |
 | confirmation | body close through the **other endpoint of that same leg** within `sweep_max_wait` bars |
 | stop | the run's final extreme beyond the swept high / low |
-| target | `range`: the far extreme of the range that existed **before** the sweep (the dashed line / arrow in the drawing). `next`: the nearest resting liquidity beyond the entry. Small swings printed *inside* the reversal leg are never used as a target. |
-| entry | the close of the confirming candle |
+| structural draw | `range` / `next` remains evidence about where liquidity sits; it is not the scored trade exit |
+| mitigation entry | first proximal-edge touch of the order block, or of the paired-endpoint breaker after an aggressive (≥1 ATR body) shift |
+| trade target | armed **only after mitigation**, fixed at `entry ± 4 × |entry − stop|`; reaching it is a win |
+| invalidated | stop reached while still pending, before either eligible zone was mitigated; this is unfilled and not a loss |
 
 Both sides are tracked at the same time — taking buy-side liquidity does not
 switch off the sell-side watch. That matters, because reversals usually take
@@ -165,26 +167,30 @@ together:
 Every alert now shows its evidence: `external bullish (HH+HL) · last break of
 structure up, 42 bars ago · depth 2 internal · volume 1.81× · score 85`.
 
-**What it measured** — BTCUSDT 1m, 2024-07 → 2025-06, four timeframes, 2R
-target: the gates cut signals from 144 to **68** and moved R/trade from +0.20 to
+**Earlier gate experiment (legacy 2R scoring, not the current lifecycle)** —
+BTCUSDT 1m, 2024-07 → 2025-06, four timeframes: targeting 2R, the gates cut signals from 144 to **68** and moved R/trade from +0.20 to
 +0.25. The honest breakdown, including the two gates this sample does *not*
 confirm, the noise floor (SE ≈ 0.17 R → no comparison reaches 2σ) and the
 reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
 
 ### What the page shows (round 18)
 
-* **Setups** on the left, newest first, each with entry / stop / target / 2R /
-  R:R / score and a **state**: `pending` (price has not come back into the order
-  block — still valid), `active` (filled), then `win` / `stopped` / `expired` /
-  `invalidated`. With the shipped `setup_max_bars: 0`, age alone never expires an
-  untouched setup: it remains valid until mitigated or price invalidates it.
+* **Setups** on the left, newest first, each with entry / stop / post-mitigation
+  4R target / score and an explained **state**. `pending` has no trade or target;
+  `active` means an order block or eligible aggressive-shift breaker was mitigated
+  and the target is armed. It then becomes `win` at +4R or `stopped` at −1R.
+  `invalidated` means the stop went first while still unfilled, and the stored
+  `state_reason` says exactly which rule fired. With `setup_max_bars: 0`, age
+  alone never expires an untouched setup.
 * **Setup-centred chart** on the right, drawn from real exchange candles. When
   an old signal is selected the server fetches history around that signal—not
   merely the latest 180 candles—so the swept H/L and break candle cannot vanish
   off-screen. The sweep candle/level is amber, the entire setup window is
   shaded, and the opposite body-break + same-candle HVB is outlined blue.
-  Entry/stop/target risk boxes, time/price axes, crosshair OHLC, drag-pan,
-  wheel/axis zoom, fullscreen and reset-to-setup match the SMC-Radar chart.
+  Order-block and breaker-block zones are separately labelled. Entry and 4R
+  begin at the mitigation candle—not the breakout—while the stop remains visible
+  from confirmation. Time/price axes, crosshair OHLC, drag-pan, wheel/axis zoom,
+  fullscreen and reset-to-setup match the SMC-Radar chart.
 * **Filters**: symbol search, timeframe chips (1m … 1d), side, grade, state and
   sort. Browser preferences and the selected signal survive a reload via local
   storage; strategy/filter/structure settings remain server-side in the atomic
@@ -207,9 +213,10 @@ gone from the app after a restart. Everything is now written to SQLite
 (`data/tdigm.sqlite3`, WAL) the moment it is found, and updated through its whole
 life - `pending → active → win | stopped | expired`. A restart shows the archive
 **before a single candle arrives** and rehydrates every valid row into the live
-state machine, so later candles can mitigate or invalidate it. A decided outcome
-is never overwritten by a re-scan, and the numbers on the board (hit rate, R per decided trade, per grade)
-are computed from those rows rather than from memory.
+state machine, so later candles can mitigate or invalidate it. An outcome is
+write-once within one lifecycle version; this 4R-after-mitigation upgrade is
+versioned so deep replay intentionally replaces old 2R classifications. The board
+computes win rate and R/trade from current-version mitigated rows, not memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
 `paired-leg H/L sweep → body close through that same leg's opposite endpoint → correctly directed same-candle HVB`.
@@ -217,11 +224,12 @@ Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
 
-> 107 setups recorded · 43 won · 54 stopped · hit rate 44% · +0.33R per decided trade
+> win rate = 4R wins / (4R wins + stopped trades), after mitigation only
 
 `include archive` (on by default) merges the stored list into the setups card;
-`GET /api/signals` and `GET /api/signals.csv` read the same rows. R is scored
-against the fixed 2R target, the convention every measurement below uses.
+`GET /api/signals` and `GET /api/signals.csv` read the same rows. Current rows
+score +4R for a target, −1R for a stop and exclude unfilled invalidations from
+trade results; the break-even win rate before fees is 20%.
 `tools/backfill_archive.py` fills the archive from recorded candles and walks each
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
@@ -388,7 +396,9 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **cooldown** | 0 | quiet period per instrument+timeframe after a signal |
 | **swing length** | 5 | how big a swing must be to count as liquidity |
 | **max wait / level memory** | 60 / 180 | how long a sweep may take to confirm, how long a level stays valid |
-| **target** | range extreme | `range` (drawing) or `next` liquidity |
+| **post-mitigation target** | 4R | armed only when an order block or eligible breaker is touched |
+| **breaker aggression** | 1.0 ATR body | paired endpoint candle is a breaker only when the directed break body meets this threshold |
+| **structural draw** | range extreme | `range` / `next` remains context, not the scored exit |
 
 Every rejection is counted and shown ("no HVB on this candle 623"), so a quiet
 screen is explained instead of looking broken.

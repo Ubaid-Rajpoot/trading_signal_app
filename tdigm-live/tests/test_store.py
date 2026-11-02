@@ -96,6 +96,7 @@ def test_one_signal_can_be_loaded_and_quarantined_without_deletion(tmp_path):
     row = store.get(PAYLOAD["key"])
     assert row["valid"] is False and row["state"] == "invalidated"
     assert row["chain_errors"] == ["sweep time is missing"]
+    assert row["state_reason"] == "integrity quarantine: sweep time is missing"
     assert store.counts()["total"] == 1, "an integrity failure is retained for audit, not deleted"
 
 
@@ -121,6 +122,21 @@ def test_a_decided_outcome_is_final(tmp_path):
     )
 
 
+def test_a_new_lifecycle_version_can_regrade_an_old_final_outcome(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    store.record({**PAYLOAD, "state": "win", "valid": False, "r_now": 2.0})
+    upgraded = {
+        **PAYLOAD,
+        "lifecycle_version": 2,
+        "state": "pending", "valid": True, "mitigated": False,
+        "target": None, "rr": None, "r_now": None,
+    }
+    store.record(upgraded)
+    row = store.get(PAYLOAD["key"])
+    assert row["lifecycle_version"] == 2
+    assert row["state"] == "pending" and row["target"] is None
+
+
 def test_the_archive_outlives_the_process(tmp_path):
     path = tmp_path / "sig.sqlite3"
     first = SignalStore(path)
@@ -144,15 +160,22 @@ def test_filters_read_the_archive_not_the_process(tmp_path):
     assert store.list(valid=0) == []
 
 
-def test_results_are_computed_from_the_rows(tmp_path):
+def test_results_are_4r_after_mitigation_and_exclude_legacy_or_unfilled_rows(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
-    store.record({**PAYLOAD, "key": "A", "state": "win", "valid": False})
-    store.record({**PAYLOAD, "key": "B", "state": "stopped", "valid": False})
-    store.record({**PAYLOAD, "key": "C", "state": "pending", "valid": True})
+    current = {**PAYLOAD, "lifecycle_version": 2, "mitigated": True, "target_rr": 4.0}
+    store.record({**current, "key": "A", "state": "win", "valid": False, "r_now": 4.0})
+    store.record({**current, "key": "B", "state": "stopped", "valid": False, "r_now": -1.0})
+    store.record({**current, "key": "C", "state": "pending", "valid": True,
+                  "mitigated": False, "r_now": None})
+    store.record({**PAYLOAD, "key": "legacy", "state": "win", "valid": False})
     results = store.results()["all"]
     assert results["wins"] == 1 and results["losses"] == 1
+    assert results["mitigated"] == 2
     assert results["win_rate"] == 0.5
-    assert results["r_per_trade"] == 0.5, "(2R - 1R) / 2 decided trades"
+    assert results["r_per_trade"] == 1.5, "(+4R - 1R) / 2 decided mitigated trades"
+    full = store.results()
+    assert full["target_rr"] == 4.0 and full["lifecycle_version"] == 2
+    assert "after mitigation" in full["r_basis"]
 
 
 def test_a_broken_disk_never_stops_the_scanner(tmp_path):

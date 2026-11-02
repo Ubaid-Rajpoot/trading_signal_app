@@ -68,6 +68,10 @@ DEFAULT_FILTERS: dict[str, Any] = {
     # 0 = an untouched setup remains valid until price invalidates it.  This is
     # essential for historical discovery: age alone is not mitigation.
     "setup_max_bars": 0,
+    # Risk/reward starts at mitigation, never at the body-break close.
+    "setup_target_rr": 4.0,
+    # A paired endpoint becomes a breaker only after an aggressive price shift.
+    "breaker_body_atr": 1.0,
     "volume_break": False,
     "volume_mult": 1.5,
     "volume_period": 20,

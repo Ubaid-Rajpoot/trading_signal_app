@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 from bot.engine import Engine  # noqa: E402
 from bot.store import SignalStore  # noqa: E402
-from tools.scan_history import _bars_by_timeframe, _outcome, read_candles  # noqa: E402
+from tools.scan_history import read_candles  # noqa: E402
 
 TDI = {"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9,
        "band_mult": 1.6185, "hvb_reference": "mbl"}
@@ -42,6 +42,7 @@ async def replay(args: argparse.Namespace, candles: list[dict], store: SignalSto
         tdi_settings=TDI,
         filters={"trend_context": args.trend_context, "require_hh_hl": args.trend_context,
                  "max_internal_depth": 2, "hvb_window": args.hvb_window,
+                 "setup_target_rr": 4.0, "breaker_body_atr": 1.0,
                  "confirm_mode": "all", "regime": not args.no_regime},
         structure={"pivot_len": 5, "major_len": 20, "macro_len": 80, "sweep_max_wait": 60,
                    "target_mode": "next"},
@@ -64,8 +65,8 @@ def main() -> int:
     ap.add_argument("folder", nargs="?", default="data/btc")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--timeframes", default="5m,15m,30m,1h")
-    ap.add_argument("--hvb-window", type=int, default=3)
-    ap.add_argument("--horizon", type=int, default=300, help="bars to walk forward per setup")
+    ap.add_argument("--hvb-window", type=int, default=0,
+                    help="0 keeps the shipped same-candle body-break + HVB rule")
     ap.add_argument("--db", default=str(ROOT / "data" / "tdigm.sqlite3"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--trend-context", action="store_true", help="re-apply the HH/HL gate")
@@ -89,21 +90,11 @@ def main() -> int:
     print(f"{args.symbol}: {len(candles)} 1m bars -> {len(setups)} setups"
           + (" (dry run, nothing written)" if args.dry_run else f" -> {args.db}"))
 
-    bars = _bars_by_timeframe(candles, args.timeframes.split(","))
-    states: Counter[str] = Counter()
-    for payload in setups.values():
-        state, _r = _outcome({"setup": {"entry": payload.get("entry"), "stop": payload.get("stop"),
-                                       "target": payload.get("target")},
-                              "side": payload.get("side"), "time": payload.get("created_ms")},
-                             bars.get(payload.get("timeframe"), []), args.horizon,
-                             target_mode="fixed", fixed_r=2.0)
-        # the archive's record is a fixed 2R target, so every row is comparable
-        payload["state"] = {"win": "win", "loss": "stopped", "open": "expired"}[state]
-        payload["closed_ms"] = payload.get("created_ms")
-        states[payload["state"]] += 1
-        if store is not None:
-            store.record(payload, "futures")
-
+    # The engine has already advanced every setup over every later candle using
+    # the exact live lifecycle: pending until mitigation, then fixed 4R/stop.
+    # A second formula here used to overwrite that truth with a synthetic 2R
+    # result, including setups that were never filled.
+    states: Counter[str] = Counter(payload.get("state") or "pending" for payload in setups.values())
     print(f"outcomes: {dict(states)}")
     if store is not None:
         print(f"archive now holds {store.counts().get('total', 0)} rows")

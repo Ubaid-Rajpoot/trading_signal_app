@@ -433,8 +433,9 @@ def create_app(
         rows = store.export(limit=limit)
         buffer = io.StringIO()
         fields = ["created_ms", "symbol", "market", "timeframe", "side", "grade", "state",
-                  "valid", "mitigated", "entry", "stop", "target", "target_2r", "rr",
-                  "score", "r_now", "zone_low", "zone_high", "swept_level", "bos_level",
+                  "valid", "mitigated", "entry", "stop", "target", "target_rr", "target_rr_price", "rr",
+                  "score", "r_now", "zone_low", "zone_high", "mitigation_kind", "state_reason",
+                  "lifecycle_version", "swept_level", "bos_level",
                   "break_kind", "hvb_side", "hvb_lag", "volume_ratio", "trend_dir",
                   "closed_ms", "evidence"]
         writer = _csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")

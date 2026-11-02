@@ -35,7 +35,8 @@ _INT_KEYS = {"max_bars_since_sweep", "trend_ema", "cooldown_minutes", "bos_max_a
              "volume_period"}
 _FLOAT_KEYS = {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
                "premium_level", "pool_tolerance", "pool_count", "structure_atr_min",
-               "structure_atr_max", "volume_mult", "confirm_min_score"}
+               "structure_atr_max", "volume_mult", "confirm_min_score", "setup_target_rr",
+               "breaker_body_atr"}
 _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
               "trend_context", "require_hh_hl", "require_bos", "volume_break"}

@@ -137,7 +137,16 @@
       score: raw.score,
       session: raw.session || "",
       created_ms: Number(raw.created_ms || raw.time || 0),
+      touched_ms: Number(raw.touched_ms || 0),
+      closed_ms: Number(raw.closed_ms || 0),
       zone: raw.zone || null,
+      zones: raw.zones || (raw.zone ? [raw.zone] : []),
+      mitigation_kind: raw.mitigation_kind || "",
+      mitigation_zone: raw.mitigation_zone || null,
+      state_reason: raw.state_reason || "",
+      target_rr: raw.target_rr,
+      lifecycle_version: Number(raw.lifecycle_version || 1),
+      mitigated: !!raw.mitigated,
       swept_level: raw.swept_level,
       swept_side: raw.swept_side,
       sweep_ms: Number(raw.sweep_ms || (raw.setup || {}).sweep_time || 0),
@@ -368,13 +377,13 @@
     }
     var rows = [];
     rows.push(row("signals stored", num(counts.total, 0), "every plan ever recorded, across restarts"));
-    rows.push(row("decided", num(all.decided, 0), "closed at the draw, the stop or break-even"));
-    rows.push(row("win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
-      "wins / decided. At the median 1:" + (model.medianRr || "?") + " a plan needs "
-      + (model.medianRr ? Math.round(100 / (1 + model.medianRr)) : "?") + "% to break even before fees."));
+    rows.push(row("mitigated", num(all.mitigated, 0), "order-block or eligible aggressive-breaker touches under the current lifecycle"));
+    rows.push(row("decided", num(all.decided, 0), "mitigated trades closed at fixed 4R or at the stop"));
+    rows.push(row("4R win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
+      "4R wins / (4R wins + stopped trades), after mitigation only. Break-even before fees is 20%."));
     var rpt = all.r_per_trade;
     rows.push(row("R / trade", rpt == null ? "—" : (rpt > 0 ? "+" : "") + Number(rpt).toFixed(3),
-      "measured on the stored rows at the fixed 2R convention, net of nothing else"));
+      "measured only after mitigation: +4R for a target, -1R for a stop"));
     rows.push(row("95% interval", all.ci_low == null ? "—"
       : (all.ci_low > 0 ? "+" : "") + Number(all.ci_low).toFixed(2) + " … "
         + (all.ci_high > 0 ? "+" : "") + Number(all.ci_high).toFixed(2),
@@ -429,11 +438,22 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
+    if (row.lifecycle_version < 2) {
+      bits.push('<div class="chain-invalid"><b>LEGACY LIFECYCLE</b> · excluded from the mitigation-first 4R win rate until deep replay regrades it</div>');
+    }
+    var stateLabel = stateOf(row).toUpperCase();
+    var stateWhy = row.state_reason || (row.state === "pending"
+      ? "waiting for order-block or eligible aggressive-breaker mitigation; no trade or 4R target exists yet"
+      : "no lifecycle reason was stored for this legacy row");
+    bits.push('<div class="nums"><span>state <b>' + escapeHtml(stateLabel) + "</b> · "
+      + escapeHtml(stateWhy) + "</span></div>");
     var nums = [];
     ["entry", "stop", "target"].forEach(function (k) {
       if (row[k] !== null && row[k] !== undefined) nums.push(k + " <b>" + escapeHtml(num(row[k])) + "</b>");
     });
-    if (row.rr) nums.push("planned <b>1:" + Number(row.rr).toFixed(1) + "</b>");
+    if (row.rr) nums.push("armed <b>1:" + Number(row.rr).toFixed(1) + " after mitigation</b>");
+    else nums.push("target <b>arms at 1:" + Number(row.target_rr || 4).toFixed(0) + " after mitigation</b>");
+    if (row.mitigation_kind) nums.push("filled from <b>" + escapeHtml(row.mitigation_kind.replace(/_/g, " ")) + "</b>");
     if (row.r_now !== null && row.r_now !== undefined) nums.push("now <b>" + (Number(row.r_now) > 0 ? "+" : "") + Number(row.r_now).toFixed(2) + "R</b>");
     if (row.fee_r !== null && row.fee_r !== undefined) nums.push("fee <b>" + Number(row.fee_r).toFixed(2) + "R</b>");
     if (row.score !== null && row.score !== undefined) nums.push("score <b>" + escapeHtml(row.score) + "</b>");
@@ -451,10 +471,11 @@
     }
     var bucket = bucketRecord(row);
     if (bucket) {
-      bits.push('<div class="nums" title="Every closed trade in this instrument-timeframe-side bucket, '
-        + 'at the fixed 2R convention. The interval is what the sample actually supports.">'
+      bits.push('<div class="nums" title="Every mitigated trade in this instrument-timeframe bucket, '
+        + 'at fixed 1:4. Unfilled invalidations are not losses. The interval is what the sample supports.">'
         + "<span>" + escapeHtml(row.timeframe) + " " + escapeHtml(sideOf(row)) + " so far: <b>"
-        + bucket.n + "</b> closed · <b>" + (bucket.r > 0 ? "+" : "") + Number(bucket.r).toFixed(2) + "R</b>"
+        + bucket.decided + "</b> decided · <b>" + (bucket.r_per_trade > 0 ? "+" : "")
+        + Number(bucket.r_per_trade || 0).toFixed(2) + "R</b>"
         + " each · 95% " + (bucket.ci_low > 0 ? "+" : "") + Number(bucket.ci_low).toFixed(2)
         + "…" + (bucket.ci_high > 0 ? "+" : "") + Number(bucket.ci_high).toFixed(2)
         + " <b>" + escapeHtml(bucket.verdict) + "</b></span></div>");
@@ -688,6 +709,10 @@
       [selected.entry, selected.stop, selected.target, selected.swept_level, selected.bos_level].forEach(function (v) {
         v = Number(v); if (isFinite(v) && v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
       });
+      (selected.zones || []).forEach(function (zone) {
+        var zl = Number(zone.low), zh = Number(zone.high);
+        if (isFinite(zl) && isFinite(zh)) { lo = Math.min(lo, zl); hi = Math.max(hi, zh); }
+      });
     }
     var rawSpan = hi - lo || Math.max(1, Math.abs(hi) * 0.01);
     var centre = (hi + lo) / 2 + chartView.panY * rawSpan;
@@ -744,15 +769,36 @@
       }
 
       var entry = Number(selected.entry), stop = Number(selected.stop), target = Number(selected.target);
-      var tradeEnd = Math.min(w - padR, bx + Math.max(candleW * 12, plotW * 0.24));
-      if (isFinite(entry) && isFinite(stop)) {
+      var mitigationIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+      var tradeStart = mitigationIndex >= 0 ? x(mitigationIndex) : bx;
+      var tradeEnd = Math.min(w - padR, tradeStart + Math.max(candleW * 12, plotW * 0.24));
+      if (selected.mitigated && isFinite(entry) && isFinite(stop)) {
         ctx.fillStyle = "rgba(255,92,122,.075)";
-        ctx.fillRect(bx, Math.min(y(entry), y(stop)), Math.max(2, tradeEnd - bx), Math.abs(y(stop) - y(entry)));
+        ctx.fillRect(tradeStart, Math.min(y(entry), y(stop)), Math.max(2, tradeEnd - tradeStart), Math.abs(y(stop) - y(entry)));
       }
-      if (isFinite(entry) && isFinite(target)) {
+      if (selected.mitigated && isFinite(entry) && isFinite(target)) {
         ctx.fillStyle = "rgba(46,230,168,.075)";
-        ctx.fillRect(bx, Math.min(y(entry), y(target)), Math.max(2, tradeEnd - bx), Math.abs(y(target) - y(entry)));
+        ctx.fillRect(tradeStart, Math.min(y(entry), y(target)), Math.max(2, tradeEnd - tradeStart), Math.abs(y(target) - y(entry)));
       }
+
+      // Both legitimate mitigation choices are explicit. The breaker is the
+      // paired endpoint candle on the left of an aggressive displacement.
+      (selected.zones || []).forEach(function (zone, zi) {
+        var zl = Number(zone.low), zh = Number(zone.high);
+        if (!isFinite(zl) || !isFinite(zh) || zh <= zl) return;
+        var sourceIndex = barAtTime(candles, Number(zone.time || breakTime));
+        var zx = sourceIndex >= 0 ? x(sourceIndex) : bx;
+        var endIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+        var zEnd = endIndex >= 0 ? x(endIndex) + bodyW : tradeEnd;
+        var breaker = zone.type === "breaker_block";
+        ctx.fillStyle = breaker ? "rgba(180,135,255,.13)" : "rgba(103,169,255,.10)";
+        ctx.strokeStyle = breaker ? "rgba(180,135,255,.78)" : "rgba(103,169,255,.68)";
+        ctx.fillRect(zx, y(zh), Math.max(bodyW, zEnd - zx), Math.max(2, y(zl) - y(zh)));
+        ctx.strokeRect(zx, y(zh), Math.max(bodyW, zEnd - zx), Math.max(2, y(zl) - y(zh)));
+        ctx.fillStyle = breaker ? "#b487ff" : "#67a9ff";
+        ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+        ctx.fillText(breaker ? "BREAKER" : "ORDER BLOCK", zx + 3, y(zh) - 2 - zi * 10);
+      });
     }
 
     // Candles use the same colours and spacing as SMC-Radar.
@@ -784,19 +830,25 @@
       outlineCandle(breakIndex, "#67a9ff", "BODY BREAK + HVB", false);
     }
 
-    // Selected trade levels begin at the body-break candle; unlike the old
-    // chart they do not paint a full-width line that appears unrelated to time.
+    // Entry and 4R begin at mitigation, not at the body-break close. Pending
+    // rows show only a planned fill and invalidation stop.
     if (selected && breakIndex >= 0) {
-      var startX = Math.max(padL, x(breakIndex));
-      [[selected.entry, "#dfe6f2", "entry", []], [selected.stop, "#ff5c7a", "stop", [5, 4]],
-        [selected.target, "#2ee6a8", "target", [5, 4]], [selected.bos_level, "#b487ff", "body break", [2, 3]]]
+      var touchedIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+      var startX = Math.max(padL, x(touchedIndex >= 0 ? touchedIndex : breakIndex));
+      var entryLabel = selected.mitigated ? "entry after mitigation" : "planned mitigation fill";
+      var breakX = Math.max(padL, x(breakIndex));
+      [[selected.entry, "#dfe6f2", entryLabel, [], startX],
+        [selected.stop, "#ff5c7a", "stop", [5, 4], breakX],
+        [selected.target, "#2ee6a8", "4R target", [5, 4], startX],
+        [selected.bos_level, "#b487ff", "body break", [2, 3], breakX]]
         .forEach(function (line) {
           var value = Number(line[0]); if (!isFinite(value)) return;
           var yy = y(value); if (yy < padT || yy > h - padB) return;
+          var lineStart = line[4];
           ctx.strokeStyle = line[1]; ctx.lineWidth = 1; ctx.setLineDash(line[3]);
-          ctx.beginPath(); ctx.moveTo(startX, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(lineStart, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.setLineDash([]);
           ctx.fillStyle = line[1]; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
-          ctx.fillText(line[2] + " " + priceText(value), startX + 4, yy - 2);
+          ctx.fillText(line[2] + " " + priceText(value), lineStart + 4, yy - 2);
         });
     }
 

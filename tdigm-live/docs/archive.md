@@ -39,14 +39,14 @@ be held up by an fsync, and a crash must not corrupt the file.
 |---|---|---|
 | a signal is saved as soon as it exists | `Engine._remember()` on publish and on every state change | `test_the_engine_writes_through_and_reads_back_on_boot` |
 | a restart shows the archive **before any candle arrives** | `load_stored()` at build time, `/api/signals` reads SQLite | `test_the_archive_outlives_the_process` |
-| a decided outcome is final | a `win`/`stopped` row is never overwritten by a re-scan replaying the same history | `test_a_decided_outcome_is_final` |
+| a decided outcome is final within one lifecycle version | ordinary rescans cannot rewrite it; a versioned rule change (such as post-mitigation 4R) intentionally regrades history | `test_a_decided_outcome_is_final`, `test_a_new_lifecycle_version_can_regrade_an_old_final_outcome` |
 | a broken disk never stops the scanner | the store degrades to `enabled=False` and reports the problem; `/api/health` shows it | `test_a_broken_disk_never_stops_the_scanner` |
 | old databases keep working | columns added later are migrated in place, never by recreating the table | `MIGRATIONS` in `bot/store.py` |
 
-The "final" rule matters more than it looks. Rescanning 18 months of BTC replays
-hundreds of setups that already ended; without it, a win would silently become
-`pending` again and the win rate on the page would drift every time you pressed
-**rescan**.
+The "final" rule matters more than it looks. Ordinary rescans cannot turn a win
+back into `pending`. The exception is explicit `lifecycle_version` advancement:
+version 2 changed the fill to mitigation and the target to 4R, so old outcomes
+must be replayed once rather than contaminating the new win rate.
 
 ## Reading it back
 
@@ -56,21 +56,19 @@ hundreds of setups that already ended; without it, a win would silently become
   cannot take out is a trap.
 * The page has **include archive** (on by default) in the filter bar. The live
   list and the stored list are merged by key; a live row always wins because it
-  is newer. Decided setups are labelled `closed at target` / `closed at stop` /
-  `closed, never filled`, and **valid only** does not hide them - that switch is
-  about open positions, not history.
+  is newer. State filters expose pending, active, 4R wins, stops and unfilled
+  invalidations separately, and every row displays its stored `state_reason`.
 
-The archive line on the setups card is computed from the rows themselves, not
-from anything in memory:
+The archive line on the setups card is computed from current-version rows, not
+from memory:
 
-> 107 setups recorded · 43 won · 54 stopped · hit rate 44% · +0.33R per decided
-> trade · grade A 29/78 (+0.115R) · grade B 14/19 (+1.211R)
+> win rate = mitigated 4R wins / (mitigated 4R wins + mitigated stops)
 
-R is scored against the fixed **2R** target, the convention every measurement in
-`docs/` uses. Most setups have no structural target at all (the next liquidity
-level is further away than 2R, or inside the entry), so scoring them on their own
-target would mix two yardsticks and produce a number that cannot be compared with
-the ablation table.
+Risk/reward does not begin on the body-break candle. A later order-block or
+eligible aggressive-breaker touch freezes entry and risk; the target is exactly
+**4R** from that fill. A pre-mitigation stop is `invalidated`, carries no realised
+R and is excluded. Legacy 2R studies remain below as labelled historical
+experiments, but they are not mixed into lifecycle-v2 results.
 
 ## Filling it from history
 
@@ -84,8 +82,9 @@ python tools/backfill_archive.py data/btc --symbol BTCUSDT            # 107 setu
 python tools/backfill_archive.py data/btc --symbol BTCUSDT --dry-run  # writes nothing
 ```
 
-BTCUSDT, 2023-01-01 → 2025-06-30, 5m/15m/30m/1h: **107 setups, 43 won, 54
-stopped, 10 never filled.**
+The older BTCUSDT 2023-01-01 → 2025-06-30 report produced **107 setups, 43 won,
+54 stopped, 10 never filled under legacy 2R scoring**. It is retained only for
+reproducibility; a lifecycle-v2 deep replay is required for the current 4R rate.
 
 ## Thirty instruments at a time
 
@@ -114,9 +113,9 @@ speed-up claim I cannot test at 500 symbols.
 
 ## More signals
 
-The archive made the sparsity measurable, and the measurement changed a default.
-Full table in `docs/trend-rules.md`; the short version, BTCUSDT 1m → 5m/15m/30m/1h
-over 18 months, fixed 2R:
+The archive made sparsity measurable. The following table is a **legacy gate
+experiment**, retained for reproduction only; it used fixed 2R and does not
+represent the current same-candle HVB, trend-gated, mitigation-first 4R policy:
 
 | variant | signals | win% | R/trade |
 |---|---|---|---|
@@ -124,14 +123,10 @@ over 18 months, fixed 2R:
 | **HVB within 3 bars of the break** | 72 | 40.6% | 0.22 |
 | **+ external HH/HL trend gate off** | **107** | **42.6%** | **0.28** |
 
-So: the HVB window is 3 bars, and `trend_context` / `require_hh_hl` are now
-**off by default**. The gate was removing a third of the signals without paying
-for it in expectancy. It is still evaluated on every setup and it is what makes a
-setup **grade A** instead of **grade B**, so nothing is lost - the information is
-on the card, and the archive reports both grades separately.
-
-Loosening further was measured and rejected: `max_internal_depth` 3 gives 89
-signals at 0.18R/trade (window 0) - more rows, worse rows.
+Those numbers do not override the shipped rules: `hvb_window: 0` requires the
+same candle, and current trend/structure gates remain configured in
+`config.json`. New lifecycle-v2 results are reported separately only after a
+fresh deep replay.
 
 ### A caveat about the grades
 

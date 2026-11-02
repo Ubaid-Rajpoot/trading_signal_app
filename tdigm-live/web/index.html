@@ -72,11 +72,14 @@
       <div class="group-head">state</div>
       <select id="state-select">
         <option value="all">every state</option>
-        <option value="open">open only (valid)</option>
-        <option value="win">closed at the draw</option>
+        <option value="open">open only (pending + active)</option>
+        <option value="pending">pending mitigation</option>
+        <option value="active">active after mitigation</option>
+        <option value="win">won at fixed 4R</option>
         <option value="stopped">closed at the stop</option>
         <option value="breakeven">scratched at break-even</option>
         <option value="expired">expired</option>
+        <option value="invalidated">invalidated before mitigation</option>
       </select>
     </div>
 
