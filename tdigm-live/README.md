@@ -354,7 +354,10 @@ could produce anything. `--skip N` moves the start point.
   reads `live · polling` and everything still works — matrix, setups, reasons.
 * **`live` + a red banner naming the exchange** means the bot is fine and the
   exchange is not reachable from that machine. It retries on its own; reloading
-  will not help.
+  will not help. REST requests deliberately do not advertise Brotli: MEXC has
+  returned malformed `br` bodies for contract detail. If any content decoder
+  still fails, that request is immediately retried with `Accept-Encoding:
+  identity` instead of trapping the scanner on the 45-symbol fallback.
 * `curl -s localhost:8700/api/health` answers in milliseconds and separates
   feed status, automatic-universe mode/error/count, fully/partially/empty warm
   symbols, failed cells, queue depth, frames, and the setup decision funnel.

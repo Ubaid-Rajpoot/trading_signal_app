@@ -91,6 +91,12 @@ class BaseFeed:
         self._http = httpx.AsyncClient(
             timeout=20,
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
+            # MEXC occasionally emits a malformed Brotli stream (the decoder is
+            # fed bytes after its end marker). httpx advertises `br` whenever a
+            # Brotli package happens to be installed, making production differ
+            # from otherwise identical hosts. Keep compression, but negotiate
+            # the broadly reliable gzip/deflate codecs only.
+            headers={"Accept-Encoding": "gzip, deflate"},
         )
         self._generation = 0  # bumped when the symbol list changes
 
@@ -142,9 +148,14 @@ class BaseFeed:
 
     async def _get_json(self, url: str, params: dict | None = None, retries: int = 4) -> object:
         delay = 1.0
+        accept_encoding = "gzip, deflate"
         for attempt in range(retries):
             try:
-                resp = await self._http.get(url, params=params)
+                resp = await self._http.get(
+                    url,
+                    params=params,
+                    headers={"Accept-Encoding": accept_encoding},
+                )
                 if resp.status_code == 200:
                     return resp.json()
                 if resp.status_code == 429 and attempt < retries - 1:
@@ -156,6 +167,16 @@ class BaseFeed:
                     delay *= 2.0
                     continue
                 raise FeedError(f"{url} -> HTTP {resp.status_code} {resp.text[:120]}")
+            except httpx.DecodingError as exc:
+                # A content decoder failure is deterministic for that compressed
+                # response. Retrying with the same advertised codec repeats the
+                # failure; request an uncompressed body immediately instead.
+                accept_encoding = "identity"
+                if attempt == retries - 1:
+                    raise FeedError(
+                        f"{url} -> response decompression failed even with identity encoding: {exc}"
+                    )
+                continue
             except (httpx.RequestError, asyncio.TimeoutError) as exc:
                 if attempt == retries - 1:
                     raise FeedError(f"{url} -> {type(exc).__name__}: {exc}")

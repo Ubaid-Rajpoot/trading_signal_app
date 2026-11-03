@@ -14,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -51,6 +52,38 @@ def test_mexc_history_interval_is_translated_exactly_once():
     feed = MexcFuturesFeed(["BTCUSDT"])
     assert feed.exchange_interval("1h") == "1h", "history() translates 1h to Min60"
     assert feed.exchange_interval("3m") is None, "unsupported native candles are aggregated"
+
+
+@pytest.mark.asyncio
+async def test_rest_disables_brotli_and_recovers_from_a_bad_compressed_response():
+    """Production MEXC once returned a malformed `br` detail response.
+
+    Hosts with Brotli installed used to advertise it automatically and then make
+    every universe retry fail in the decoder. The pooled client no longer asks
+    for Brotli, and a decoder failure retries once with no compression at all.
+    """
+    feed = MexcFuturesFeed(["BTCUSDT"])
+    assert feed._http.headers["accept-encoding"] == "gzip, deflate"
+    await feed._http.aclose()
+
+    class BrokenOnce:
+        def __init__(self):
+            self.encodings = []
+
+        async def get(self, url, params=None, headers=None):
+            self.encodings.append(headers["Accept-Encoding"])
+            if len(self.encodings) == 1:
+                raise httpx.DecodingError(
+                    "brotli decoder received trailing data",
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(200, json={"success": True, "data": [1]})
+
+    client = BrokenOnce()
+    feed._http = client  # type: ignore[assignment]
+    payload = await feed._get_json("https://contract.mexc.com/api/v1/contract/detail")
+    assert payload == {"success": True, "data": [1]}
+    assert client.encodings == ["gzip, deflate", "identity"]
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,12 @@ The repair makes contract detail authoritative:
 
 The sandbox cannot reach MEXC directly (TLS EOF), so no claim is made here about today's exact exchange count. Recorded response-shape tests prove that a 520-contract detail response remains 520 contracts even when the ticker endpoint fails. Production health now exposes the actual count instead of disguising failure as a 45-contract universe.
 
+### Malformed Brotli response follow-up
+
+Production subsequently exposed a transport-specific failure from MEXC contract detail: `brotli: decoder process called with data when can_accept_more_data() is False`. It means the server/proxy returned an invalid Brotli-compressed body (bytes after the decoder's end marker); it does not mean the JSON parser or trading rules failed. `httpx` advertised Brotli only on hosts where an optional Brotli package happened to be installed, which explained why the failure differed by machine.
+
+The pooled REST client now advertises only `gzip, deflate`. If any compressed response still raises `httpx.DecodingError`, the same request is immediately retried with `Accept-Encoding: identity`. A regression test injects the production decoder exception and proves the identity retry succeeds, allowing automatic universe refresh to leave the 45-symbol fallback.
+
 ## Why zero signals was not accepted as a market conclusion
 
 The setup funnel was exercised over a deterministic synthetic stress replay: 40 distinct 1-minute series × 5,000 bars = 200,000 closed candles. This is a starvation/regression test, not market evidence and not a backtest.
