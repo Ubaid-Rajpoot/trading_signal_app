@@ -341,6 +341,20 @@
     }
     if (model.health) {
       var n = model.health.notifications || {};
+      var u = model.health.universe || {};
+      var cov = model.health.coverage || {};
+      var universeLabel = u.auto
+        ? (u.mode === "discovered" ? " · " + (u.available || 0) + " discovered"
+          + (u.error ? " (refresh failed)" : "")
+          : " · FALLBACK universe" + (u.error ? " (discovery failed)" : ""))
+        : "";
+      $("stat-symbols").textContent = (model.health.symbols || 0) + " symbols · "
+        + (cov.symbols_ready || 0) + " fully warm · " + (cov.cells_waiting || 0) + " cells waiting"
+        + (cov.symbols_active_warmup ? " · " + cov.symbols_active_warmup + " replaying" : "")
+        + (cov.queued_symbols ? " · " + cov.queued_symbols + " queued" : "")
+        + universeLabel;
+      $("stat-symbols").title = u.error || (u.mode === "discovered"
+        ? "Automatic exchange discovery succeeded." : "Automatic exchange discovery is not active.");
       var noise = (n.filtered || 0) + (n.suppressed || 0);
       $("status-noise").textContent = noise + " notice(s) hidden";
       $("status-noise").title = (n.filtered || 0) + " rejected setup notices and " + (n.suppressed || 0)
@@ -553,7 +567,8 @@
     var worst = Object.keys(drops).sort(function (a, b) { return drops[b] - drops[a]; })[0];
     if (f.mode === "sweep") {
       $("status-funnel").textContent = (f.sweeps || 0) + " sweeps → " + (f.setups || 0)
-        + " body breaks → " + (f.plans || 0) + " TDIGM signals"
+        + " paired body breaks → " + (f.hvb_aligned || 0) + " same-candle HVBs → "
+        + (f.plans || 0) + " filter-passed setups"
         + (worst ? " · top rejection: " + worst + " (" + drops[worst] + ")" : "");
     } else {
       $("status-funnel").textContent = (f.traps || 0) + " traps → " + (f.displacements || 0)
@@ -1063,7 +1078,7 @@
   function refreshHealth() {
     fetch("/api/health")
       .then(function (r) { return r.json(); })
-      .then(function (data) { model.health = data; renderHeader(); })
+      .then(function (data) { model.health = data; renderHeader(); checkAlarm(); })
       .catch(function () {});
   }
 
@@ -1086,6 +1101,14 @@
     var age = model.lastMessage ? (Date.now() - model.lastMessage) / 1000 : null;
     if (h.feed === "stopped" || (h.failed && h.failed > 0 && h.symbols === 0)) {
       banner("The feed stopped. The page is still reading the archive, but no new candles are arriving. Check the server log.");
+    } else if (h.universe && h.universe.auto && h.universe.mode !== "discovered") {
+      banner("Automatic futures-universe discovery failed. The scanner is using only "
+        + (h.universe.selected || h.symbols || 0) + " configured fallback contracts and will retry. "
+        + (h.universe.error || "The exchange returned a suspiciously small list."));
+    } else if (h.universe && h.universe.auto && h.universe.error) {
+      banner("The latest futures-universe refresh failed. The scanner retained all "
+        + (h.universe.selected || h.symbols || 0) + " contracts from the last successful discovery and will retry. "
+        + h.universe.error);
     } else if (!model.wsOk && age !== null && age > 20) {
       banner("Socket disconnected — falling back to HTTP polling, so the table may lag by a few seconds. It will reconnect by itself.");
     } else {

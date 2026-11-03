@@ -24,8 +24,10 @@ where old measurements are too weak or too stale to support a claim.
 > body close beyond the furthest remembered range edge. Inside an established
 > outer trend, one clean local `LH+LL` / `HL+HH` step is enough to identify the
 > specific directional leg; the same one-step flicker cannot stand alone inside
-> mixed outer structure. ADX ≥ 22 and ER ≥ 0.30 remain additional gates; they
-> cannot certify trend by themselves.
+> mixed outer structure. ADX ≥ 22 and ER ≥ 0.30 remain additional gates for an
+> established trend and cannot certify trend by themselves. They do not veto the
+> fresh major/macro full-range release: those lagging statistics commonly still
+> say `range` on the exact body close that establishes the new direction.
 
 Legend: **on** = shipped default · **off** = implemented, switchable, left off.
 
@@ -81,6 +83,7 @@ The card shows all of it: `external bullish (HH+HL) · last break of structure u
 | a break of structure must have happened in the trade's direction | `require_bos` | **on** | `no recent structure break in the trade direction` |
 | …and it must be recent | `bos_max_age` | **240 bars** | `break of structure is stale (312 bars)` |
 | how deep inside the structure a setup may sit | `max_internal_depth` | **2** | `internal within internal` |
+| lagging range regime for established trends | `regime_adx_min` / `regime_er_min` | **22 / 0.30** | ADX/ER rejection; bypassed only by the fresh major/macro full-range shift above |
 | high-volume signal candle (≥ N× average) | `volume_break` / `volume_mult` / `volume_period` | **off** / 1.5× / 20 | `volume 0.83× < 1.5×` |
 | how the switched-on conditions combine | `confirm_mode`, `confirm_min_score` | `all` / 60 | `confluence score 55 < 60` |
 

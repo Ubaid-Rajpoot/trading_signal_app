@@ -104,9 +104,34 @@ def create_app(
     store = SignalStore(None if config.get("database") == "" else db_path)
     engine.attach_store(store)
     restored = engine.load_stored()
-    universe_cache: dict[str, Any] = {"at": 0.0, "items": [], "error": None}
+    auto_universe = bool(config.get("auto_universe"))
+    fallback_symbols = list(engine.symbols)
+    universe_min_expected = max(1, int(config.get("universe_min_expected", 100)))
+    universe_retry_seconds = max(10.0, float(config.get("universe_retry_seconds", 60)))
+    universe_refresh_seconds = max(300.0, float(config.get("universe_refresh_seconds", 3600)))
+    universe_cache: dict[str, Any] = {
+        "at": 0.0,
+        "last_attempt": 0.0,
+        "items": [],
+        "error": None,
+        "attempts": 0,
+        "successes": 0,
+        "mode": "configured_fallback" if auto_universe else "manual",
+        "selected": len(engine.symbols),
+        "fallback_count": len(fallback_symbols),
+    }
+    universe_lock = asyncio.Lock()
     tasks: list[asyncio.Task] = []
-    warm_queue: asyncio.Queue[str] = asyncio.Queue()
+    # (symbol, depth, force): shallow jobs for every new contract stay ahead of
+    # their deep jobs, so a 700-contract add does not warm only the first 24.
+    warm_queue: asyncio.Queue[tuple[str, int, bool]] = asyncio.Queue()
+    startup_history_bars = max(
+        120, min(engine.history_bars, int(config.get("startup_history_bars", 1000)))
+    )
+    if engine.strategy == "book":
+        # The narrative engine owns one separate deep 1m replay; running it in
+        # both phases would duplicate the same expensive work.
+        startup_history_bars = engine.history_bars
     history_days = float(config.get("history_days", 0) or 0)
     rescan_state: dict[str, Any] = {"running": False, "result": None}
     chart_cache: dict[tuple[str, str, int, int], tuple[float, list[dict]]] = {}
@@ -124,7 +149,7 @@ def create_app(
             if symbol in warm_pending:
                 continue
             warm_pending.add(symbol)
-            warm_queue.put_nowait(symbol)
+            warm_queue.put_nowait((symbol, startup_history_bars, False))
 
     async def warmer() -> None:
         """One of ``workers`` consumers of the warm-up queue.
@@ -135,14 +160,21 @@ def create_app(
         instrument can starve the ones behind it: they all wait in the same FIFO.
         """
         while True:
-            symbol = await warm_queue.get()
+            symbol, depth, force = await warm_queue.get()
+            queue_deep = depth < engine.history_bars
             try:
-                await engine.warm_symbol(feed, symbol)
+                await engine.warm_symbol(
+                    feed, symbol, force=force, history_bars=depth
+                )
             except Exception:
                 pass
             finally:
-                warm_pending.discard(symbol)
                 warm_queue.task_done()
+            if queue_deep and symbol in engine.symbols:
+                # Appended behind all already queued shallow work: breadth first.
+                warm_queue.put_nowait((symbol, engine.history_bars, True))
+            else:
+                warm_pending.discard(symbol)
 
     async def pump() -> None:
         """Read candles from the feed and hand them to the engine, forever."""
@@ -181,6 +213,26 @@ def create_app(
             if retried:
                 await engine._emit_state(force=True)  # noqa: SLF001
 
+    async def universe_refresher() -> None:
+        """Retry failed/partial discovery and periodically catch new listings."""
+        if not auto_universe or not hasattr(feed, "universe"):
+            return
+        while True:
+            delay = (
+                universe_refresh_seconds
+                if universe_cache.get("mode") == "discovered" and not universe_cache.get("error")
+                else universe_retry_seconds
+            )
+            await asyncio.sleep(delay)
+            try:
+                await _refresh_auto_universe(initial=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # `_refresh_auto_universe` normally records this itself; this is
+                # the final guard that keeps a refresh bug from killing retries.
+                universe_cache["error"] = f"{type(exc).__name__}: {exc}"
+
     async def boot() -> None:
         """Warm in the background, then start reading candles.
 
@@ -189,22 +241,18 @@ def create_app(
         Now the server is up instantly, the page shows every cell as warming,
         and rows fill in as their history lands.
         """
-        if config.get("auto_universe") and hasattr(feed, "universe"):
+        if auto_universe and hasattr(feed, "universe"):
             try:
-                items = await feed.universe()
-                ranked = [item["symbol"] for item in items]
-                wanted = ranked[:max_symbols]
-                if wanted:
-                    current = list(engine.symbols)
-                    removed = engine.remove_symbols(current)
-                    if removed:
-                        feed.remove_symbols(removed)
-                    added = engine.add_symbols(wanted)
-                    if added:
-                        feed.add_symbols(added)
-                    _persist_symbols()
+                await _refresh_auto_universe(initial=True)
             except Exception as exc:
-                await publish({"type": "log", "level": "warn", "message": f"auto-universe fetch failed: {exc}"})
+                universe_cache["error"] = f"{type(exc).__name__}: {exc}"
+                await publish(
+                    {
+                        "type": "log",
+                        "level": "warn",
+                        "message": f"auto-universe apply failed; keeping fallback: {exc}",
+                    }
+                )
         # Subscribe immediately.  Closed bars are buffered per symbol by the
         # engine while that symbol's REST history is rebuilt, then drained in
         # order.  A 700-contract deep scan therefore never creates a blind live
@@ -213,7 +261,26 @@ def create_app(
         pump_task = asyncio.create_task(pump())
         try:
             try:
-                await engine.warmup(feed, concurrency=workers)
+                # First make every contract/timeframe usable. Only then spend
+                # requests on the full 5,000-bar historical replay. This keeps
+                # low-ranked contracts from sitting blind behind the first batch.
+                await engine.warmup(
+                    feed, concurrency=workers, history_bars=startup_history_bars
+                )
+                if startup_history_bars < engine.history_bars:
+                    await publish(
+                        {
+                            "type": "log",
+                            "level": "info",
+                            "message": (
+                                f"fast warm-up complete; deep replaying {engine.history_bars} bars "
+                                f"across {len(engine.symbols)} contracts"
+                            ),
+                        }
+                    )
+                    await engine.rescan(
+                        feed, concurrency=workers, history_bars=engine.history_bars
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # never take the page down over warm-up
@@ -233,6 +300,7 @@ def create_app(
             tasks.append(asyncio.create_task(warmer()))
         tasks.append(asyncio.create_task(setup_pusher()))
         tasks.append(asyncio.create_task(retry_sweeper()))
+        tasks.append(asyncio.create_task(universe_refresher()))
         try:
             # a first table immediately, so the browser paints something at once
             await engine._emit_state(force=True)  # noqa: SLF001 - same module boundary
@@ -282,6 +350,21 @@ def create_app(
             "clients": len(hub.clients),
             "warming": engine.warming(),
             "failed": len(engine.warm_failures),
+            "coverage": {**engine.coverage(), "queued_symbols": warm_queue.qsize()},
+            "decision_funnel": engine.decision_funnel(),
+            "universe": {
+                "auto": auto_universe,
+                "mode": universe_cache["mode"],
+                "available": len(universe_cache["items"]),
+                "selected": len(engine.symbols),
+                "fallback_count": universe_cache["fallback_count"],
+                "attempts": universe_cache["attempts"],
+                "successes": universe_cache["successes"],
+                "fetched_at": universe_cache["at"],
+                "last_attempt": universe_cache["last_attempt"],
+                "error": universe_cache["error"],
+                "diagnostics": getattr(feed, "universe_diagnostics", None),
+            },
             "market": str(config.get("market", "futures")),
             "setups": len(engine.setup_payloads),
             "stored": store_counts.get("total", 0),
@@ -377,14 +460,22 @@ def create_app(
                 "drops": engine.book.drops(),
             }
         else:
+            decisions = engine.decision_funnel()
             funnel = {
                 "mode": "sweep",
                 "sweeps": sum(cell.structure.sweep_count for cell in engine.cells.values()),
-                "setups": sum(cell.structure.setups for cell in engine.cells.values()),
-                "plans": engine.kinds.get("signal", 0),
+                "setups": decisions["setups"],
+                "hvb_aligned": decisions["hvb_aligned"],
+                "filtered": decisions["filtered"],
+                "plans": decisions["passed"],
                 "drops": dict(engine.filters.rejections),
             }
-        return {"watching": rows, "funnel": funnel, "strategy": engine.strategy}
+        return {
+            "watching": rows,
+            "funnel": funnel,
+            "strategy": engine.strategy,
+            "coverage": engine.coverage(),
+        }
 
     @app.get("/api/signals")
     async def signals(
@@ -670,12 +761,110 @@ def create_app(
         now = time.time()
         if not force and universe_cache["items"] and now - universe_cache["at"] < 600:
             return universe_cache
-        try:
-            items = await feed.universe()
-            universe_cache.update({"items": items, "at": now, "error": None})
-        except Exception as exc:
-            universe_cache["error"] = f"{type(exc).__name__}: {exc}"
-        return universe_cache
+        async with universe_lock:
+            now = time.time()
+            if not force and universe_cache["items"] and now - universe_cache["at"] < 600:
+                return universe_cache
+            universe_cache["attempts"] += 1
+            universe_cache["last_attempt"] = now
+            try:
+                items = await feed.universe()
+                if not isinstance(items, list) or not items:
+                    raise RuntimeError("exchange returned zero eligible contracts")
+                universe_cache.update(
+                    {
+                        "items": items,
+                        "at": time.time(),
+                        "error": None,
+                        "successes": universe_cache["successes"] + 1,
+                    }
+                )
+            except Exception as exc:
+                # Preserve a previously successful list, but never disguise the
+                # failed attempt. Health/UI show both stale coverage and error.
+                universe_cache["error"] = f"{type(exc).__name__}: {exc}"
+            return universe_cache
+
+    def _apply_discovered(items: list[dict], *, initial: bool) -> tuple[int, int, str | None]:
+        ranked = config_store.clean_symbols(
+            [
+                item.get("symbol")
+                for item in items
+                if isinstance(item, dict) and item.get("symbol")
+            ]
+        )
+        wanted = ranked[:max_symbols]
+        if not wanted:
+            return 0, 0, "discovery produced no usable symbol names"
+
+        wanted_set = set(wanted)
+        drop = list(engine.symbols) if initial else [
+            symbol for symbol in engine.symbols if symbol not in wanted_set
+        ]
+        removed = engine.remove_symbols(drop)
+        if removed:
+            feed.remove_symbols(removed)
+        added = engine.add_symbols([symbol for symbol in wanted if symbol not in engine.symbols])
+        if added:
+            feed.add_symbols(added)
+            if not initial:
+                queue_warm(added)
+        universe_cache["selected"] = len(engine.symbols)
+        problem = _persist_symbols()
+        return len(added), len(removed), problem
+
+    async def _refresh_auto_universe(*, initial: bool) -> bool:
+        data = await _universe(force=True)
+        if data["error"]:
+            retaining = (
+                "last discovered"
+                if data.get("mode") == "discovered" and data.get("items")
+                else "configured fallback"
+            )
+            await publish(
+                {
+                    "type": "log",
+                    "level": "warn",
+                    "message": (
+                        f"auto-universe fetch failed; retaining {len(engine.symbols)} {retaining} "
+                        f"contracts: {data['error']}"
+                    ),
+                }
+            )
+            return False
+        available = len(data["items"])
+        if available < universe_min_expected:
+            data["error"] = (
+                f"suspicious partial universe: only {available} contracts "
+                f"(minimum expected {universe_min_expected})"
+            )
+            await publish(
+                {
+                    "type": "log",
+                    "level": "warn",
+                    "message": (
+                        f"{data['error']}; keeping {len(engine.symbols)} configured fallback contracts"
+                    ),
+                }
+            )
+            return False
+        added, removed, problem = _apply_discovered(data["items"], initial=initial)
+        data["mode"] = "discovered"
+        data["selected"] = len(engine.symbols)
+        if problem:
+            await publish({"type": "log", "level": "warn", "message": problem})
+        await publish(
+            {
+                "type": "log",
+                "level": "info",
+                "message": (
+                    f"auto-universe discovered {available} enabled contracts; "
+                    f"scanning {len(engine.symbols)} (added {added}, removed {removed})"
+                ),
+            }
+        )
+        await engine._emit_state(force=True)  # noqa: SLF001
+        return True
 
     @app.get("/api/universe")
     async def universe(force: int = 0) -> dict[str, Any]:
@@ -684,8 +873,26 @@ def create_app(
             "exchange": engine.exchange,
             "error": data["error"],
             "count": len(data["items"]),
+            "selected": len(engine.symbols),
+            "mode": data["mode"],
+            "attempts": data["attempts"],
             "fetched_at": data["at"],
+            "last_attempt": data["last_attempt"],
+            "diagnostics": getattr(feed, "universe_diagnostics", None),
             "items": data["items"][:4000],
+        }
+
+    @app.post("/api/universe/refresh")
+    async def refresh_universe() -> dict[str, Any]:
+        if not auto_universe:
+            return {"ok": False, "error": "auto_universe is disabled"}
+        ok = await _refresh_auto_universe(initial=False)
+        return {
+            "ok": ok,
+            "error": universe_cache["error"],
+            "available": len(universe_cache["items"]),
+            "selected": len(engine.symbols),
+            "mode": universe_cache["mode"],
         }
 
     @app.post("/api/universe/add")

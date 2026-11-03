@@ -203,6 +203,36 @@ def test_fresh_major_range_break_can_establish_the_new_direction():
     assert any("ranging/unclear structure" in reason for reason in reasons)
 
 
+def test_fresh_major_shift_is_not_starved_by_lagging_adx_er():
+    """The explicit structure shift rule outranks a lagging range indicator.
+
+    This is narrow: only a fresh major/macro close beyond the remembered range
+    gets the exception. An established trend with merely a local leg still has
+    to satisfy the configured ADX/ER regime gate.
+    """
+    reversal = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=0, range_break=True,
+    )
+    shifted = candidate(context=strict_context(major=reversal))
+    strict = strict_gates(regime=True, regime_adx_min=22.0, regime_er_min=0.3)
+    ok, reasons = strict.apply(
+        shifted,
+        regime={"state": "range", "adx": 16.0, "er": 0.08, "direction": 1},
+    )
+    assert ok, reasons
+    assert shifted["range_clearance"] == "fresh major/macro range-breaking shift"
+
+    established = strict_degree(steps=3, ratio=1.0, range_break=False)
+    local = strict_degree(steps=1, ratio=1.0, range_break=True)
+    ok, reasons = strict.apply(
+        candidate(context=strict_context(major=established, internal=local)),
+        regime={"state": "range", "adx": 16.0, "er": 0.08, "direction": 1},
+    )
+    assert not ok
+    assert any("ranging market" in reason for reason in reasons)
+
+
 # ------------------------------------------------------- break of structure
 def test_no_break_of_structure_no_trade():
     ok, reasons = gates().apply(candidate(context=context(bos_direction=None, bos_age=None)))

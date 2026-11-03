@@ -45,6 +45,7 @@ class TimedFeed:
         self.in_flight = 0
         self.peak = 0
         self.calls = 0
+        self.limits: list[int] = []
 
     def exchange_interval(self, tf: str) -> str:
         return tf
@@ -53,6 +54,7 @@ class TimedFeed:
         self.in_flight += 1
         self.peak = max(self.peak, self.in_flight)
         self.calls += 1
+        self.limits.append(limit)
         try:
             await asyncio.sleep(self.delay)
             if symbol in self.bad:
@@ -85,6 +87,20 @@ async def test_warm_up_runs_thirty_instruments_at_once():
     assert feed.peak == 30, f"expected a pool of 30, saw {feed.peak} in flight"
     assert feed.calls == 60
     assert engine.warming() == 0, "every instrument should have history afterwards"
+
+
+@pytest.mark.asyncio
+async def test_fast_startup_depth_does_not_replace_the_configured_deep_depth():
+    feed = TimedFeed(delay=0)
+    engine = engine_over(["BTCUSDT"], ["5m"])
+    assert engine.history_bars == 5000
+
+    await engine.warmup(feed, concurrency=1, history_bars=240)
+    assert feed.limits == [240]
+    assert engine.history_bars == 5000, "the fast pass must not weaken later deep rescans"
+
+    await engine.rescan(feed, concurrency=1)
+    assert feed.limits[-1] == 5000
 
 
 @pytest.mark.asyncio

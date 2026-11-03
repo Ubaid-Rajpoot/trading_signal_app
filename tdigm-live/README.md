@@ -13,7 +13,9 @@ exactly one thing:
 No orders, no account, no backtest, no other strategy. It is a scanner.
 
 The latest defect-by-defect review and the exact verification boundary are in
-[`docs/audit-2026-11-01.md`](docs/audit-2026-11-01.md).
+[`docs/audit-2026-11-01.md`](docs/audit-2026-11-01.md). The production 45-symbol /
+zero-signal diagnosis is recorded separately in
+[`docs/production-recovery-2026-11-03.md`](docs/production-recovery-2026-11-03.md).
 
 ```
 BTCUSDT   15m   SHORT   pending mitigation   target —
@@ -115,7 +117,7 @@ The HVB must happen **on the confirming candle** — same candle, not "recently"
 
 A range prints the same sweep-then-break shape as a trend. That is exactly why
 it is dangerous, so before a setup is allowed the bot has to see an actual
-trend. Two independent measures have to agree:
+trend. For established structure, two lagging regime measures also have to agree:
 
 | measure | what it sees | default |
 |---|---|---|
@@ -131,7 +133,11 @@ signal = structure AND HVB AND trend      (plus every other filter you leave on)
 If the market is ranging the setup is not published at all; the rejection is
 counted and named on the page ("ranging market: ADX 14.2 < 22", "ranging
 market: ER 0.05 < 0.30"), and the matrix dims those cells and prints the ADX
-next to them, so you can see *why* it is quiet instead of guessing.
+next to them, so you can see *why* it is quiet instead of guessing. The one
+narrow exception is the structural rule below: a fresh major/macro **body close
+beyond the full remembered range edge** establishes the new direction immediately.
+ADX/ER lag that event by construction, so they may not veto it; an internal BOS,
+EMA direction, or ordinary momentum candle receives no such exception.
 
 Both thresholds are sliders in ⚙ and are saved to `config.json`. Set them low
 to see more, high to see only the strongest trends.
@@ -324,12 +330,15 @@ python run.py universe --exchange mexc --top 30     # list pairs by 24h turnover
 
 ### Start-up: the page is up in a second, the history fills behind it
 
-Warm-up (5,000 candles per timeframe per instrument) runs **after** the server is
-accepting requests, in a 24-worker pool. The live socket pump starts immediately;
-closed candles arriving while a symbol is rebuilt are buffered per symbol and
-replayed in timestamp order. Thus a full-universe deep scan does not create a
-blind live window. MEXC's 2,000-row REST cap is paged rather than silently
-truncating the requested history.
+Warm-up runs **after** the server is accepting requests, in a 24-worker pool.
+It is breadth-first in two passes: every contract/timeframe first gets 1,000 bars
+(`startup_history_bars`), then every contract is deep-replayed over the configured
+5,000 bars. Newly added batches use the same shallow-then-deep queue. This avoids
+spending all workers on deep history for the first 24 contracts while hundreds
+remain blind. The live socket pump starts immediately; closed candles arriving
+while a symbol is rebuilt are buffered per symbol and replayed in timestamp
+order. Thus a full-universe deep scan does not create a blind live window. MEXC's
+2,000-row REST cap is paged rather than silently truncating the requested history.
 
 `python run.py replay data/btc 60` starts 7,800 minutes into the files and serves
 that prefix as history, so **all five timeframes are warm in the first seconds**
@@ -346,8 +355,11 @@ could produce anything. `--skip N` moves the start point.
 * **`live` + a red banner naming the exchange** means the bot is fine and the
   exchange is not reachable from that machine. It retries on its own; reloading
   will not help.
-* `curl -s localhost:8700/api/health` answers in milliseconds and says exactly
-  what is happening: feed status, frames received, cells still warming, signals.
+* `curl -s localhost:8700/api/health` answers in milliseconds and separates
+  feed status, automatic-universe mode/error/count, fully/partially/empty warm
+  symbols, failed cells, queue depth, frames, and the setup decision funnel.
+  A failed discovery is also a persistent red banner: the page explicitly says
+  it is scanning the configured fallback rather than pretending 45 is "all".
 
 ### Instruments — from the page, written to `config.json`
 
@@ -355,8 +367,10 @@ Open **＋ Instruments**:
 
 * type a symbol (`BTCUSDT, ETHUSDT`) → added, warmed with history, saved;
 * remove with the ✕ on any chip;
-* **exchange universe**: every USDT pair on the exchange, biggest 24h turnover
-  first, searchable — add one, the **top 25**, or **all** of them;
+* **exchange universe**: every enabled USDT perpetual from MEXC contract detail,
+  biggest 24h turnover first, searchable — add one, the **top 25**, or **all** of
+  them. Ticker data ranks contracts but never removes an enabled contract; a
+  partial ticker response can no longer collapse hundreds of listings to 45;
 * every change is written to `config.json` immediately and survives a restart.
 
 Or edit `config.json` / pass `--symbols BTCUSDT,ETHUSDT` on the command line.
@@ -542,7 +556,9 @@ simulation is claimed here.
   "symbols": ["BTCUSDT", "ETHUSDT"],     // fallback if universe discovery is unavailable
   "exchange": "mexc", "market": "futures",
   "auto_universe": true, "max_symbols": 2000, "workers": 24,
-  "strategy": "sweep", "history_bars": 5000,
+  "universe_min_expected": 100, "universe_retry_seconds": 60,
+  "universe_refresh_seconds": 3600,
+  "strategy": "sweep", "startup_history_bars": 1000, "history_bars": 5000,
   "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"],
   "tdi":   { "rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185 },
   "structure": { "pivot_len": 5, "sweep_max_wait": 60, "level_max_age": 180, "max_levels": 40, "target_mode": "range" },

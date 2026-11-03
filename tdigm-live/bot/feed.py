@@ -659,40 +659,105 @@ class MexcFuturesFeed(BaseFeed):
         return candles[-wanted:]
 
     async def universe(self) -> list[dict]:
+        """Return every enabled USDT perpetual; ticker data only ranks it.
+
+        Contract detail is the authoritative listing.  The previous implementation
+        intersected it with the ticker response and discarded zero/missing
+        ``amount24`` rows.  A partial ticker response could therefore turn 700+
+        enabled contracts into a plausible-looking list of 45 without raising an
+        error.  Missing ticker rows now sort last instead of disappearing.
+        """
+
+        def rows(payload: object, endpoint: str) -> list[dict]:
+            if not isinstance(payload, dict):
+                raise FeedError(f"MEXC futures {endpoint} returned {type(payload).__name__}, not an object")
+            if payload.get("success") is False:
+                raise FeedError(
+                    f"MEXC futures {endpoint} failed: code={payload.get('code')} "
+                    f"message={payload.get('message') or payload.get('msg') or 'unknown'}"
+                )
+            data = payload.get("data")
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            # Be explicit about a changed/blocked response.  Returning [] here is
+            # what allowed startup to silently retain the tiny configured list.
+            raise FeedError(f"MEXC futures {endpoint} response has no data list")
+
+        def truthy(value: object) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
         detail = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/detail")
-        tickers = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/ticker")
-        stats = {t.get("symbol"): t for t in ((tickers or {}).get("data") or [])}  # type: ignore[union-attr]
-        out = []
-        for item in (detail or {}).get("data") or []:  # type: ignore[union-attr]
-            symbol = item.get("symbol")
-            if not symbol or item.get("quoteCoin") != "USDT":
+        contracts = rows(detail, "contract/detail")
+        ticker_error: str | None = None
+        try:
+            tickers = await self._get_json(f"{MEXC_FUTURES_REST}/api/v1/contract/ticker")
+            ticker_rows = rows(tickers, "contract/ticker")
+        except Exception as exc:
+            # Discovery must survive an optional ranking endpoint being down.
+            ticker_rows = []
+            ticker_error = f"{type(exc).__name__}: {exc}"
+        stats = {str(t.get("symbol") or "").upper(): t for t in ticker_rows if t.get("symbol")}
+
+        out: list[dict] = []
+        excluded = {"non_usdt": 0, "disabled": 0, "hidden": 0, "malformed": 0}
+        seen: set[str] = set()
+        for item in contracts:
+            native = str(item.get("symbol") or "").strip().upper()
+            quote = str(item.get("quoteCoin") or "").strip().upper()
+            if not native:
+                excluded["malformed"] += 1
+                continue
+            if quote != "USDT" and not (not quote and native.endswith("_USDT")):
+                excluded["non_usdt"] += 1
                 continue
             # MEXC: state 0 = enabled; 1 delivery, 2 completed, 3 offline,
             # 4 paused. Hidden/offline contracts must not consume a socket and
             # then fail every history request.
             state = item.get("state")
             if state is not None and str(state) != "0":
+                excluded["disabled"] += 1
                 continue
-            if bool(item.get("isHidden", False)):
+            if truthy(item.get("isHidden", False)):
+                excluded["hidden"] += 1
                 continue
-            tick = stats.get(symbol)
-            if not tick:
+            symbol = plain_symbol(native)
+            if not symbol or symbol in seen:
+                excluded["malformed"] += 1
                 continue
-            turnover = _num(tick.get("amount24"))
-            if turnover <= 0:
-                continue  # nothing traded: not a market worth watching
+            seen.add(symbol)
+            tick = stats.get(native) or {}
+            turnover = max(0.0, _num(tick.get("amount24")))
             out.append(
                 {
-                    "symbol": plain_symbol(symbol),
-                    "base": item.get("baseCoin"),
-                    "quote": item.get("quoteCoin"),
+                    "symbol": symbol,
+                    "base": item.get("baseCoin") or symbol.removesuffix("USDT"),
+                    "quote": quote or "USDT",
                     "price": _num(tick.get("lastPrice")),
                     "change": _num(tick.get("riseFallRate")) * 100,
                     "turnover": turnover,
+                    "ticker": bool(tick),
+                    "liquid": turnover > 0,
                     "market": "futures",
                 }
             )
-        return sorted(out, key=lambda x: -x["turnover"])
+        if not out:
+            raise FeedError(
+                f"MEXC futures contract/detail listed {len(contracts)} rows but no enabled USDT contracts"
+            )
+        self.universe_diagnostics = {
+            "detail_rows": len(contracts),
+            "ticker_rows": len(ticker_rows),
+            "eligible": len(out),
+            "missing_tickers": sum(1 for item in out if not item["ticker"]),
+            "zero_turnover": sum(1 for item in out if not item["liquid"]),
+            "excluded": excluded,
+            "ticker_error": ticker_error,
+        }
+        # Positive turnover first, then deterministic symbol order. All enabled
+        # contracts remain present even if the ticker endpoint was partial.
+        return sorted(out, key=lambda item: (-item["turnover"], item["symbol"]))
 
     async def stream(self, symbols: list[str]) -> None:
         if websockets is None:

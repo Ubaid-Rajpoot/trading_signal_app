@@ -185,6 +185,85 @@ class FakeExchangeFeed(ReplayFeed):
         ]
 
 
+class FailingUniverseFeed(FakeExchangeFeed):
+    async def universe(self):
+        raise RuntimeError("contract detail unavailable")
+
+
+class FlakyUniverseFeed(FakeExchangeFeed):
+    def __init__(self):
+        super().__init__()
+        self.universe_calls = 0
+
+    async def universe(self):
+        self.universe_calls += 1
+        if self.universe_calls == 1:
+            raise RuntimeError("temporary detail failure")
+        return await super().universe()
+
+
+def _exchange_app(tmp_path, feed, **updates):
+    config_path = tmp_path / "config.json"
+    config = json.loads(json.dumps(CONFIG))
+    config.update(updates)
+    config_store.write(config_path, config)
+    engine = Engine(
+        symbols=config["symbols"],
+        timeframes=config["timeframes"],
+        tdi_settings=config["tdi"],
+        filters=config["filters"],
+        structure=config["structure"],
+        history_bars=240,
+    )
+    return create_app(config, feed, engine, config_path), engine, config_path
+
+
+def test_auto_universe_failure_is_visible_and_keeps_the_fallback(tmp_path):
+    app, engine, _path = _exchange_app(
+        tmp_path, FailingUniverseFeed(), auto_universe=True,
+        universe_min_expected=10, startup_history_bars=120,
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/health").json()
+        assert body["universe"]["mode"] == "configured_fallback"
+        assert body["universe"]["attempts"] >= 1
+        assert "contract detail unavailable" in body["universe"]["error"]
+        assert body["symbols"] == 1 == len(engine.symbols)
+
+
+def test_auto_universe_retry_recovers_from_the_fallback(tmp_path):
+    feed = FlakyUniverseFeed()
+    app, engine, _path = _exchange_app(
+        tmp_path, feed, auto_universe=True, max_symbols=20,
+        universe_min_expected=10, startup_history_bars=120,
+    )
+    with TestClient(app) as client:
+        before = client.get("/api/health").json()["universe"]
+        assert before["mode"] == "configured_fallback" and before["error"]
+        recovered = client.post("/api/universe/refresh").json()
+        assert recovered == {
+            "ok": True, "error": None, "available": 50,
+            "selected": 20, "mode": "discovered",
+        }
+        assert len(engine.symbols) == 20
+        assert feed.universe_calls == 2
+
+
+def test_auto_universe_replaces_fallback_and_reports_discovered_count(tmp_path):
+    app, engine, config_path = _exchange_app(
+        tmp_path, FakeExchangeFeed(), auto_universe=True, max_symbols=20,
+        universe_min_expected=10, startup_history_bars=120,
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/health").json()
+        listed = client.get("/api/universe").json()
+        assert body["universe"]["mode"] == "discovered"
+        assert body["universe"]["available"] == listed["count"] == 50
+        assert body["symbols"] == len(engine.symbols) == 20
+        assert body["coverage"]["symbols_total"] == 20
+    assert len(json.loads(config_path.read_text())["symbols"]) == 20
+
+
 def test_add_all_from_the_universe_respects_the_limit_and_saves(tmp_path):
     config_path = tmp_path / "config.json"
     config = json.loads(json.dumps(CONFIG))

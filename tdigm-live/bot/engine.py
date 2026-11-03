@@ -204,6 +204,12 @@ class Cell:
     ema_bars: int = 0
     last_setup: dict | None = None
     pending: dict | None = None   # a confirmed setup waiting for its HVB
+    # Per-current-history-window decision funnel. A fresh replay replaces the
+    # Cell, so these counts do not inflate every time the operator rescans.
+    raw_setups: int = 0
+    hvb_aligned_setups: int = 0
+    filtered_setups: int = 0
+    passed_setups: int = 0
 
     def __post_init__(self) -> None:
         self.tracker = TdiTracker(
@@ -704,14 +710,23 @@ class Engine:
         """Mark symbols before the live pump starts, closing the startup race."""
         self._warming_symbols.update(str(symbol).upper() for symbol in symbols)
 
-    async def warm_symbol(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
-        """Warm one symbol atomically while its live closed bars wait in memory."""
+    async def warm_symbol(
+        self, feed, symbol: str, attempts: int = 3, force: bool = False,
+        history_bars: int | None = None,
+    ) -> int:
+        """Warm one symbol atomically while its live closed bars wait in memory.
+
+        ``history_bars`` permits a fast breadth-first startup pass before the
+        configured deep replay. The full depth remains ``self.history_bars``.
+        """
         symbol = symbol.upper()
         lock = self._warm_locks.setdefault(symbol, asyncio.Lock())
         async with lock:
             self._warming_symbols.add(symbol)
             try:
-                empty = await self._warm_symbol_history(feed, symbol, attempts=attempts, force=force)
+                empty = await self._warm_symbol_history(
+                    feed, symbol, attempts=attempts, force=force, history_bars=history_bars
+                )
                 # Bars can arrive while earlier buffered bars are being applied.
                 # Keep the symbol paused and drain until the queue is actually
                 # empty; at live speed this normally runs once.
@@ -730,7 +745,10 @@ class Engine:
                         await self._process_stream_candle(candle)
                 self._warming_symbols.discard(symbol)
 
-    async def _warm_symbol_history(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
+    async def _warm_symbol_history(
+        self, feed, symbol: str, attempts: int = 3, force: bool = False,
+        history_bars: int | None = None,
+    ) -> int:
         """Load enough history for one instrument, then read the setups it holds.
 
         Returns the number of cells that still came back empty. Two things matter
@@ -744,6 +762,9 @@ class Engine:
           can ever show you are the ones that happen while it is open.
         """
         symbol = symbol.upper()
+        depth = self.history_bars if history_bars is None else max(
+            120, min(self.history_bars, int(history_bars))
+        )
         empty = 0
         book_mode = self.strategy == "book" and self.book is not None
         # 3m and 2h are derived on MEXC. Share their deeper 1m/1h source
@@ -758,24 +779,26 @@ class Engine:
             for attempt in range(attempts):
                 interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
                 if interval is None:  # exchange has no native candle: aggregate a lower one
-                    if await self._warm_from_lower(feed, symbol, tf, history_cache):
+                    if await self._warm_from_lower(
+                        feed, symbol, tf, history_cache, history_bars=depth
+                    ):
                         candles = []
                         break
                 else:
                     try:
-                        request_bars = self.history_bars
+                        request_bars = depth
                         if (
                             tf == "1m"
                             and "3m" in self.timeframes
                             and feed.exchange_interval("3m") is None
                         ):
-                            request_bars = min(50_000, (self.history_bars + 3) * 3)
+                            request_bars = min(50_000, (depth + 3) * 3)
                         elif (
                             tf == "1h"
                             and "2h" in self.timeframes
                             and feed.exchange_interval("2h") is None
                         ):
-                            request_bars = min(50_000, (self.history_bars + 3) * 2)
+                            request_bars = min(50_000, (depth + 3) * 2)
                         cached = history_cache.get(interval) or []
                         candles = cached if len(cached) >= request_bars - 3 else await feed.history(
                             symbol, interval, request_bars
@@ -785,7 +808,9 @@ class Engine:
                             break
                     except Exception as exc:
                         if attempt == attempts - 1:
-                            if await self._warm_from_lower(feed, symbol, tf, history_cache):
+                            if await self._warm_from_lower(
+                                feed, symbol, tf, history_cache, history_bars=depth
+                            ):
                                 candles = []
                                 break
                             self.warm_failures[f"{symbol}:{tf}"] = attempt + 1
@@ -796,7 +821,7 @@ class Engine:
                             await asyncio.sleep(0.6 * (attempt + 1))
             if candles:
                 await self._replay(
-                    symbol, tf, candles[-self.history_bars:], evaluate=not book_mode
+                    symbol, tf, candles[-depth:], evaluate=not book_mode
                 )
                 self.warm_failures.pop(f"{symbol}:{tf}", None)
             current = self.cells.get((symbol, tf), cell)
@@ -939,7 +964,52 @@ class Engine:
             if cell.tracker.last is None or len(cell.candles) < 120
         )
 
-    async def warmup(self, feed, concurrency: int = 30) -> None:
+    def coverage(self) -> dict[str, int]:
+        """Exact warm-up breadth, separated from exchange/feed health."""
+        total = len(self.cells)
+        ready = sum(
+            1 for cell in self.cells.values()
+            if cell.tracker.last is not None and len(cell.candles) >= 120
+        )
+        ready_symbols = 0
+        partial_symbols = 0
+        empty_symbols = 0
+        for symbol in self.symbols:
+            cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
+            hits = sum(
+                1 for cell in cells
+                if cell is not None and cell.tracker.last is not None and len(cell.candles) >= 120
+            )
+            if cells and hits == len(cells):
+                ready_symbols += 1
+            elif hits:
+                partial_symbols += 1
+            else:
+                empty_symbols += 1
+        return {
+            "cells_total": total,
+            "cells_ready": ready,
+            "cells_waiting": max(0, total - ready),
+            "failed_cells": len(self.warm_failures),
+            "symbols_total": len(self.symbols),
+            "symbols_ready": ready_symbols,
+            "symbols_partial": partial_symbols,
+            "symbols_empty": empty_symbols,
+            "symbols_active_warmup": len(self._warming_symbols),
+        }
+
+    def decision_funnel(self) -> dict[str, int]:
+        """Current replay/live window: structure -> aligned HVB -> filters."""
+        return {
+            "setups": sum(cell.raw_setups for cell in self.cells.values()),
+            "hvb_aligned": sum(cell.hvb_aligned_setups for cell in self.cells.values()),
+            "filtered": sum(cell.filtered_setups for cell in self.cells.values()),
+            "passed": sum(cell.passed_setups for cell in self.cells.values()),
+        }
+
+    async def warmup(
+        self, feed, concurrency: int = 30, history_bars: int | None = None
+    ) -> None:
         """History for every instrument, in parallel, one bad symbol at a time.
 
         Serial warm-up is what made a 120-instrument universe look dead for
@@ -957,7 +1027,10 @@ class Engine:
         async def one(symbol: str) -> None:
             async with gate:
                 try:
-                    await self.warm_symbol(feed, symbol)
+                    if history_bars is None:
+                        await self.warm_symbol(feed, symbol)
+                    else:
+                        await self.warm_symbol(feed, symbol, history_bars=history_bars)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # one bad symbol must not stop the rest
@@ -979,7 +1052,8 @@ class Engine:
         self.signals.clear()
 
     async def rescan(
-        self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30
+        self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30,
+        history_bars: int | None = None,
     ) -> dict[str, Any]:
         """Re-read history and re-run the scan.
 
@@ -988,6 +1062,10 @@ class Engine:
         """
         if reset:
             self.forget_setups()
+        # Rejection counters must describe this replay/current policy, not an
+        # ever-growing sum of startup pass + deep pass + every manual rescan.
+        self.filters.rejections.clear()
+        self.filters.passed = 0
         before = set(self.setup_payloads)
         warmed = 0
         self.prepare_warmup(list(self.symbols))
@@ -1002,7 +1080,9 @@ class Engine:
                     # re-fetch the full window: a cell only *keeps* 180 bars, so
                     # re-scanning the buffer would look at half the history the
                     # first scan saw and quietly lose setups that are still alive
-                    await self.warm_symbol(feed, symbol, force=True)
+                    await self.warm_symbol(
+                        feed, symbol, force=True, history_bars=history_bars
+                    )
                     warmed += 1
 
         await asyncio.gather(*(one(symbol) for symbol in self.symbols))
@@ -1044,7 +1124,8 @@ class Engine:
         return found
 
     async def _warm_from_lower(
-        self, feed, symbol: str, tf: str, history_cache: dict[str, list[dict]] | None = None
+        self, feed, symbol: str, tf: str, history_cache: dict[str, list[dict]] | None = None,
+        history_bars: int | None = None,
     ) -> bool:
         """Build a non-native timeframe from the nearest practical lower one.
 
@@ -1059,7 +1140,10 @@ class Engine:
         source_ms = TIMEFRAMES[source]
         target_ms = TIMEFRAMES[tf]
         ratio = max(1, target_ms // source_ms)
-        need = min(50_000, (self.history_bars + 3) * ratio)
+        depth = self.history_bars if history_bars is None else max(
+            120, min(self.history_bars, int(history_bars))
+        )
+        need = min(50_000, (depth + 3) * ratio)
         cache = history_cache if history_cache is not None else {}
         bars = cache.get(source) or []
         if source not in cache:
@@ -1077,7 +1161,7 @@ class Engine:
                 built.append(done)
         if not built:
             return False
-        await self._replay(symbol, tf, built[-self.history_bars:])
+        await self._replay(symbol, tf, built[-depth:])
         return True
 
     def _prime_partial(self, cell: Cell, minutes: list[dict]) -> None:
@@ -1216,6 +1300,9 @@ class Engine:
             await self._confirm_pending(cell, bar, hvb, hvb_points, hvb_speed, centre_cross, base, point)
 
         if setup is not None:
+            cell.raw_setups += 1
+            if hvb:
+                cell.hvb_aligned_setups += 1
             book = self._confluence(cell, setup, bar)
             depth = cell.tmap.depth(setup.side, setup.break_kind, setup.index)
             candidate = {
@@ -1268,12 +1355,14 @@ class Engine:
             candidate["grade"] = grade_of(candidate)
             ok, reasons = self._apply_filters(cell, candidate, bar)
             if ok:
+                cell.passed_setups += 1
                 candidate["filtered"] = []
                 cell.last_setup = setup.as_dict()
                 cell.alerts += 1
                 self.cooldowns[(cell.symbol, cell.timeframe)] = time.time()
                 await self._publish(cell, candidate, bar)
             else:
+                cell.filtered_setups += 1
                 await self._emit(
                     {
                         "type": "filtered",
@@ -1392,6 +1481,7 @@ class Engine:
         want = "down" if held["side"] == "SHORT" else "up"
         if lag > window:
             cell.pending = None
+            cell.filtered_setups += 1
             self.filters.rejections["no HVB inside the window"] = (
                 self.filters.rejections.get("no HVB inside the window", 0) + 1
             )
@@ -1399,6 +1489,7 @@ class Engine:
         if not hvb or hvb != want:
             return
         cell.pending = None
+        cell.hvb_aligned_setups += 1
         candidate = dict(held["candidate"])
         candidate.update(
             {
@@ -1419,8 +1510,10 @@ class Engine:
         candidate["grade"] = grade_of(candidate)
         ok, reasons = self._apply_filters(cell, candidate, bar)
         if not ok:
+            cell.filtered_setups += 1
             await self._emit({"type": "filtered", "alert": {**candidate, "filtered": reasons}})
             return
+        cell.passed_setups += 1
         candidate["filtered"] = []
         cell.alerts += 1
         self.cooldowns[(cell.symbol, cell.timeframe)] = time.time()
@@ -2037,6 +2130,8 @@ class Engine:
             "archive": (self.store.counts() if self.store else {}),
             "failed": len(self.warm_failures),
             "warming": self.warming(),
+            "coverage": self.coverage(),
+            "decision_funnel": self.decision_funnel(),
             "candles_seen": self.candles_seen,
             "last_candle_age": round(time.time() - self.last_event_at, 1),
             "uptime": round(time.time() - self.started_at, 1),
@@ -2090,6 +2185,8 @@ def _evidence(alert: dict) -> list[str]:
         )
     if alert.get("hvb"):
         out.append(f"HVB {alert['hvb']} on the break candle ({_fmt(alert.get('hvb_points'))} pts)")
+    if alert.get("range_clearance"):
+        out.append(str(alert["range_clearance"]))
     if external.get("direction"):
         degree = "HH+HL" if external["direction"] > 0 else "LH+LL"
         out.append(

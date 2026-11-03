@@ -311,7 +311,27 @@ class Filters:
             state = regime.get("state")
             adx_min = float(cfg.get("regime_adx_min") or 0)
             er_min = float(cfg.get("regime_er_min") or 0)
-            if state is None:
+            # ADX and efficiency ratio are lagging measurements. They must not
+            # veto the explicit policy that a fresh major/macro range-breaking
+            # structure shift establishes a new trend. This is not a generic
+            # momentum exception: the close must have broken the remembered
+            # outer range in the trade direction, within the configured age.
+            fresh_bars = int(cfg.get("fresh_shift_max_bars") or 0)
+            fresh_structural_shift = bool(
+                cfg.get("trend_context", True)
+                and cfg.get("clear_structure", True)
+                and side
+                and any(
+                    degree.get("bos_direction") == want
+                    and degree.get("bos_range_break")
+                    and degree.get("bos_age") is not None
+                    and (fresh_bars <= 0 or int(degree["bos_age"]) <= fresh_bars)
+                    for degree in (context.get("major") or {}, context.get("macro") or {})
+                )
+            )
+            if fresh_structural_shift:
+                candidate["range_clearance"] = "fresh major/macro range-breaking shift"
+            elif state is None:
                 reasons.append("market state not known yet (ADX/ER still warming up)")
             elif state != "trend":
                 if adx is not None and adx < adx_min:
@@ -321,7 +341,6 @@ class Filters:
                 else:
                     reasons.append("ranging market (ADX and ER below the trend thresholds)")
             elif str(cfg.get("regime_direction") or "any").lower() == "with" and side:
-                want = 1 if side == "long" else -1
                 if regime.get("direction") is not None and regime["direction"] * want < 0:
                     reasons.append("against the EMA trend (regime_direction = with)")
 

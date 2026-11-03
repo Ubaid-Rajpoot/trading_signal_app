@@ -196,10 +196,53 @@ async def test_mexc_futures_universe_is_contracts_with_turnover(monkeypatch):
 
     monkeypatch.setattr(feed, "_get_json", fake_get)
     items = await feed.universe()
-    assert [item["symbol"] for item in items] == ["BTCUSDT", "DOGEUSDT"], (
-        "biggest turnover first, USDC contracts skipped, untraded ones dropped"
+    assert [item["symbol"] for item in items] == ["BTCUSDT", "DOGEUSDT", "DEADUSDT"], (
+        "turnover ranks contracts, but a missing ticker must not erase an enabled contract"
     )
     assert items[0]["market"] == "futures"
+    assert items[-1]["ticker"] is False and items[-1]["turnover"] == 0
+    assert feed.universe_diagnostics["eligible"] == 3
+    assert feed.universe_diagnostics["missing_tickers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_universe_survives_a_failed_ticker_endpoint(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+
+    async def fake_get(url, params=None):
+        if url.endswith("/contract/detail"):
+            return {
+                "success": True,
+                "data": [
+                    {"symbol": f"COIN{i}_USDT", "baseCoin": f"COIN{i}",
+                     "quoteCoin": "USDT", "state": 0, "isHidden": False}
+                    for i in range(520)
+                ] + [
+                    {"symbol": "PAUSED_USDT", "quoteCoin": "USDT", "state": 4},
+                    {"symbol": "HIDDEN_USDT", "quoteCoin": "USDT", "state": 0,
+                     "isHidden": "true"},
+                ],
+            }
+        raise RuntimeError("ticker temporarily unavailable")
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    items = await feed.universe()
+    assert len(items) == 520
+    assert all(item["symbol"].endswith("USDT") for item in items)
+    assert feed.universe_diagnostics["ticker_rows"] == 0
+    assert feed.universe_diagnostics["ticker_error"]
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_universe_rejects_an_empty_or_changed_detail_shape(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+
+    async def fake_get(url, params=None):
+        return {"success": True, "data": {"contracts": []}}
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    with pytest.raises(Exception, match="no data list"):
+        await feed.universe()
 
 
 def test_the_page_can_read_setups_and_a_chart(tmp_path):

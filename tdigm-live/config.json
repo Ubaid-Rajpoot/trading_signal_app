@@ -51,6 +51,10 @@
   "max_symbols": 2000,
   "workers": 24,
   "auto_universe": true,
+  "universe_min_expected": 100,
+  "universe_retry_seconds": 60,
+  "universe_refresh_seconds": 3600,
+  "startup_history_bars": 1000,
   "database": "data/tdigm.sqlite3",
   "timeframes": [
     "1m",
