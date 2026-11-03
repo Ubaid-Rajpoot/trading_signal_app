@@ -550,16 +550,20 @@ def create_app(
         key: str = "",
         at: int = 0,
         refresh: int = 0,
+        live: int = 0,
     ) -> JSONResponse:
-        """TradingView-style audit window centred on the selected setup.
+        """TradingView-style setup audit or current, still-forming market view.
 
-        The old endpoint always returned the latest 180 bars. Selecting a valid
-        January daily setup in November therefore showed neither its sweep nor
-        its break, which looked exactly like a false signal. The archive key now
-        anchors exchange history around the event itself.
+        Setup mode anchors exchange history around the event so its proof cannot
+        disappear. ``live=1`` bypasses that immutable window and returns the
+        in-memory tail plus the exchange's forming candle and mark-to-market R.
         """
         symbol = symbol.upper()
-        selected = (store.get(key) if key else None) or engine.setup_payloads.get(key)
+        live_mode = bool(live)
+        if live_mode:
+            selected = engine.setup_payloads.get(key) or (store.get(key) if key else None)
+        else:
+            selected = (store.get(key) if key else None) or engine.setup_payloads.get(key)
         if selected and (
             str(selected.get("symbol") or "").upper() != symbol
             or str(selected.get("timeframe") or "") != timeframe
@@ -569,7 +573,7 @@ def create_app(
         wanted = max(80, min(1000, int(bars)))
         override: list[dict] | None = None
         history_error: str | None = None
-        if focus:
+        if focus and not live_mode:
             cache_key = (symbol, timeframe, focus, wanted)
             cached = chart_cache.get(cache_key)
             if cached and not refresh and time.time() - cached[0] < 300:
@@ -593,9 +597,15 @@ def create_app(
             wanted,
             candles_override=override,
             selected=selected,
+            live=live_mode,
         )
         body["history_error"] = history_error
         body["historical_window"] = override is not None
+        body["server_time_ms"] = int(time.time() * 1000)
+        live_body = body.get("live") or {}
+        updated_ms = int(live_body.get("updated_ms") or 0)
+        live_body["age_ms"] = max(0, body["server_time_ms"] - updated_ms) if updated_ms else None
+        body["live"] = live_body
         return JSONResponse(body, headers={"Cache-Control": "no-store, max-age=0"})
 
     @app.post("/api/rescan")

@@ -1946,6 +1946,99 @@ class Engine:
                 out.extend(rollup.flush())
         return out[-wanted:]
 
+    @staticmethod
+    def _live_risk_reward(selected: dict | None, market: dict | None, enabled: bool) -> dict:
+        """Mark-to-market R without mutating the closed-candle lifecycle.
+
+        ``planned_rr`` is target reward divided by initial risk. ``current_r`` is
+        P/L from the actual mitigation entry in those same initial-risk units.
+        ``remaining_rr`` is reward-to-risk from the current market price to the
+        frozen target/current stop. Pending setups expose only a projected plan;
+        no live P/L is invented before mitigation.
+        """
+        result: dict[str, Any] = {"enabled": bool(enabled), "forming": False}
+        if not enabled or market is None:
+            return result
+
+        def number(value: Any) -> float | None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+
+        price = number(market.get("close"))
+        high = number(market.get("high"))
+        low = number(market.get("low"))
+        result.update(
+            {
+                "forming": not bool(market.get("closed", True)),
+                "price": price,
+                "high": high,
+                "low": low,
+                "at": int(market.get("close_time") or market.get("open_time") or 0),
+                "updated_ms": int(market.get("_received_ms") or 0),
+            }
+        )
+        if selected is None or price is None:
+            return result
+
+        side = str(selected.get("side") or "").upper()
+        state = str(selected.get("state") or "pending").lower()
+        mitigated = bool(selected.get("mitigated") or selected.get("touched_ms"))
+        entry = number(selected.get("entry"))
+        stop = number(selected.get("stop"))
+        stop0 = number(selected.get("stop0")) or stop
+        target = number(selected.get("target")) if mitigated else number(selected.get("leg_target"))
+        initial_risk = number(selected.get("risk0")) if mitigated else None
+        if not initial_risk and entry is not None and stop0 is not None:
+            initial_risk = abs(entry - stop0)
+
+        planned_rr = None
+        if entry is not None and target is not None and initial_risk and initial_risk > 0:
+            reward = entry - target if side == "SHORT" else target - entry
+            if reward > 0:
+                planned_rr = reward / initial_risk
+
+        result.update(
+            {
+                "side": side,
+                "state": state,
+                "mitigated": mitigated,
+                "planned_rr": None if planned_rr is None else round(planned_rr, 4),
+                "current_r": None,
+                "remaining_rr": None,
+                "status": "pending_unfilled" if state == "pending" else state,
+            }
+        )
+        if state != "active" or not mitigated or entry is None or stop is None or target is None:
+            return result
+
+        if initial_risk and initial_risk > 0:
+            move = entry - price if side == "SHORT" else price - entry
+            result["current_r"] = round(move / initial_risk, 4)
+
+        if side == "SHORT":
+            hit_stop = high is not None and high >= stop
+            hit_target = low is not None and low <= target
+        else:
+            hit_stop = low is not None and low <= stop
+            hit_target = high is not None and high >= target
+        if hit_stop and hit_target:
+            result["status"] = "both_touched_live"
+        elif hit_stop:
+            result["status"] = "stop_touched_live"
+        elif hit_target:
+            result["status"] = "target_touched_live"
+        else:
+            result["status"] = "active_live"
+
+        remaining_reward = price - target if side == "SHORT" else target - price
+        remaining_risk = stop - price if side == "SHORT" else price - stop
+        if remaining_reward > 0 and remaining_risk > 0:
+            result["remaining_rr"] = round(remaining_reward / remaining_risk, 4)
+        return result
+
     def chart(
         self,
         symbol: str,
@@ -1954,13 +2047,33 @@ class Engine:
         *,
         candles_override: list[dict] | None = None,
         selected: dict | None = None,
+        live: bool = False,
     ) -> dict:
-        """Candles and an explicit, auditable sweep -> break -> HVB chain."""
+        """Candles and an explicit, auditable sweep -> break -> HVB chain.
+
+        Setup mode is immutable historical evidence. Live mode deliberately uses
+        the in-memory tail and appends the still-forming exchange candle without
+        allowing it into indicators, structure, or lifecycle decisions.
+        """
         cell = self.cells.get((symbol.upper(), timeframe))
         if cell is None:
-            return {"symbol": symbol, "timeframe": timeframe, "candles": [], "setups": []}
+            return {
+                "symbol": symbol, "timeframe": timeframe, "candles": [], "setups": [],
+                "live": {"enabled": bool(live), "forming": False},
+            }
         limit = max(20, min(1000, bars))
-        candles = list(candles_override if candles_override is not None else cell.candles)[-limit:]
+        closed_candles = list(
+            candles_override if candles_override is not None else cell.candles
+        )[-limit:]
+        candles = list(closed_candles)
+        forming_added = False
+        if live and candles_override is None and cell.forming is not None:
+            forming = dict(cell.forming)
+            forming["closed"] = False
+            if not candles or int(forming.get("open_time") or 0) > int(candles[-1].get("open_time") or 0):
+                candles.append(forming)
+                forming_added = True
+        candles = candles[-limit:]
         first = int(candles[0]["open_time"]) if candles else 0
         last = int(candles[-1]["close_time"]) if candles else 0
         rows = []
@@ -1992,12 +2105,24 @@ class Engine:
         ) if selected_row else []
         if selected_row is not None:
             selected_row = {**selected_row, "chain_valid": not chain_errors, "chain_errors": chain_errors}
-        markers = self._markers(cell, candles, first)
+        # Forming candles are visual/mark-to-market data only. Structure and
+        # indicator markers remain closed-candle evidence.
+        marker_candles = [bar for bar in closed_candles if bar.get("closed", True)]
+        markers = self._markers(cell, marker_candles, first)
         focus_ms = int((selected_row or {}).get("created_ms") or 0)
-        focus_index = next(
-            (i for i, bar in enumerate(candles) if int(bar.get("close_time") or 0) >= focus_ms),
-            max(0, len(candles) - 1),
-        ) if candles else 0
+        if live and candles:
+            focus_index = len(candles) - 1
+        else:
+            focus_index = next(
+                (i for i, bar in enumerate(candles) if int(bar.get("close_time") or 0) >= focus_ms),
+                max(0, len(candles) - 1),
+            ) if candles else 0
+        live_metrics = self._live_risk_reward(
+            selected_row,
+            candles[-1] if candles else None,
+            live,
+        )
+        live_metrics["forming"] = forming_added
         return {
             "symbol": symbol.upper(),
             "timeframe": timeframe,
@@ -2012,6 +2137,7 @@ class Engine:
             "trend": cell.tmap_state or {},
             "warm": len(cell.candles) >= 120,
             "bars": len(candles),
+            "live": live_metrics,
         }
 
     # ----------------------------------------------------------- book drawing
@@ -2042,22 +2168,37 @@ class Engine:
 
     # ------------------------------------------------------------- preview
     def _preview(self, symbol: str, candle: dict) -> None:
-        """Evaluate the still-forming candle so the UI shows it live."""
-        if len(self.symbols) > self.preview_max_symbols:
-            return  # a full universe is too big for per-tick recomputation
+        """Maintain live OHLC for every cell; throttle expensive indicators.
+
+        Exchange kline updates carry cumulative volume for the current 1m bar.
+        Re-merging the previous preview on every tick double-counted that volume.
+        Higher-timeframe previews are instead rebuilt from the rollup's closed
+        partial bucket plus the latest forming minute. This also keeps candles
+        moving for a full exchange universe; only TDI/BOS preview computation is
+        capped by ``preview_max_symbols``.
+        """
         now = time.monotonic()
+        indicators_enabled = len(self.symbols) <= self.preview_max_symbols
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
-            if cell is None or not cell.candles:
+            if cell is None:
                 continue
             start = (int(candle["open_time"]) // TIMEFRAMES[tf]) * TIMEFRAMES[tf]
-            preview = dict(candle)
+            if tf == "1m":
+                preview = dict(candle)
+            else:
+                partial = cell.rollup.candle if cell.rollup and cell.rollup.start == start else None
+                preview = merge(partial, candle) if partial is not None else dict(candle)
             preview["open_time"] = start
-            if cell.forming and cell.forming.get("open_time") == start:
-                preview = merge(cell.forming, candle)
-                preview["open_time"] = start
+            preview["timeframe"] = tf
+            preview["closed"] = False
+            preview["_received_ms"] = int(time.time() * 1000)
             cell.forming = preview
-            if len(cell.candles) < 120 or now - cell.preview_at < 1.5:
+            if (
+                not indicators_enabled
+                or len(cell.candles) < 120
+                or now - cell.preview_at < 1.5
+            ):
                 continue
             cell.preview_at = now
 

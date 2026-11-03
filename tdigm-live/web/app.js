@@ -590,7 +590,8 @@
   // wheel zoom, drag pan, right-axis price scaling, crosshair/OHLC and empty
   // right margin.  The selected setup—not today's candle—is the focus.
   var chartView = {
-    data: null, selectedKey: "", span: 120, right: 0, zoomY: 1, panY: 0,
+    data: null, selectedKey: "", loadedMode: "", mode: "setup", requestToken: "", requestSeq: 0,
+    span: 120, right: 0, zoomY: 1, panY: 0, followLive: false,
     hover: null, drag: null, focus: 0,
   };
 
@@ -604,6 +605,9 @@
 
   function barAtTime(candles, ms) {
     if (!ms || !candles.length) return -1;
+    var firstOpen = Number(candles[0].t || 0);
+    var lastClose = Number(candles[candles.length - 1].ct || candles[candles.length - 1].t || 0);
+    if (Number(ms) < firstOpen || Number(ms) > lastClose) return -1;
     var lo = 0, hi = candles.length - 1, found = -1;
     while (lo <= hi) {
       var mid = (lo + hi) >> 1;
@@ -624,35 +628,106 @@
     $("chart-title").textContent = row.symbol + " " + row.timeframe + " · " + sideOf(row);
     $("chart-sub").textContent = clock(row.created_ms) + " UTC · " + stateOf(row) + (row.grade ? " · grade " + row.grade : "");
     renderStory(row);
-    loadChart(row, false);
+    chartView.mode = row.valid ? "live" : "setup";
+    chartView.followLive = chartView.mode === "live";
+    loadChart(row, false, chartView.mode);
   }
 
-  function loadChart(row, force) {
+  function paintChartMode() {
+    $("btn-chart-live").classList.toggle("on", chartView.mode === "live");
+    $("btn-chart-reset").classList.toggle("on", chartView.mode === "setup");
+  }
+
+  function loadChart(row, force, requestedMode) {
     if (!row) return;
     var key = row.key;
+    var mode = requestedMode || chartView.mode || "setup";
+    chartView.mode = mode;
+    paintChartMode();
     model.chartKey = key;
     model.chartBusy = true;
+    var token = key + "|" + mode + "|" + (++chartView.requestSeq);
+    chartView.requestToken = token;
     var url = "/api/chart?symbol=" + encodeURIComponent(row.symbol)
       + "&timeframe=" + encodeURIComponent(row.timeframe)
       + "&bars=600&key=" + encodeURIComponent(row.key)
       + "&at=" + encodeURIComponent(row.created_ms)
-      + (force ? "&refresh=1" : "");
+      + (mode === "live" ? "&live=1" : "")
+      + (force && mode === "setup" ? "&refresh=1" : "");
     fetch(url)
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (model.chartKey !== key || chartView.requestToken !== token) return;
         model.chartBusy = false;
-        if (model.chartKey !== key) return;
-        var changed = chartView.selectedKey !== key;
+        var changed = chartView.selectedKey !== key || chartView.loadedMode !== mode;
         chartView.data = data;
         chartView.selectedKey = key;
+        chartView.loadedMode = mode;
+        updateLiveMetrics(data);
         if (changed || force) resetChartView();
-        else drawChart();
+        else if (mode === "live" && chartView.followLive) {
+          var candles = data.candles || [];
+          chartView.focus = Math.max(0, candles.length - 1);
+          chartView.right = Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.10);
+          drawChart();
+        } else drawChart();
       })
       .catch(function () {
+        if (chartView.requestToken !== token) return;
         model.chartBusy = false;
         $("chart-hint").hidden = false;
         $("chart-hint").textContent = "Could not load candles for this setup.";
       });
+  }
+
+  function updateLiveMetrics(data) {
+    var live = data && data.live || {};
+    var state = $("chart-live-state");
+    var price = $("chart-live-price");
+    var plan = $("chart-plan-rr");
+    var current = $("chart-current-r");
+    var remaining = $("chart-remaining-rr");
+    var note = $("chart-live-note");
+    state.className = "live-pill";
+    current.className = "";
+
+    if (!live.enabled) {
+      state.textContent = "SETUP VIEW";
+      price.textContent = "—";
+      plan.textContent = "—";
+      current.textContent = "—";
+      remaining.textContent = "—";
+      note.textContent = "Immutable setup evidence; select LIVE for the current market.";
+      return;
+    }
+
+    var stale = live.forming && live.age_ms != null && Number(live.age_ms) > 15000;
+    state.textContent = stale ? "STALE FEED" : live.forming ? "● LIVE CANDLE" : "LIVE · LAST CLOSE";
+    state.classList.add(stale ? "bad" : live.forming ? "live" : "warn");
+    price.textContent = num(live.price);
+    plan.textContent = live.planned_rr == null ? "—" : "1:" + Number(live.planned_rr).toFixed(2);
+    if (live.current_r == null) current.textContent = live.state === "pending" ? "unfilled" : "—";
+    else {
+      current.textContent = (Number(live.current_r) > 0 ? "+" : "") + Number(live.current_r).toFixed(2) + "R";
+      current.className = Number(live.current_r) >= 0 ? "pos" : "neg";
+    }
+    remaining.textContent = live.remaining_rr == null ? "—" : "1:" + Number(live.remaining_rr).toFixed(2);
+
+    var messages = {
+      pending_unfilled: "Projected plan only — mitigation has not filled the trade.",
+      active_live: "Mark-to-market from the mitigation entry; remaining R:R uses current price to target/stop.",
+      target_touched_live: "Target touched inside the forming candle; awaiting the closed-candle lifecycle update.",
+      stop_touched_live: "STOP TOUCHED inside the forming candle; awaiting the closed-candle lifecycle update.",
+      both_touched_live: "STOP AND TARGET touched; conservative stop-first policy applies on close.",
+    };
+    note.textContent = stale
+      ? "No forming-kline update for more than 15 seconds; displayed price may be stale."
+      : messages[live.status] || "Live market view; archived outcomes remain closed-candle decisions.";
+    if (!stale && (live.status === "stop_touched_live" || live.status === "both_touched_live")) {
+      state.className = "live-pill bad";
+    } else if (!stale && live.status === "target_touched_live") {
+      state.className = "live-pill warn";
+    }
   }
 
   function resetChartView() {
@@ -662,14 +737,21 @@
     chartView.panY = 0;
     chartView.hover = null;
     chartView.span = Math.min(Math.max(60, Math.min(140, candles.length)), Math.max(20, candles.length));
-    chartView.focus = clamp(Number(data.focus_index) || 0, 0, Math.max(0, candles.length - 1));
-    // Put the break/HVB candle about two thirds across the frame, leaving both
-    // the preceding sweep and post-signal lifecycle in sight.
-    chartView.right = clamp(
-      chartView.focus + Math.round(chartView.span * 0.32),
-      Math.min(chartView.span - 1, Math.max(0, candles.length - 1)),
-      Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.18)
-    );
+    if (chartView.mode === "live") {
+      chartView.followLive = true;
+      chartView.focus = Math.max(0, candles.length - 1);
+      chartView.right = chartView.focus + Math.round(chartView.span * 0.10);
+    } else {
+      chartView.followLive = false;
+      chartView.focus = clamp(Number(data.focus_index) || 0, 0, Math.max(0, candles.length - 1));
+      // Put the break/HVB candle about two thirds across the frame, leaving both
+      // the preceding sweep and post-signal lifecycle in sight.
+      chartView.right = clamp(
+        chartView.focus + Math.round(chartView.span * 0.32),
+        Math.min(chartView.span - 1, Math.max(0, candles.length - 1)),
+        Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.18)
+      );
+    }
     drawChart();
   }
 
@@ -719,6 +801,7 @@
     var bodyW = Math.max(1, Math.min(13, candleW * 0.68));
 
     var selected = data.selected || null;
+    var liveEnabled = !!(data.live && data.live.enabled);
     var rawSetup = selected && selected.setup || {};
     var sweepTime = selected ? Number(selected.sweep_ms || rawSetup.sweep_time || 0) : 0;
     var breakTime = selected ? Number(selected.created_ms || rawSetup.break_time || 0) : 0;
@@ -728,7 +811,7 @@
     var lo = Infinity, hi = -Infinity;
     for (var i = i0; i <= i1; i++) { lo = Math.min(lo, Number(candles[i].l)); hi = Math.max(hi, Number(candles[i].h)); }
     if (!isFinite(lo) || !isFinite(hi)) return;
-    if (selected && breakIndex >= i0 && breakIndex <= i1) {
+    if (selected && (liveEnabled || breakIndex >= i0 && breakIndex <= i1)) {
       [selected.entry, selected.stop, selected.target, selected.leg_target,
         selected.swept_level, selected.bos_level].forEach(function (v) {
         v = Number(v); if (isFinite(v) && v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
@@ -856,11 +939,12 @@
 
     // Entry and the trade target arm at mitigation, not at the body-break close.
     // Pending rows still show the evolving confirmation-leg H/L as unarmed proof.
-    if (selected && breakIndex >= 0) {
+    if (selected && (breakIndex >= 0 || liveEnabled)) {
       var touchedIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
-      var startX = Math.max(padL, x(touchedIndex >= 0 ? touchedIndex : breakIndex));
+      var anchorIndex = touchedIndex >= 0 ? touchedIndex : breakIndex >= 0 ? breakIndex : i0;
+      var startX = Math.max(padL, x(anchorIndex));
       var entryLabel = selected.mitigated ? "entry after mitigation" : "planned mitigation fill";
-      var breakX = Math.max(padL, x(breakIndex));
+      var breakX = Math.max(padL, x(breakIndex >= 0 ? breakIndex : i0));
       var targetValue = selected.mitigated ? selected.target : selected.leg_target;
       var targetLabel = selected.mitigated
         ? "frozen confirmation-leg target"
@@ -868,12 +952,16 @@
       var targetIndex = selected.leg_target_ms ? barAtTime(candles, selected.leg_target_ms) : -1;
       var targetStartX = selected.mitigated
         ? startX
-        : Math.max(padL, x(targetIndex >= 0 ? targetIndex : breakIndex));
-      [[selected.entry, "#dfe6f2", entryLabel, [], startX],
+        : Math.max(padL, x(targetIndex >= 0 ? targetIndex : breakIndex >= 0 ? breakIndex : i0));
+      var levelLines = [
+        [selected.entry, "#dfe6f2", entryLabel, [], startX],
         [selected.stop, "#ff5c7a", "stop", [5, 4], breakX],
         [targetValue, "#2ee6a8", targetLabel, [5, 4], targetStartX],
-        [selected.bos_level, "#b487ff", "body break", [2, 3], breakX]]
-        .forEach(function (line) {
+      ];
+      if (breakIndex >= 0) levelLines.push(
+        [selected.bos_level, "#b487ff", "body break", [2, 3], breakX]
+      );
+      levelLines.forEach(function (line) {
           var value = Number(line[0]); if (!isFinite(value)) return;
           var yy = y(value); if (yy < padT || yy > h - padB) return;
           var lineStart = line[4];
@@ -918,6 +1006,9 @@
       if (selected.chain_valid === false) {
         audit.className = "chart-audit bad";
         audit.textContent = "QUARANTINED · " + (selected.chain_errors || []).join(" · ");
+      } else if (liveEnabled && (sweepIndex < 0 || breakIndex < 0)) {
+        audit.className = "chart-audit ok";
+        audit.textContent = "LIVE MARKET · setup proof remains available in SETUP view";
       } else if (data.history_error || sweepIndex < 0 || breakIndex < 0) {
         audit.className = "chart-audit warn";
         audit.textContent = "Chain recorded, but its historical candle window is unavailable"
@@ -927,8 +1018,9 @@
         audit.textContent = "✓ paired-leg H/L sweep → same-leg opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
       }
     } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
-    $("chart-tf").textContent = candles.length + " historical bars"
-      + (data.historical_window ? " · setup-centred" : " · latest")
+    $("chart-tf").textContent = candles.length + (liveEnabled ? " market bars" : " historical bars")
+      + (data.historical_window ? " · setup-centred" : liveEnabled ? " · live tail" : " · latest")
+      + (data.live && data.live.forming ? " · forming now" : "")
       + (data.history_error ? " · history fallback" : "");
   }
 
@@ -968,6 +1060,7 @@
       if (chartView.drag) {
         if (chartView.drag.mode === "scale") chartView.zoomY = clamp(chartView.drag.zoom * (1 + (p.y - chartView.drag.y) / 220), 0.25, 16);
         else {
+          chartView.followLive = false;
           chartView.right = chartView.drag.right - (p.x - chartView.drag.x) / Math.max(1, p.w - 84) * chartView.span;
           chartView.panY = chartView.drag.panY + (p.y - chartView.drag.y) / Math.max(1, p.h - 44) / Math.max(0.25, chartView.zoomY);
         }
@@ -983,9 +1076,21 @@
     window.addEventListener("mouseup", function () { chartView.drag = null; canvas.classList.remove("panning"); });
     canvas.addEventListener("mouseleave", function () { if (!chartView.drag) { chartView.hover = null; drawChart(); } });
     canvas.addEventListener("dblclick", resetChartView);
-    $("btn-chart-in").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 0.8), 20, (chartView.data.candles || []).length); drawChart(); };
-    $("btn-chart-out").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 1.25), 20, (chartView.data.candles || []).length); drawChart(); };
-    $("btn-chart-reset").onclick = resetChartView;
+    $("btn-chart-in").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 0.8), 20, (chartView.data.candles || []).length); if (chartView.mode === "live") chartView.followLive = true; drawChart(); };
+    $("btn-chart-out").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 1.25), 20, (chartView.data.candles || []).length); if (chartView.mode === "live") chartView.followLive = true; drawChart(); };
+    $("btn-chart-live").onclick = function () {
+      var row = model.selected ? model.rows.get(model.selected) : null;
+      if (!row) return;
+      chartView.mode = "live";
+      chartView.followLive = true;
+      loadChart(row, true, "live");
+    };
+    $("btn-chart-reset").onclick = function () {
+      var row = model.selected ? model.rows.get(model.selected) : null;
+      if (!row) return;
+      if (chartView.mode === "setup") resetChartView();
+      else loadChart(row, true, "setup");
+    };
     $("btn-chart-full").onclick = function () {
       var panel = $("chart-panel");
       if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
@@ -1181,6 +1286,12 @@
     open();
   }
 
+  function refreshLiveChart() {
+    if (document.hidden || chartView.mode !== "live" || model.chartBusy || !model.selected) return;
+    var row = model.rows.get(model.selected);
+    if (row) loadChart(row, false, "live");
+  }
+
   function poll() {
     fetch("/api/state")
       .then(function (r) { return r.json(); })
@@ -1304,6 +1415,7 @@
     connect();
     poll();
     setInterval(poll, 6000);
+    setInterval(refreshLiveChart, 1000);
     setInterval(refreshHealth, 8000);
     refreshWatch();
     setInterval(refreshWatch, 5000);

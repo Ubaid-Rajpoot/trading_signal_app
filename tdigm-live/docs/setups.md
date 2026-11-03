@@ -180,6 +180,23 @@ Every instrument/timeframe cell in the matrix is clickable and opens its chart,
 so a cell that says `range` or `sweep high` can be checked against the candles
 that produced it.
 
+For an open setup, **LIVE** shows the latest in-memory market tail and appends the
+exchange's still-forming candle, refreshed once per second. The live strip keeps
+four different quantities explicit:
+
+* `price` — the current forming-kline close;
+* `plan` — target reward divided by initial risk (`1:x`), projected only while
+  pending and frozen from the actual entry/stop after mitigation;
+* `now` — mark-to-market P/L from the mitigation entry in initial-risk R units
+  (never invented for an unfilled setup);
+* `remaining` — reward to the frozen target divided by risk to the current stop,
+  both measured from current market price.
+
+A live intrabar stop/target touch is warned immediately, but it does not mutate
+the archive. Structure, HVB, mitigation, target extension, and lifecycle outcomes
+still consume closed candles only. **SETUP** returns to the immutable historical
+window containing the selected sweep and confirmation chain.
+
 ## 6. Filters on top, and more instruments
 
 The bar above the setups list:

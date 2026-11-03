@@ -209,7 +209,13 @@ reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
   frozen confirmation-leg target begin at the mitigation candle—not the
   breakout—while the stop remains visible
   from confirmation. Time/price axes, crosshair OHLC, drag-pan, wheel/axis zoom,
-  fullscreen and reset-to-setup match the SMC-Radar chart.
+  fullscreen and reset-to-setup match the SMC-Radar chart. Valid setups open in
+  **LIVE** mode: the latest exchange kline is appended as a visibly forming
+  candle and refreshed once per second. The strip above the chart shows live
+  price, the frozen/projected plan R:R, current P/L in initial-risk units, and
+  remaining reward-to-risk from market price to target/stop. **SETUP** switches
+  back to immutable setup-centred evidence. Forming data is display-only and can
+  never create a signal or rewrite a lifecycle outcome before candle close.
 * **Filters**: symbol search, timeframe chips (1m … 1d), side, grade, state and
   sort. Browser preferences and the selected signal survive a reload via local
   storage; strategy/filter/structure settings remain server-side in the atomic

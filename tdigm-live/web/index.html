@@ -153,13 +153,22 @@
       <div class="chart-head-right">
         <span class="muted small" id="chart-tf"></span>
         <div class="chart-tools" aria-label="chart controls">
+          <button class="ghost" id="btn-chart-live" title="follow the still-forming market candle">live</button>
           <button class="ghost" id="btn-chart-in" title="zoom in">+</button>
           <button class="ghost" id="btn-chart-out" title="zoom out">−</button>
-          <button class="ghost" id="btn-chart-reset" title="return to the selected setup">setup</button>
+          <button class="ghost" id="btn-chart-reset" title="return to immutable setup evidence">setup</button>
           <button class="ghost" id="btn-chart-full" title="full screen">⛶</button>
           <button class="ghost" id="btn-refresh-chart" title="reload setup history">↻</button>
         </div>
       </div>
+    </div>
+    <div class="chart-live" id="chart-live" aria-live="polite">
+      <span class="live-pill" id="chart-live-state">SETUP VIEW</span>
+      <span>price <b id="chart-live-price">—</b></span>
+      <span title="target reward divided by initial risk">plan R:R <b id="chart-plan-rr">—</b></span>
+      <span title="mark-to-market profit or loss in initial-risk units">live R <b id="chart-current-r">—</b></span>
+      <span title="reward to target divided by risk to stop from current price">remaining R:R <b id="chart-remaining-rr">—</b></span>
+      <span class="live-note" id="chart-live-note">Select LIVE to follow the current market.</span>
     </div>
     <div class="canvas-wrap">
       <canvas id="chart" title="drag to pan · wheel to zoom · drag the price axis to scale · double-click to reset"></canvas>

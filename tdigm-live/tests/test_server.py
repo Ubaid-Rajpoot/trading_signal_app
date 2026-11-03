@@ -92,14 +92,66 @@ def test_selected_chart_is_anchored_by_archive_key_and_exposes_the_chain(client)
     assert body["focus_index"] >= 0
 
 
+def test_live_chart_returns_the_forming_candle_and_mark_to_market_rr(client):
+    key = "BTCUSDT|5m|1735690200000"
+    payload = {
+        "key": key, "kind": "signal", "strategy": "sweep", "symbol": "BTCUSDT",
+        "timeframe": "5m", "side": "SHORT", "created_ms": 1_735_690_200_000,
+        "state": "active", "valid": True, "mitigated": True,
+        "entry": 100.0, "stop": 104.0, "stop0": 104.0, "risk0": 4.0,
+        "target": 90.0, "leg_target": 90.0, "touched_ms": 1_735_690_500_000,
+        "target_model": "hvb_bos_leg_extreme_v1", "lifecycle_version": 5,
+    }
+    client.engine.setup_payloads[key] = payload  # type: ignore[attr-defined]
+    cell = client.engine.cells[("BTCUSDT", "5m")]  # type: ignore[attr-defined]
+    cell.candles.clear()
+    cell.candles.append({
+        "symbol": "BTCUSDT", "timeframe": "5m", "open_time": 1_735_690_800_000,
+        "close_time": 1_735_691_099_999, "open": 100.0, "high": 101.0,
+        "low": 98.0, "close": 99.0, "volume": 10.0, "closed": True,
+    })
+    cell.forming = {
+        "symbol": "BTCUSDT", "timeframe": "5m", "open_time": 1_735_691_100_000,
+        "close_time": 1_735_691_399_999, "open": 99.0, "high": 99.5,
+        "low": 97.0, "close": 98.0, "volume": 4.0, "closed": False,
+    }
+
+    body = client.get(
+        "/api/chart",
+        params={"symbol": "BTCUSDT", "timeframe": "5m", "key": key, "live": 1},
+    ).json()
+    assert body["historical_window"] is False
+    assert body["candles"][-1]["closed"] is False
+    assert body["live"]["forming"] is True and body["live"]["price"] == 98.0
+    assert body["live"]["planned_rr"] == 2.5
+    assert body["live"]["current_r"] == 0.5
+    assert body["live"]["remaining_rr"] == pytest.approx(1.3333)
+
+    # The next exchange update replaces the same forming bar; the live endpoint
+    # must move both the candle and R immediately without closing it.
+    cell.forming.update({"close": 97.0, "low": 96.5, "volume": 6.0})
+    moved = client.get(
+        "/api/chart",
+        params={"symbol": "BTCUSDT", "timeframe": "5m", "key": key, "live": 1},
+    ).json()
+    assert moved["candles"][-1]["c"] == 97.0
+    assert moved["candles"][-1]["closed"] is False
+    assert moved["live"]["current_r"] == 0.75
+    assert moved["live"]["remaining_rr"] == pytest.approx(1.0)
+
+
 def test_page_has_bounded_signal_scrolling_and_smc_style_chart_controls(client):
     page = client.get("/").text
     css = client.get("/app.css").text
     script = client.get("/app.js").text
-    assert all(name in page for name in ("btn-chart-in", "btn-chart-out", "btn-chart-reset", "chart-audit"))
+    assert all(name in page for name in (
+        "btn-chart-live", "btn-chart-in", "btn-chart-out", "btn-chart-reset",
+        "chart-audit", "chart-current-r", "chart-remaining-rr",
+    ))
     assert "min-height: 0" in css and "overscroll-behavior: contain" in css
     assert "tdigm.ui.preferences.v2" in script and "savePreferences" in script
     assert "BODY BREAK + HVB" in script and "HIGH SWEEP" in script
+    assert "refreshLiveChart, 1000" in script and 'mode === "live" ? "&live=1"' in script
 
 
 def test_adding_a_symbol_writes_the_config_file(client):

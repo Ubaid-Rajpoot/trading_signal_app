@@ -227,10 +227,74 @@ def test_engine_ignores_forming_candles_for_alerts():
         forming["closed"] = False
         before = len(engine.alerts)
         await engine.on_candle(forming)
-        return before, len(engine.alerts)
+        live_chart = engine.chart("BTCUSDT", "5m", live=True)
+        audit_chart = engine.chart("BTCUSDT", "5m")
+        return before, len(engine.alerts), live_chart, audit_chart
 
-    before, after = asyncio.run(run())
+    before, after, live_chart, audit_chart = asyncio.run(run())
     assert after == before, "a forming candle must never raise an alert"
+    assert live_chart["candles"][-1]["closed"] is False
+    assert live_chart["candles"][-1]["c"] == 500.0
+    assert live_chart["live"]["enabled"] is True and live_chart["live"]["forming"] is True
+    assert all(candle["closed"] is not False for candle in audit_chart["candles"])
+
+
+def test_live_ohlc_survives_the_full_universe_cap_without_double_counting_volume():
+    engine = Engine(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        timeframes=["1m", "5m"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={"trend_context": False},
+        structure={"pivot_len": 2},
+        preview_max_symbols=1,
+    )
+
+    async def run():
+        start = 1_700_000_100_000 - (1_700_000_100_000 % 300_000)
+        closed = bar(start, 100.0)
+        await engine.on_candle(closed)
+        forming = bar(start + 60_000, 101.0)
+        forming.update({"closed": False, "volume": 2.0})
+        await engine.on_candle(forming)
+        update = {**forming, "close": 102.0, "high": 103.0, "volume": 4.0}
+        await engine.on_candle(update)
+
+    asyncio.run(run())
+    one = engine.cells[("BTCUSDT", "1m")]
+    five = engine.cells[("BTCUSDT", "5m")]
+    assert one.forming["close"] == 102.0 and one.forming["volume"] == 4.0
+    assert five.forming["close"] == 102.0 and five.forming["volume"] == 5.0
+    assert one.preview is None and five.preview is None, "only indicators are capped, not live OHLC"
+
+
+def test_live_risk_reward_is_marked_from_the_actual_mitigation_entry():
+    setup = {
+        "side": "SHORT", "state": "active", "mitigated": True,
+        "entry": 100.0, "stop": 104.0, "stop0": 104.0, "risk0": 4.0,
+        "target": 90.0,
+    }
+    market = {
+        "open_time": 1_000, "close_time": 1_999, "open": 99.0,
+        "high": 99.5, "low": 97.0, "close": 98.0, "closed": False,
+    }
+    live = Engine._live_risk_reward(setup, market, True)
+    assert live["planned_rr"] == 2.5
+    assert live["current_r"] == 0.5
+    assert live["remaining_rr"] == pytest.approx(1.3333)
+    assert live["status"] == "active_live"
+
+    both = Engine._live_risk_reward(
+        setup, {**market, "high": 105.0, "low": 89.0}, True
+    )
+    assert both["status"] == "both_touched_live"
+
+    pending = Engine._live_risk_reward(
+        {**setup, "state": "pending", "mitigated": False, "target": None, "leg_target": 90.0},
+        market,
+        True,
+    )
+    assert pending["planned_rr"] == 2.5
+    assert pending["current_r"] is None and pending["status"] == "pending_unfilled"
 
 
 # --------------------------------------------------------------- structure
