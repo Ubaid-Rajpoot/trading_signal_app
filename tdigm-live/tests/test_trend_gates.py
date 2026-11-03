@@ -126,7 +126,7 @@ def strict_gates(**overrides):
     return gates(
         clear_structure=True,
         min_trend_steps=2,
-        min_directional_ratio=0.75,
+        min_directional_ratio=1.0,
         fresh_shift_max_bars=20,
         **overrides,
     )
@@ -141,6 +141,16 @@ def test_strict_gate_rejects_a_recent_directional_flicker_inside_a_range():
     assert any("ranging/unclear structure to the left" in reason for reason in reasons)
 
 
+def test_strict_gate_rejects_even_one_mixed_step_in_remembered_outer_structure():
+    almost = strict_degree(steps=3, ratio=0.75, range_like=False)
+    local = strict_degree(steps=1, ratio=1.0, range_like=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=almost, internal=local))
+    )
+    assert not ok
+    assert any("100% consistency" in reason for reason in reasons)
+
+
 def test_strict_gate_accepts_repeated_major_structure_and_its_directional_leg():
     major = strict_degree(steps=3, ratio=1.0)
     internal = strict_degree(steps=2, ratio=1.0)
@@ -148,6 +158,28 @@ def test_strict_gate_accepts_repeated_major_structure_and_its_directional_leg():
         candidate(context=strict_context(major=major, internal=internal))
     )
     assert ok, reasons
+
+
+def test_established_larger_trend_allows_one_clear_specific_internal_leg():
+    major = strict_degree(steps=3, ratio=1.0)
+    local_leg = strict_degree(steps=1, ratio=1.0, range_like=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=major, internal=local_leg))
+    )
+    assert ok, reasons
+
+    # The same one-step shape cannot stand on its own when the larger structure
+    # is mixed/ranging. This is the key difference between the tick drawing and
+    # a 1-minute directional flicker inside an old range.
+    mixed_major = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=2, range_break=False,
+    )
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=mixed_major, internal=local_leg))
+    )
+    assert not ok
+    assert any("ranging/unclear structure" in reason for reason in reasons)
 
 
 def test_fresh_major_range_break_can_establish_the_new_direction():
@@ -346,7 +378,7 @@ def test_shipped_config_keeps_the_production_structure_gate_strict():
     assert shipped["require_hh_hl"] is True
     assert shipped["clear_structure"] is True
     assert shipped["min_trend_steps"] == 2
-    assert shipped["min_directional_ratio"] == 0.75
+    assert shipped["min_directional_ratio"] == 1.0
     assert shipped["fresh_shift_max_bars"] == 20
     assert shipped["regime_adx_min"] == 22.0 and shipped["regime_er_min"] == 0.30
     assert shipped["breaker_stop_buffer_atr"] == 0.10

@@ -38,7 +38,7 @@ from typing import Any
 
 VALID = {"pending", "active"}
 DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
-LIFECYCLE_VERSION = 3
+LIFECYCLE_VERSION = 4
 DEFAULT_TARGET_RR = 4.0
 
 

@@ -90,7 +90,7 @@ async def main() -> int:
                     help="research only: allow one recent HH/HL pair without wider left context")
     ap.add_argument("--trend-steps", type=int, default=2,
                     help="consecutive high and low swing steps required at major/macro degree")
-    ap.add_argument("--directional-ratio", type=float, default=0.75,
+    ap.add_argument("--directional-ratio", type=float, default=1.0,
                     help="fraction of recent structural steps that must agree")
     ap.add_argument("--fresh-shift-bars", type=int, default=20,
                     help="bars for a major close beyond the remembered range edge to establish direction")

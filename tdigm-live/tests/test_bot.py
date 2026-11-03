@@ -450,6 +450,132 @@ def test_sequential_second_high_invalidates_the_active_liquidity_run():
     assert broken["setup"] is None
 
 
+def test_tick_drawing_allows_one_outer_leg_with_directional_internal_structure():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    # The right-hand tick drawing: 120 -> 100 -> 115 -> 90 is one clear
+    # bearish structural leg (LH + LL internally).  The rise to 125 passes the
+    # internal 115 on its way to sweeping the one outer high at 120; 115 is not
+    # a second same-degree range high.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 90.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 121.0, high=125.0, low=116.0))
+    assert swept["invalidated"] is False
+    assert swept["sweep"] is not None and swept["sweep"].level == 120.0
+    assert swept["sweep"].opposite.price == 90.0
+
+    broken = st.add(bar(360_000, 85.0, high=121.0, low=84.0))
+    assert broken["setup"] is not None
+    proof = broken["setup"].as_dict()
+    assert proof["swept_count"] == 1 and proof["leg_model"] == "directional_outer_v1"
+    assert proof["swept_level"] == 120.0 and proof["broke_level"] == 90.0
+
+
+def test_tick_drawing_is_recognised_from_confirmed_candle_pivots():
+    rows = [
+        (111, 109, 110), (115, 110, 114), (120, 114, 119),
+        (119, 110, 112), (110, 104, 105), (105, 100, 101),
+        (108, 101, 107), (112, 106, 111), (115, 110, 114),
+        (113, 105, 106), (104, 95, 96), (96, 90, 91),
+        (100, 91, 99), (110, 99, 109), (125, 110, 121),
+        (121, 84, 85),
+    ]
+    _st, _pivots, _sweeps, setups, invalid = run_structure(rows)
+    shorts = [setup for _index, setup in setups if setup.side == "SHORT"]
+    assert not invalid and shorts
+    proof = shorts[-1].as_dict()
+    assert proof["swept_level"] == 120.0 and proof["broke_level"] == 90.0
+    assert proof["swept_count"] == 1
+
+
+def test_tick_drawing_outer_leg_is_symmetric_for_a_long():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    st.levels.extend([
+        Level("low", 80.0, 1, 60_000),
+        Level("high", 100.0, 2, 120_000),
+        Level("low", 85.0, 3, 180_000),
+        Level("high", 110.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 79.0, high=84.0, low=75.0))
+    assert swept["invalidated"] is False
+    assert swept["sweep"] is not None and swept["sweep"].level == 80.0
+    assert swept["sweep"].opposite.price == 110.0
+    broken = st.add(bar(360_000, 115.0, high=116.0, low=79.0))
+    assert broken["setup"] is not None and broken["setup"].side == "LONG"
+    assert broken["setup"].as_dict()["swept_count"] == 1
+
+
+def test_tick_drawing_can_upgrade_an_internal_sweep_to_the_outer_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 90.0, 4, 240_000),
+    ])
+    st.count = 5
+    internal = st.add(bar(300_000, 114.0, high=116.0, low=110.0))
+    assert internal["sweep"] is not None and internal["sweep"].level == 115.0
+
+    outer = st.add(bar(360_000, 122.0, high=125.0, low=114.0))
+    assert outer["invalidated"] is False
+    assert outer["sweep"] is not None and outer["sweep"].level == 120.0
+    assert outer["sweep"].opposite.price == 90.0
+    broken = st.add(bar(420_000, 85.0, high=121.0, low=84.0))
+    assert broken["setup"] is not None
+    assert broken["setup"].sweep.level == 120.0
+
+
+def test_cross_drawing_rejects_nested_oscillation_without_a_directional_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    # The left-hand X drawing contracts: the second high is lower but the second
+    # low is higher. There is no clear H1 -> L2 leg that can absorb H2 as internal
+    # structure, so taking both highs is a genuine multi-sweep range.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 105.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 121.0, high=125.0, low=116.0))
+    assert swept["sweep"] is None and swept["invalidated"] is True
+    assert "multiple highs" in swept["invalid_reason"]
+    assert st.add(bar(360_000, 95.0, high=121.0, low=94.0))["setup"] is None
+
+
+def test_cross_drawing_rejects_several_equal_box_highs_on_one_candle():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 120.0, 3, 180_000),
+        Level("low", 100.0, 4, 240_000),
+        Level("high", 120.0, 5, 300_000),
+        Level("low", 101.0, 6, 360_000),
+    ])
+    st.count = 7
+    swept = st.add(bar(420_000, 121.0, high=125.0, low=116.0))
+    assert swept["sweep"] is None and swept["invalidated"] is True
+    assert "multiple highs" in swept["invalid_reason"]
+    assert st.add(bar(480_000, 95.0, high=121.0, low=94.0))["setup"] is None
+
+
 def test_crossing_a_paired_low_and_newer_unpaired_low_is_multi_sweep():
     from bot.structure import Level
 
@@ -717,6 +843,8 @@ async def test_engine_emits_a_signal_for_the_complete_setup():
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
+    assert alert["chain_version"] == 4
+    assert alert["setup"]["leg_model"] == "directional_outer_v1"
     assert alert["setup"]["stop"] == 107.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
     assert alert["filtered"] == []

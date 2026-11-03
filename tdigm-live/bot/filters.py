@@ -78,7 +78,7 @@ DEFAULT_FILTERS: dict[str, Any] = {
     # shipped config explicitly enables this mandatory production gate.
     "clear_structure": False,
     "min_trend_steps": 2,
-    "min_directional_ratio": 0.75,
+    "min_directional_ratio": 1.0,
     "fresh_shift_max_bars": 20,
     "volume_break": False,
     "volume_mult": 1.5,
@@ -186,7 +186,7 @@ class Filters:
                 macro = context.get("macro") or {}
                 internal = context.get("internal") or context.get("minor") or {}
                 steps = int(cfg.get("min_trend_steps") or 2)
-                ratio = float(cfg.get("min_directional_ratio", 0.75))
+                ratio = float(cfg.get("min_directional_ratio", 1.0))
                 fresh_bars = int(cfg.get("fresh_shift_max_bars") or 0)
 
                 def clear(degree: dict) -> bool:
@@ -194,6 +194,16 @@ class Filters:
                         degree.get("direction") == want
                         and degree.get("clean")
                         and int(degree.get("trend_steps") or 0) >= steps
+                        and float(degree.get("directional_ratio") or 0.0) >= ratio
+                        and not degree.get("range_like", True)
+                    )
+
+                def directional_leg(degree: dict) -> bool:
+                    """One clear local LH+LL / HL+HH step inside larger structure."""
+                    return bool(
+                        degree.get("direction") == want
+                        and degree.get("clean")
+                        and int(degree.get("trend_steps") or 0) >= 1
                         and float(degree.get("directional_ratio") or 0.0) >= ratio
                         and not degree.get("range_like", True)
                     )
@@ -208,7 +218,7 @@ class Filters:
                     )
 
                 established = clear(major) or clear(macro)
-                local_release = clear(internal) or released(internal) or released(major)
+                local_release = directional_leg(internal) or released(internal) or released(major)
                 fresh_reversal = released(major) or released(macro)
                 if not (fresh_reversal or (established and local_release)):
                     reasons.append(

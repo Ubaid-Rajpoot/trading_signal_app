@@ -15,14 +15,17 @@ makes each of them a switch:
 This page is the honest record: what each rule computes, what it rejects, and
 where old measurements are too weak or too stale to support a claim.
 
-> **Current-policy boundary (lifecycle v3).** The historical tables below predate
+> **Current-policy boundary (lifecycle v4).** The historical tables below predate
 > exactly-one-sweep structure, breaker-local stops and mitigation-only 4R. They
 > are retained as labelled research, not presented as current results. The live
 > policy now requires repeated major/macro progression (at least two high and two
-> low steps, at least 75% recent directional consistency) plus a clear local leg
+> low steps, with 100% remembered recent-step consistency) plus a clear local leg
 > or range release. A mixed left-side range passes only after a fresh major/macro
-> body close beyond the furthest remembered range edge. ADX ≥ 22 and ER ≥ 0.30
-> remain additional gates; they cannot certify trend by themselves.
+> body close beyond the furthest remembered range edge. Inside an established
+> outer trend, one clean local `LH+LL` / `HL+HH` step is enough to identify the
+> specific directional leg; the same one-step flicker cannot stand alone inside
+> mixed outer structure. ADX ≥ 22 and ER ≥ 0.30 remain additional gates; they
+> cannot certify trend by themselves.
 
 Legend: **on** = shipped default · **off** = implemented, switchable, left off.
 
@@ -45,8 +48,10 @@ From those pivots it keeps:
   when both fell, and no direction when mixed;
 * `trend_steps` — the smaller of the consecutive high-side and low-side runs, so
   one side cannot hide repeated oscillation on the other;
-* `directional_ratio` — how many of up to four recent steps on each side agree
-  with that direction; the shipped gate requires at least 75%;
+* `directional_ratio` — how many of all remembered steps (up to seven per side
+  with the eight-pivot memory) agree with that direction; the shipped gate
+  requires 100%, so one remembered mixed
+  step prevents a range from masquerading as an established trend;
 * `range_like` — true when direction is mixed, either side has no continuing
   step, or recent agreement is below the structural floor;
 * `external.source` — `major` or `macro`, printed on the card so you can see how
@@ -70,7 +75,8 @@ The card shows all of it: `external bullish (HH+HL) · last break of structure u
 |---|---|---|---|
 | evaluate structural context | `trend_context` / `clear_structure` | **on / on** | `ranging/unclear structure to the left` |
 | repeated high-side and low-side progression | `min_trend_steps` | **2** | included in the clear-structure reason |
-| recent structural consistency | `min_directional_ratio` | **0.75** | included in the clear-structure reason |
+| remembered recent structural consistency | `min_directional_ratio` | **1.00** | any mixed step blocks the established-trend path |
+| specific local leg inside established structure | internal `trend_steps` | **at least 1** | one clean local step is accepted only when major/macro context is already clear |
 | fresh full-range shift may establish a new direction | `fresh_shift_max_bars` | **20** | stale/internal-only breaks do not clear the context gate |
 | a break of structure must have happened in the trade's direction | `require_bos` | **on** | `no recent structure break in the trade direction` |
 | …and it must be recent | `bos_max_age` | **240 bars** | `break of structure is stale (312 bars)` |
@@ -90,7 +96,7 @@ page, and are written to `config.json`.
 
 ## 3. Legacy replay: what the earlier policy rejected
 
-These counts are **not lifecycle-v3 counts** and cannot be used as current signal
+These counts are **not lifecycle-v4 counts** and cannot be used as current signal
 frequency or performance. One earlier replay of BTCUSDT 1-minute candles, 2024-07-01 → 2025-06-29 (911 days),
 on 5m / 15m / 30m / 1h, with the shipped defaults
 (`python tools/scan_history.py data/btc --timeframes 5m,15m,30m,1h`):

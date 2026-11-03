@@ -45,7 +45,7 @@ async def replay(args: argparse.Namespace, candles: list[dict], store: SignalSto
             "require_hh_hl": args.trend_context,
             "clear_structure": args.trend_context,
             "min_trend_steps": 2,
-            "min_directional_ratio": 0.75,
+            "min_directional_ratio": 1.0,
             "fresh_shift_max_bars": 20,
             "require_bos": args.trend_context,
             "max_internal_depth": 2,

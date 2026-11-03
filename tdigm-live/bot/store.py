@@ -104,7 +104,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_LIFECYCLE_VERSION = 3
+CURRENT_LIFECYCLE_VERSION = 4
 
 
 def _num(value: Any) -> float | None:

@@ -45,9 +45,10 @@ be held up by an fsync, and a crash must not corrupt the file.
 
 The "final" rule matters more than it looks. Ordinary rescans cannot turn a win
 back into `pending`. The exception is explicit `lifecycle_version` advancement:
-v2 changed the fill to mitigation and the target to 4R; v3 adds exactly-one-sweep
-validity and breaker-local post-fill stops. Rows graded under either older rule
-must be replayed rather than contaminating the current win rate.
+v2 changed the fill to mitigation and the target to 4R; v3 added one selected
+structural sweep and breaker-local post-fill stops; v4 adds degree-aware clean
+outer legs plus full remembered trend consistency. Rows graded under any older
+rule must be replayed rather than contaminating the current win rate.
 
 ## Reading it back
 
@@ -69,7 +70,7 @@ Risk/reward does not begin on the body-break candle. A later order-block or
 eligible aggressive-breaker touch freezes entry and risk; the target is exactly
 **4R** from that fill. A pre-mitigation stop is `invalidated`, carries no realised
 R and is excluded. Legacy 2R studies remain below as labelled historical
-experiments, but they are not mixed into lifecycle-v3 results.
+experiments, but they are not mixed into lifecycle-v4 results.
 
 ## Filling it from history
 
@@ -85,7 +86,7 @@ python tools/backfill_archive.py data/btc --symbol BTCUSDT --dry-run  # writes n
 
 An older BTCUSDT 2023-01-01 → 2025-06-30 report produced **107 setups, 43 won,
 54 stopped, 10 never filled under legacy 2R scoring**. It is retained only as a
-historical audit; the backfill command now applies lifecycle v3 and is not
+historical audit; the backfill command now applies lifecycle v4 and is not
 expected to reproduce those counts. A compatible real dataset is not present in
 this checkout, so a current 4R rate is intentionally not claimed.
 
@@ -128,7 +129,7 @@ represent the current same-candle HVB, trend-gated, mitigation-first 4R policy:
 
 Those numbers do not override the shipped rules: `hvb_window: 0` requires the
 same candle, and current trend/structure gates remain configured in
-`config.json`. New lifecycle-v3 results are reported separately only after a
+`config.json`. New lifecycle-v4 results are reported separately only after a
 fresh deep replay.
 
 ### A caveat about the grades

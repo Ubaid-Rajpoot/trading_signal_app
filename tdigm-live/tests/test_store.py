@@ -127,13 +127,13 @@ def test_a_new_lifecycle_version_can_regrade_an_old_final_outcome(tmp_path):
     store.record({**PAYLOAD, "state": "win", "valid": False, "r_now": 2.0})
     upgraded = {
         **PAYLOAD,
-        "lifecycle_version": 3,
+        "lifecycle_version": 4,
         "state": "pending", "valid": True, "mitigated": False,
         "target": None, "rr": None, "r_now": None,
     }
     store.record(upgraded)
     row = store.get(PAYLOAD["key"])
-    assert row["lifecycle_version"] == 3
+    assert row["lifecycle_version"] == 4
     assert row["state"] == "pending" and row["target"] is None
 
 
@@ -162,7 +162,7 @@ def test_filters_read_the_archive_not_the_process(tmp_path):
 
 def test_results_are_4r_after_mitigation_and_exclude_legacy_or_unfilled_rows(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
-    current = {**PAYLOAD, "lifecycle_version": 3, "mitigated": True, "target_rr": 4.0}
+    current = {**PAYLOAD, "lifecycle_version": 4, "mitigated": True, "target_rr": 4.0}
     store.record({**current, "key": "A", "state": "win", "valid": False, "r_now": 4.0})
     store.record({**current, "key": "B", "state": "stopped", "valid": False, "r_now": -1.0})
     store.record({**current, "key": "C", "state": "pending", "valid": True,
@@ -174,7 +174,7 @@ def test_results_are_4r_after_mitigation_and_exclude_legacy_or_unfilled_rows(tmp
     assert results["win_rate"] == 0.5
     assert results["r_per_trade"] == 1.5, "(+4R - 1R) / 2 decided mitigated trades"
     full = store.results()
-    assert full["target_rr"] == 4.0 and full["lifecycle_version"] == 3
+    assert full["target_rr"] == 4.0 and full["lifecycle_version"] == 4
     assert "after mitigation" in full["r_basis"]
 
 
@@ -201,10 +201,11 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     engine.market = "futures"
     current = {
         **PAYLOAD,
-        "chain_version": 3,
-        "lifecycle_version": 3,
+        "chain_version": 4,
+        "lifecycle_version": 4,
         "setup": {
             **PAYLOAD["setup"],
+            "leg_model": "directional_outer_v1",
             "swept_count": 1,
             "swept_levels": [{"side": "high", "price": 104.0}],
             "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
@@ -325,6 +326,62 @@ def test_startup_quarantines_v3_without_single_swept_level_proof(tmp_path):
     assert row["state"] == "invalidated"
     assert any("exactly one" in reason or "swept-level proof" in reason
                for reason in row["chain_errors"])
+    assert versioned["key"] not in engine.registry
+
+
+def test_startup_requires_deep_replay_for_a_tradeable_v3_row(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    old_current = {
+        **PAYLOAD,
+        "chain_version": 3,
+        "lifecycle_version": 3,
+        "setup": {
+            **PAYLOAD["setup"],
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 104.0}],
+            "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
+            "broke_level_time": PAYLOAD["setup"]["sweep_time"] - 1,
+        },
+    }
+    store.record(old_current)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(old_current["key"])
+    assert row["state"] == "invalidated"
+    assert any("deep replay required" in reason for reason in row["chain_errors"])
+    assert old_current["key"] not in engine.registry
+
+
+def test_startup_quarantines_v4_without_directional_outer_leg_proof(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    versioned = {
+        **PAYLOAD,
+        "chain_version": 4,
+        "lifecycle_version": 4,
+        "setup": {
+            **PAYLOAD["setup"],
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 104.0}],
+            "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
+            "broke_level_time": PAYLOAD["setup"]["sweep_time"] - 1,
+        },
+    }
+    store.record(versioned)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(versioned["key"])
+    assert row["state"] == "invalidated"
+    assert any("directional outer-leg proof" in reason for reason in row["chain_errors"])
     assert versioned["key"] not in engine.registry
 
 

@@ -154,7 +154,7 @@
     "breaker_stop_buffer_atr": 0.1,
     "clear_structure": true,
     "min_trend_steps": 2,
-    "min_directional_ratio": 0.75,
+    "min_directional_ratio": 1.0,
     "fresh_shift_max_bars": 20,
     "hvb_window": 0
   },

@@ -48,9 +48,10 @@ exact leg's high.
 |---|---|
 | swing / level | a high that no other high in `pivot_len` bars on either side beats (equal highs count — double tops are liquidity). Only confirmed `pivot_len` bars later, so nothing looks ahead. |
 | paired leg | SHORT is a completed `high → later low` leg; LONG is a completed `low → later high` leg |
-| sweep | `high >` that leg's high (SHORT) or `low <` that leg's low (LONG), on a **closed** candle; the liquidity run must take exactly one resting high or one resting low |
-| extension | price may continue beyond that same swept endpoint; reaching any second resting same-side pivot—on one candle or later before confirmation—invalidates the run |
-| confirmation | a later body close through the **other endpoint of that same leg** within `sweep_max_wait` bars |
+| sweep | `high >` that leg's high (SHORT) or `low <` that leg's low (LONG), on a **closed** candle; the run must take exactly one structural high/low at the selected degree |
+| nested leg | a lower high inside a clean outer `LH+LL` leg (or higher low inside `HL+HH`) is internal to that one leg, matching the tick drawings; it is not promoted to a second same-degree range level |
+| extension | price may continue beyond the selected endpoint; reaching a second **independent/equal or newly printed** same-side structural level—on one candle or later before confirmation—invalidates the run |
+| confirmation | a later body close through the **other endpoint of that exact simple or clean composite leg** within `sweep_max_wait` bars |
 | order-block stop | the run's final extreme beyond the swept high / low is retained when the order block fills |
 | breaker stop | if the aggressive paired-endpoint breaker fills, use its distal edge plus `breaker_stop_buffer_atr` (0.10 ATR shipped), not the distant sweep extreme |
 | structural draw | `range` / `next` remains evidence about where liquidity sits; it is not the scored trade exit |
@@ -144,14 +145,16 @@ sensible, and each part of that is a switch in ⚙ **Trend & structure**:
 |---|---|---|
 | structural context must be evaluated, not inferred from indicators | `trend_context` / `clear_structure` | **on / on** |
 | major or macro highs **and** lows must progress repeatedly in the trade direction | `min_trend_steps` | **2 each** |
-| recent structural steps that must agree with that direction | `min_directional_ratio` | **75%** |
+| remembered recent structural steps that must agree with that direction | `min_directional_ratio` | **100%** |
 | mixed/ranging left context may pass only after a major/macro body close beyond the full remembered edge | `fresh_shift_max_bars` | **20** |
 | a **break of structure** happened in the trade's direction | `require_bos` | **on** |
 | …within the last N bars | `bos_max_age` | 240 |
 | the setup is no deeper than **internal inside one trend** | `max_internal_depth` | 2 |
 
-A valid continuation therefore has established major/macro structure plus a
-clear internal directional leg (or a local range release). A reversal exception
+A valid continuation therefore has established major/macro structure (two or
+more high-side and low-side steps) plus a clear internal directional leg (one
+clean `LH+LL` / `HL+HH` step is enough inside that established structure) or a
+local range release. A reversal exception
 exists only for a fresh major/macro body close beyond the furthest remembered
 range edge; a small BOS inside the old range does not qualify. Depth is counted
 in degrees of structure: **1** the break is itself the external break · **2** the
@@ -218,11 +221,13 @@ The page used to be a window on the process: a setup that printed at 03:10 was
 gone from the app after a restart. Everything is now written to SQLite
 (`data/tdigm.sqlite3`, WAL) the moment it is found, and updated through its whole
 life - `pending → active → win | stopped | expired`. A restart shows the archive
-**before a single candle arrives** and rehydrates every valid row into the live
-state machine, so later candles can mitigate or invalidate it. An outcome is
-write-once within one lifecycle version. Lifecycle v2 introduced mitigation-first
-4R; v3 adds breaker-local stops and exactly-one-sweep structure, so deep replay
-intentionally replaces outcomes graded under either older rule set. The board
+**before a single candle arrives** and rehydrates every valid current-policy row
+into the live state machine, so later candles can mitigate or invalidate it. An
+outcome is write-once within one lifecycle version. Lifecycle v2 introduced
+mitigation-first 4R; v3 added breaker-local stops and one selected structural
+sweep; v4 adds the tick/cross degree-aware outer-leg model and full remembered
+trend consistency. Deep replay intentionally replaces outcomes graded under any
+older rule set. The board
 computes win rate and R/trade from current-version mitigated rows, not memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
@@ -260,10 +265,11 @@ sparser than accepting near misses:
   live decision engine;
 * `hvb_window: 0` — the directional TDIGM centre-band HVB must occur on the
   **same closed candle** as the opposite-side body break;
-* exactly one same-side resting pivot may be swept in the run; a simultaneous or
-  sequential second high/low invalidates it before publication;
-* `trend_context: true`, `clear_structure: true`, two structural steps at 75%
-  consistency, plus ADX ≥ 22 / ER ≥ 0.30 — a recent directional flicker inside
+* exactly one structural same-side level may be swept at the selected degree;
+  simultaneous/sequential independent or equal range highs/lows invalidate it,
+  while directional internals contained by one clean outer leg do not;
+* `trend_context: true`, `clear_structure: true`, two outer structural steps with
+  100% remembered-step consistency, plus ADX ≥ 22 / ER ≥ 0.30 — a directional flicker inside
   a visible range cannot certify a trend;
 * a fresh reversal is accepted only when major/macro structure closes beyond the
   complete remembered range edge (within 20 bars);
@@ -392,7 +398,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **HVB speed** | 1.5× | this candle's step against the line's average step (0 = no speed requirement) |
 | **trending markets only** | on | ADX(14) and the efficiency ratio must both clear their lines |
 | **ADX at least / ER at least** | 22 / 0.30 | how much indicator trend strength is enough; never substitutes for swing structure |
-| **clear left structure** | on; 2 steps / 75% | repeated major/macro HH+HL or LH+LL plus a directional local leg, or a fresh full-range release |
+| **clear left structure** | on; 2 outer steps / 100% | every remembered recent major/macro step must agree, plus at least one clean directional local step; otherwise only a fresh full-range release qualifies |
 | **fresh major shift** | 20 bars | how recently a body close beyond the remembered major/macro range edge may establish direction |
 | **regime direction** | any | `any`, or `with` the EMA20/EMA50 direction |
 | **external structure** | on | the last MAJOR break (MS) must agree with the trade (p.53) |
@@ -418,14 +424,14 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 Every rejection is counted and shown ("no HVB on this candle 623"), so a quiet
 screen is explained instead of looking broken.
 
-### Legacy regime experiment (not current v3 results)
+### Legacy regime experiment (not current v4 results)
 
 The tables below are retained as an audit of an earlier detector and its
 range-extreme/2R research scoring. They predate exactly-one-sweep validation,
 strict left-context structure, breaker-local stops, mitigation-only 4R outcomes,
 and the current ADX 22 / ER 0.30 policy. They **must not** be quoted as the
 current win rate. No compatible local candle set is present in this checkout and
-MEXC is unreachable from the development sandbox, so there is no honest v3
+MEXC is unreachable from the development sandbox, so there is no honest v4
 historical result to report yet.
 
 The earlier experiment used two years of BTCUSDT 1-minute candles. One year was
@@ -453,7 +459,7 @@ the exploratory sample and the other was held out.
 | + ADX alone, no ER (ADX ≥ 20) | 452 | 1.24 |
 
 In that legacy sample, **76% of the detected shapes were classified as ranging**.
-That observation motivated stricter filtering; it is not a v3 performance result.
+That observation motivated stricter filtering; it is not a v4 performance result.
 
 **Held-out year: 2023-07-01 → 2024-06-30 (366 days)**
 
@@ -472,7 +478,7 @@ with and without that trend gate:
 | 2023-07 → 2024-06 | −0.03 | −0.09 |
 
 Read that honestly: the legacy trend gate was a discipline rule, not proven
-alpha. Current lifecycle-v3 results must instead count only setups that meet the
+alpha. Current lifecycle-v4 results must instead count only setups that meet the
 new structure rules, are actually mitigated, and then reach either their
 post-fill stop or fixed 4R target.
 
@@ -561,17 +567,20 @@ python -m pytest tests -q      # full deterministic suite, no network needed
 
 Covered: batch TDIGM equals the incremental one; Wilder's RSI; the 5m/15m rollup
 (open/high/low/close/volume, clock aligned); a break needs a close, not a wick;
-a completed leg's H/L sweep → break of the opposite endpoint of that same leg
-produces exactly one setup, while an unrelated newer pivot cannot be substituted;
-the stop follows the run's final extreme and no target comes from levels printed
-inside the reversal leg; filters reject for the stated reason and count it; alerts
+a completed simple or clean composite leg's H/L sweep → exact opposite endpoint
+break produces one setup; the tick-shaped directional internals are accepted,
+while equal/contracting X ranges and unrelated newer pivots are rejected; the
+structural stop follows the run's final extreme, breaker mitigation switches to
+its buffered distal-edge stop, and no target exists before mitigation; filters
+reject for the stated reason and count it; alerts
 never fire on a forming candle or twice on the same one; adding/removing
 instruments writes `config.json`; MEXC kline frames parse in both encodings;
 feed sharding splits 250 symbols into 100/100/50 sockets.
 
-Verified end-to-end in this sandbox on real recorded data (replay): 5 timeframes
-warm, sweeps and setups arrive over the websocket, arm state renders, config
-writes round-trip, page renders with zero JS errors.
+The deterministic replay, server, persistence, and browser smoke paths are
+covered offline. Earlier legacy studies used recorded BTC data, but no compatible
+candle archive is present in this checkout, so no lifecycle-v4 performance number
+is inferred from those old runs.
 
 **Not verified here:** the live websocket to MEXC/Binance. Every exchange host is
 blocked from this sandbox (`python run.py check` shows the exact TLS failure), so

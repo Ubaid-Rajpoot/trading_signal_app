@@ -58,6 +58,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 SIDES = ("high", "low")
+LEG_MODEL = "directional_outer_v1"
 
 
 @dataclass
@@ -144,6 +145,7 @@ class Setup:
             "swept_level": self.sweep.level,
             "swept_count": 1,
             "swept_levels": [self.sweep.boundary.as_dict()] if self.sweep.boundary else [],
+            "leg_model": LEG_MODEL,
             "sweep_time": self.sweep.time,
             "sweep_extreme": self.sweep.extreme,
             "sweep_open": self.sweep.open,
@@ -310,42 +312,41 @@ class Structure:
         # LONG leg:  LOW  -> later HIGH. The low must be taken; that exact high
         # must later receive the body close.
         #
-        # Exactly one structural high/low may be taken in a liquidity run. If
-        # one candle crosses two resting pivots, or an active run later reaches a
-        # second pivot before reversal, it is the range/multi-sweep shape the
-        # trader explicitly rejects. Do not choose whichever pair is convenient.
+        # Exactly one structural high/low may be taken at the selected degree.
+        # Several independent/equal pivots, or another pivot printed after an
+        # active sweep, are the range/multi-sweep X shape. A lower-high/higher-low
+        # nested inside one clean outer LH+LL/HL+HH leg belongs to that one outer
+        # degree (the tick drawing), so `_dominant_leg` may absorb only that case.
         for side in SIDES:
             taken_levels = self._taken_levels(side, high, low, index)
             if not taken_levels:
                 continue
             self.sweep_count += 1
 
-            active = self._candidates[side]
-            if active or len(taken_levels) != 1:
-                for level in taken_levels:
-                    level.swept = True
-                if active:
-                    self._candidates[side] = []
-                self.invalidated += 1
-                events["invalidated"] = True
-                events["invalid_reason"] = (
-                    f"multiple {side}s swept before the opposite body break"
-                )
-                continue
+            active = list(self._candidates[side])
+            dominant = self._dominant_leg(side, taken_levels, active, index)
+            for level in taken_levels:
+                level.swept = True
 
-            boundary = taken_levels[0]
-            pairs = [pair for pair in self._completed_legs(side, index) if pair[0] is boundary]
-            boundary.swept = True
-            if len(pairs) != 1:
-                # No completed leg means there is nothing to confirm. More than
-                # one endpoint means the left-side structure itself is a range.
-                if len(pairs) > 1:
+            if dominant is None:
+                # One unpaired pivot is merely spent liquidity. Two independent
+                # pivots—or any new pivot reached during an active run—are the X
+                # drawings unless one clear outer directional leg contains them.
+                if active or len(taken_levels) > 1:
+                    self._candidates[side] = []
                     self.invalidated += 1
                     events["invalidated"] = True
-                    events["invalid_reason"] = "swept pivot belongs to multiple ambiguous legs"
+                    events["invalid_reason"] = (
+                        f"multiple {side}s swept without one clear directional structural leg"
+                    )
                 continue
 
-            _boundary, opposite = pairs[0]
+            boundary, opposite = dominant
+            # Reaching the outer boundary of a clean nested leg upgrades an
+            # earlier internal sweep; it does not count the lower-high/higher-low
+            # inside that same leg as a second range level. This is the distinction
+            # between the user's tick drawing and the contracting X drawing.
+            self._candidates[side] = []
             sweep = Sweep(
                 side=side,
                 level=boundary.price,
@@ -363,10 +364,11 @@ class Structure:
             events["sweeps"].append(sweep)
             events["sweep"] = sweep
 
-        # 3. Extend the stop while no second structural pivot is taken, and wait
-        # for the exact paired endpoint. A candle may continue beyond the one
-        # swept level, but reaching any other resting high/low invalidates the
-        # run in step 2. Time expiry also removes it.
+        # 3. Extend the stop while no second independent structural pivot is
+        # taken, and wait for the exact paired endpoint. A candle may continue
+        # beyond the selected outer level; range pivots invalidate in step 2,
+        # while directional internals already absorbed into that leg do not.
+        # Time expiry also removes it.
         for side in SIDES:
             survivors: list[Sweep] = []
             broken: list[Sweep] = []
@@ -433,34 +435,100 @@ class Structure:
             )
         ]
 
-    def _completed_legs(self, side: str, index: int) -> list[tuple[Level, Level]]:
-        """Completed, intact legs whose boundary on ``side`` can be swept.
+    def _dominant_leg(
+        self,
+        side: str,
+        taken: list[Level],
+        active: list[Sweep],
+        index: int,
+    ) -> tuple[Level, Level] | None:
+        """Select one outer leg only when it genuinely contains the internals.
 
-        The endpoint chooses its nearest preceding opposite pivot. This is the
-        missing relation in the old detector: price alone ("some low below this
-        high") cannot say that two pivots belong to one leg.
+        A clean H1→L1→LH→LL sequence is one bearish leg at the outer degree. A
+        later rise can pass the internal LH while sweeping H1 without becoming
+        the multiple-range-high X drawing. The outer pair must contain every
+        crossed/active boundary and every active candidate must share its exact
+        endpoint. Contracting, equal, or independently newer pivots cannot be
+        absorbed this way and therefore remain a multi-sweep invalidation.
+        """
+        boundaries = [
+            *taken,
+            *(row.boundary for row in active if row.boundary is not None),
+        ]
+        active_endpoints = [row.opposite for row in active if row.opposite is not None]
+        candidates: list[tuple[Level, Level]] = []
+        for boundary, endpoint in self._completed_legs(side, index):
+            # An upgrade has to reach this outer boundary now; an already active
+            # outer sweep cannot absorb a structural pivot printed afterwards.
+            if boundary not in taken:
+                continue
+            if not all(boundary.index <= level.index < endpoint.index for level in boundaries):
+                continue
+            if active_endpoints and not all(level is endpoint for level in active_endpoints):
+                continue
+            candidates.append((boundary, endpoint))
+        if not candidates:
+            return None
+        # Only the earliest containing boundary can enclose every nested one.
+        return min(candidates, key=lambda pair: pair[0].index)
+
+    @staticmethod
+    def _directional_leg(segment: list[Level], side: str) -> bool:
+        """Whether nested pivots form one clear leg rather than a range.
+
+        SHORT/high boundary: all internal highs and lows progress down (LH+LL).
+        LONG/low boundary: all internal lows and highs progress up (HL+HH).
+        A two-endpoint leg passes naturally. Equal or contracting oscillation
+        fails, matching the orange X drawings.
+        """
+        endpoint_side = "low" if side == "high" else "high"
+        if not segment or segment[0].side != side or segment[-1].side != endpoint_side:
+            return False
+        same = [level.price for level in segment if level.side == side]
+        opposite = [level.price for level in segment if level.side == endpoint_side]
+        if not same or not opposite:
+            return False
+        eps = 1e-12
+        if side == "high":
+            if same[0] <= opposite[-1]:
+                return False
+            return all(now < before - eps for before, now in zip(same, same[1:])) and all(
+                now < before - eps for before, now in zip(opposite, opposite[1:])
+            )
+        if same[0] >= opposite[-1]:
+            return False
+        return all(now > before + eps for before, now in zip(same, same[1:])) and all(
+            now > before + eps for before, now in zip(opposite, opposite[1:])
+        )
+
+    def _completed_legs(self, side: str, index: int) -> list[tuple[Level, Level]]:
+        """One furthest intact directional endpoint for each resting boundary.
+
+        Exact pairing is degree-aware: a completed outer leg may contain clean
+        directional internal pivots, but never a contraction/range. For every
+        boundary, the endpoint is extended only while the entire visible segment
+        remains LH+LL (SHORT) or HL+HH (LONG). This preserves one precise outer
+        pair without combining unrelated prices.
         """
         levels = list(self.levels)
         endpoint_side = "low" if side == "high" else "high"
         pairs: list[tuple[Level, Level]] = []
-        for pos, endpoint in enumerate(levels):
-            if endpoint.side != endpoint_side or endpoint.swept:
+        for start, boundary in enumerate(levels):
+            if boundary.side != side or boundary.swept:
                 continue
-            if index <= endpoint.index or index - endpoint.index > self.level_max_age:
+            if index <= boundary.index or index - boundary.index > self.level_max_age:
                 continue
-            boundary = next(
-                (level for level in reversed(levels[:pos]) if level.side == side),
-                None,
-            )
-            if boundary is None or boundary.swept:
-                continue
-            if index - boundary.index > self.level_max_age:
-                continue
-            if side == "high" and boundary.price <= endpoint.price:
-                continue
-            if side == "low" and boundary.price >= endpoint.price:
-                continue
-            pairs.append((boundary, endpoint))
+            endpoint: Level | None = None
+            for finish in range(start + 1, len(levels)):
+                candidate = levels[finish]
+                if candidate.side != endpoint_side or candidate.swept:
+                    continue
+                if index <= candidate.index or index - candidate.index > self.level_max_age:
+                    continue
+                if self._directional_leg(levels[start : finish + 1], side):
+                    endpoint = candidate
+            if endpoint is not None:
+                pairs.append((boundary, endpoint))
         return pairs
 
     def _sync_sweeps(self) -> None:

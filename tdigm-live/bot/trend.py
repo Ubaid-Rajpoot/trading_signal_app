@@ -134,9 +134,11 @@ class Degree:
                 else:
                     break
             runs.append(run)
-            # Up to four recent steps per side make the decision look further
-            # left than one pair without letting ancient structure dominate.
-            start = max(1, len(book) - 4)
+            # Score every remembered step (up to pivot_memory pivots per side),
+            # not just the last attractive pair. Production requires 100%, so a
+            # visible older oscillation keeps the established-trend path closed;
+            # only a fresh full-range shift can establish the new direction.
+            start = 1
             for i in range(start, len(book)):
                 step = book[i].price - book[i - 1].price
                 total += 1

@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot.trend import Pivot, TrendMap  # noqa: E402
+from bot.trend import Degree, Pivot, TrendMap  # noqa: E402
 
 SMALL = {"minor_len": 2, "major_len": 4, "macro_len": 8, "hh_tolerance_atr": 0.0}
 
@@ -78,6 +78,21 @@ def test_lower_highs_and_lower_lows_are_a_bearish_external_trend():
     assert ext["direction"] == -1
     assert ext["lh"] and ext["ll"] and ext["clean"]
     assert not ext["hh"] and not ext["hl"]
+
+
+def test_directional_ratio_reads_every_remembered_step_not_only_the_latest_pair():
+    degree = Degree("major", 4)
+    degree.highs.extend(
+        Pivot("high", price, i) for i, price in enumerate([100, 90, 91, 92, 93, 94])
+    )
+    degree.lows.extend(
+        Pivot("low", price, i) for i, price in enumerate([80, 70, 71, 72, 73, 74])
+    )
+    sequence = degree.sequence(0.0)
+    assert sequence["direction"] == 1 and sequence["trend_steps"] == 4
+    assert sequence["directional_ratio"] == 0.8, (
+        "the older down-step is still visible and must not be hidden by four attractive recent steps"
+    )
 
 
 def test_a_range_is_not_a_trend_no_matter_how_often_it_sweeps():
