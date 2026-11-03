@@ -98,9 +98,9 @@ A setup is not a moment. Each one becomes a record with a state:
 
 | state | meaning | still tradeable? |
 |---|---|---|
-| **pending** | neither the order block nor eligible breaker has been touched; no trade/target exists | **yes** |
-| **active** | mitigation fixed the entry and armed the 1:4 target | **yes** |
-| win | the post-mitigation 4R target was reached | no |
+| **pending** | neither the order block nor eligible breaker has been touched; no trade is filled, while the favorable confirmation-leg H/L continues to extend on fully closed candles | **yes** |
+| **active** | mitigation fixed the entry/stop and froze the last pre-mitigation confirmation-leg H/L as target | **yes** |
+| win | a candle after mitigation reached that frozen leg target | no |
 | stopped | the stop was reached after mitigation | no |
 | expired | optional positive `setup_max_bars` limit elapsed (disabled by default) | no |
 | invalidated | stop was reached while still unmitigated; no trade was filled | no |
@@ -142,10 +142,21 @@ edge plus `breaker_stop_buffer_atr` (shipped as 0.10 ATR): above the breaker hig
 for shorts, below its low for longs. A breaker is omitted if that local stop would
 not improve risk over the structural stop.
 
+The exit comes from the same displacement leg as confirmation, not a fixed R
+multiple. The leg starts on the selected sweep candle and includes the candle
+that both prints the directed HVB and body-closes through the paired endpoint.
+For SHORT, its favorable extreme is the lowest low; for LONG, the highest high.
+Every fully closed candle while the setup remains pending may extend that extreme.
+
 At mitigation—and not at the break close—the engine freezes entry and the
-selected post-fill stop, then computes `target = entry ± 4 × |entry − stop|`. If
-a mitigation candle also reaches stop and target, stop wins; if it reaches a zone
-and stop, the row is `stopped`, not the factually wrong “unfilled invalidated”.
+selected post-fill stop plus the **previous** favorable leg extreme. The
+mitigation candle is deliberately excluded: OHLC data cannot prove whether its
+extreme happened before or after the zone touch, so using it would improve the
+exit retrospectively. For the same reason, a target touch on the mitigation
+candle is not awarded as a win; a later candle must revisit it. A same-candle
+zone-and-stop touch is conservatively `stopped`, not the factually wrong
+“unfilled invalidated”. Winning R is `(entry − leg low) / initial risk` for SHORT
+or `(leg high − entry) / initial risk` for LONG; therefore R varies by setup.
 
 ## 5. What the page draws
 
@@ -158,7 +169,7 @@ For the selected setup, on real candles:
 | blue box | order block, from the last opposite candle before displacement |
 | purple box | paired-endpoint breaker, only for an aggressive shift |
 | dashed purple | the liquidity level that was swept |
-| dashed white / red / green | mitigation entry, stop, and fixed 4R target; entry/target begin at mitigation |
+| dashed white / red / green | mitigation entry, stop, and frozen confirmation-leg H/L target; entry/target begin at mitigation |
 | vertical line | the candle the setup confirmed on |
 
 The markers are computed with the same functions the live engine uses
@@ -200,6 +211,6 @@ python -m pytest tests -q           # deterministic offline suite
 
 The current structural-context rules are documented in
 [`trend-rules.md`](trend-rules.md). Its old measurements are explicitly labelled
-legacy; no current v4 win rate is claimed without replaying compatible real data.
+legacy; no current lifecycle-v5 win rate is claimed without replaying compatible real data.
 The page shows the evidence and rejection reason instead of asking you to trust a
 silent decision.

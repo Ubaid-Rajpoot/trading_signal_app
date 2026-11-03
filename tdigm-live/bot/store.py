@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS signals (
     target_2r    REAL,
     target_rr    REAL,
     target_rr_price REAL,
+    target_model TEXT,
+    leg_target   REAL,
+    leg_target_ms INTEGER,
+    leg_start_ms INTEGER,
+    leg_break_ms INTEGER,
     rr           REAL,
     r_now        REAL,
     score        REAL,
@@ -97,6 +102,11 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("session", "ALTER TABLE signals ADD COLUMN session TEXT"),
     ("target_rr", "ALTER TABLE signals ADD COLUMN target_rr REAL"),
     ("target_rr_price", "ALTER TABLE signals ADD COLUMN target_rr_price REAL"),
+    ("target_model", "ALTER TABLE signals ADD COLUMN target_model TEXT"),
+    ("leg_target", "ALTER TABLE signals ADD COLUMN leg_target REAL"),
+    ("leg_target_ms", "ALTER TABLE signals ADD COLUMN leg_target_ms INTEGER"),
+    ("leg_start_ms", "ALTER TABLE signals ADD COLUMN leg_start_ms INTEGER"),
+    ("leg_break_ms", "ALTER TABLE signals ADD COLUMN leg_break_ms INTEGER"),
     ("lifecycle_version", "ALTER TABLE signals ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1"),
     ("mitigation_kind", "ALTER TABLE signals ADD COLUMN mitigation_kind TEXT"),
     ("state_reason", "ALTER TABLE signals ADD COLUMN state_reason TEXT"),
@@ -104,7 +114,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_LIFECYCLE_VERSION = 4
+CURRENT_LIFECYCLE_VERSION = 5
 
 
 def _num(value: Any) -> float | None:
@@ -145,6 +155,11 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "target_2r": _num(payload.get("target_2r")),
         "target_rr": _num(payload.get("target_rr")),
         "target_rr_price": _num(payload.get("target_rr_price")),
+        "target_model": payload.get("target_model"),
+        "leg_target": _num(payload.get("leg_target")),
+        "leg_target_ms": _int(payload.get("leg_target_ms")),
+        "leg_start_ms": _int(payload.get("leg_start_ms")),
+        "leg_break_ms": _int(payload.get("leg_break_ms")),
         "rr": _num(payload.get("rr")),
         "r_now": _num(payload.get("r_now")),
         "score": _num(payload.get("score")),
@@ -259,7 +274,8 @@ class SignalStore:
                             "state", "valid", "mitigated", "closed_ms", "state_since",
                             "touched_ms", "bars", "r_now", "last_price", "be_ms",
                             "entry", "stop", "stop0", "risk0", "target", "target_2r",
-                            "target_rr", "target_rr_price", "rr", "zone", "zones",
+                            "target_rr", "target_rr_price", "target_model", "leg_target",
+                            "leg_target_ms", "leg_start_ms", "leg_break_ms", "rr", "zone", "zones",
                             "mitigation_kind", "mitigation_zone", "state_reason",
                             "breakeven_at_r", "chain_valid", "chain_errors",
                             "integrity_checked_ms", "invalid_reason",
@@ -270,7 +286,8 @@ class SignalStore:
                         for key in (
                             "state", "valid", "mitigated", "closed_ms", "state_since",
                             "touched_ms", "bars", "r_now", "entry", "target", "target_rr",
-                            "target_rr_price", "stop", "rr", "zone", "mitigation_kind",
+                            "target_rr_price", "target_model", "leg_target", "leg_target_ms",
+                            "leg_start_ms", "leg_break_ms", "stop", "rr", "zone", "mitigation_kind",
                             "state_reason",
                         ):
                             updates.pop(key, None)
@@ -496,28 +513,39 @@ class SignalStore:
             try:
                 rows = self._db.execute(
                     "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target, "
-                    "target_rr, mitigated, lifecycle_version FROM signals "
-                    "WHERE lifecycle_version >= ?",
-                    (CURRENT_LIFECYCLE_VERSION,),
+                    "target_rr, target_model, mitigated, lifecycle_version FROM signals "
+                    "WHERE lifecycle_version = ? AND target_model = ?",
+                    (CURRENT_LIFECYCLE_VERSION, "hvb_bos_leg_extreme_v1"),
                 ).fetchall()
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
 
         def r_of(row: sqlite3.Row) -> float:
-            """Risk units won or lost - the trade's own outcome, not a convention.
+            """Risk units won or lost from the trade's actual frozen prices.
 
-            Current lifecycle rows store realised post-mitigation R: +4R at the
-            fixed target, -1R at the stop, and 0R at break-even. Unfilled
-            invalidations never enter this sample. Rows missing ``r_now`` fall
-            back to their configured target-R value.
+            Lifecycle-v5 wins resolve at their own confirmation-leg H/L, so R is
+            variable. Unfilled invalidations never enter the sample. ``r_now`` is
+            authoritative; the price calculation is only for migrated v5 rows.
             """
             if row["state"] == "breakeven":
                 return 0.0
             stored = row["r_now"] if "r_now" in row.keys() else None
             if stored is not None:
                 return float(stored)
-            return float(row["target_rr"] or 4.0) if row["state"] == "win" else -1.0
+            if row["state"] == "win":
+                entry, stop, target = row["entry"], row["stop"], row["target"]
+                if entry is not None and stop is not None and target is not None:
+                    risk = abs(float(entry) - float(stop))
+                    move = (
+                        float(entry) - float(target)
+                        if str(row["side"]).upper() == "SHORT"
+                        else float(target) - float(entry)
+                    )
+                    if risk > 0 and move > 0:
+                        return move / risk
+                return float(row["target_rr"] or 0.0)
+            return -1.0
 
         def summarise(rows: list[sqlite3.Row]) -> dict[str, Any]:
             trades = [r for r in rows if bool(r["mitigated"])]
@@ -565,9 +593,13 @@ class SignalStore:
 
         out: dict[str, Any] = {
             "all": summarise(list(rows)),
-            "r_basis": "fixed 1:4 target after mitigation; invalidated/unfilled setups excluded",
+            "r_basis": (
+                "HVB/BOS confirmation-leg H/L frozen immediately before mitigation; "
+                "invalidated/unfilled setups excluded"
+            ),
             "lifecycle_version": CURRENT_LIFECYCLE_VERSION,
-            "target_rr": 4.0,
+            "target_model": "hvb_bos_leg_extreme_v1",
+            "target_rr": None,
         }
         # every dimension the page filters on is also a dimension the scanner is
         # *judged* on: these are the buckets a trader would actually split by

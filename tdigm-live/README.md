@@ -190,11 +190,14 @@ reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
 
 ### What the page shows (round 18)
 
-* **Setups** on the left, newest first, each with entry / stop / post-mitigation
-  4R target / score and an explained **state**. `pending` has no trade or target;
-  `active` means an order block or eligible aggressive-shift breaker was mitigated
-  and the target is armed. It then becomes `win` at +4R or `stopped` at −1R.
-  `invalidated` means the stop went first while still unfilled, and the stored
+* **Setups** on the left, newest first, each with entry / stop / confirmation-leg
+  target / score and an explained **state**. While `pending`, the target preview
+  follows the favorable extreme of the sweep→same-candle HVB/BOS displacement
+  leg, but no trade exists yet. `active` means an order block or eligible
+  aggressive-shift breaker was mitigated; the last fully closed pre-mitigation
+  H/L is then frozen as the target. A later target revisit becomes `win`, while
+  a post-fill stop becomes `stopped`. `invalidated` means the stop went first
+  while still unfilled, and the stored
   `state_reason` says exactly which rule fired. With `setup_max_bars: 0`, age
   alone never expires an untouched setup.
 * **Setup-centred chart** on the right, drawn from real exchange candles. When
@@ -202,8 +205,9 @@ reproduction commands are in [`docs/trend-rules.md`](docs/trend-rules.md).
   merely the latest 180 candles—so the swept H/L and break candle cannot vanish
   off-screen. The sweep candle/level is amber, the entire setup window is
   shaded, and the opposite body-break + same-candle HVB is outlined blue.
-  Order-block and breaker-block zones are separately labelled. Entry and 4R
-  begin at the mitigation candle—not the breakout—while the stop remains visible
+  Order-block and breaker-block zones are separately labelled. Entry and the
+  frozen confirmation-leg target begin at the mitigation candle—not the
+  breakout—while the stop remains visible
   from confirmation. Time/price axes, crosshair OHLC, drag-pan, wheel/axis zoom,
   fullscreen and reset-to-setup match the SMC-Radar chart.
 * **Filters**: symbol search, timeframe chips (1m … 1d), side, grade, state and
@@ -230,11 +234,15 @@ life - `pending → active → win | stopped | expired`. A restart shows the arc
 **before a single candle arrives** and rehydrates every valid current-policy row
 into the live state machine, so later candles can mitigate or invalidate it. An
 outcome is write-once within one lifecycle version. Lifecycle v2 introduced
-mitigation-first 4R; v3 added breaker-local stops and one selected structural
-sweep; v4 adds the tick/cross degree-aware outer-leg model and full remembered
-trend consistency. Deep replay intentionally replaces outcomes graded under any
-older rule set. The board
-computes win rate and R/trade from current-version mitigated rows, not memory.
+mitigation-first fixed 4R; v3 added breaker-local stops and one selected
+structural sweep; v4 added the tick/cross degree-aware outer-leg model and full
+remembered trend consistency. **Lifecycle v5 replaces the fixed exit** with the
+favorable H/L of the displacement leg that starts at the sweep and contains the
+same-candle HVB/body break. Fully closed pending candles may extend that extreme;
+the mitigation candle is excluded and the previous extreme freezes on fill.
+Deep replay intentionally replaces outcomes graded under any older rule set. The
+board computes win rate and R/trade from current-version mitigated rows, not
+memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
 `exactly one paired-leg H/L sweep → later body close through that same leg's opposite endpoint → correctly directed same-candle HVB`.
@@ -242,15 +250,25 @@ Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
 
-> win rate = 4R wins / (4R wins + stopped trades), after mitigation only
+> win rate = confirmation-leg target wins / (target wins + stopped trades), after mitigation only
 
 `include archive` (on by default) merges the stored list into the setups card;
-`GET /api/signals` and `GET /api/signals.csv` read the same rows. Current rows
-score +4R for a target, −1R for a stop and exclude unfilled invalidations from
-trade results; the break-even win rate before fees is 20%.
+`GET /api/signals` and `GET /api/signals.csv` read the same rows. A winning row's
+R is its frozen target distance divided by initial risk; a stop is −1R. Unfilled
+invalidations are excluded. Because each setup has a different reward distance,
+there is no universal fixed break-even percentage.
 `tools/backfill_archive.py` fills the archive from recorded candles and walks each
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
+
+A deterministic lifecycle-v5 regression over 1,317,520 BTCUSDT one-minute bars
+(2022-07-01 through 2024-12-31), rolled into all nine configured timeframes,
+retained 109 setups: 24 target wins, 84 stops, and one still-pending unmitigated
+setup. That sample's win rate was 22.22%, mean result −0.256R/trade, and 95%
+interval −0.701R to +0.189R (**not proven**). It is a single-symbol regression,
+not a claim about the live MEXC universe. Input hash, exact command, per-timeframe
+counts, and limitations are in
+[`docs/lifecycle-v5-regression-2026-11-03.md`](docs/lifecycle-v5-regression-2026-11-03.md).
 
 ### Concurrent history and live scanning
 
@@ -425,7 +443,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **premium / discount** | off, 0.5 | the sweep (or the entry) must sit in premium for shorts / discount for longs |
 | **centre band** | middle of bands | `mbl` (yellow line, middle of upper/lower) or `fifty` (the 50 axis) |
 | **20-bar break** | off | the older rule (close beyond the last 20 highs/lows) as an extra condition |
-| **min R:R** | 0 | skip setups whose target pays less than this |
+| **min R:R** | 0 | legacy/provisional confirmation-close gate; keep at 0 because the final entry, stop and variable target R are not all frozen until mitigation |
 | **max bars after sweep** | 0 | skip reversals that took too long to arrive |
 | **sides** | both | long only / short only |
 | **trend** | off | with / against an EMA (length configurable) |
@@ -433,7 +451,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **cooldown** | 0 | quiet period per instrument+timeframe after a signal |
 | **swing length** | 5 | how big a swing must be to count as liquidity |
 | **max wait / level memory** | 60 / 180 | how long a sweep may take to confirm, how long a level stays valid |
-| **post-mitigation target** | 4R | armed only when an order block or eligible breaker is touched |
+| **post-mitigation target** | confirmation-leg H/L | favorable sweep→HVB/BOS leg extreme extends on fully closed pending candles, then freezes immediately before an order-block or eligible-breaker touch |
 | **breaker aggression** | 1.0 ATR body | paired endpoint candle is a breaker only when the directed break body meets this threshold |
 | **breaker stop buffer** | 0.10 ATR | after breaker mitigation, stop just beyond that block's distal edge; order blocks retain the sweep stop |
 | **structural draw** | range extreme | `range` / `next` remains context, not the scored exit |
@@ -441,15 +459,15 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 Every rejection is counted and shown ("no HVB on this candle 623"), so a quiet
 screen is explained instead of looking broken.
 
-### Legacy regime experiment (not current v4 results)
+### Legacy regime experiment (not current v5 results)
 
 The tables below are retained as an audit of an earlier detector and its
 range-extreme/2R research scoring. They predate exactly-one-sweep validation,
-strict left-context structure, breaker-local stops, mitigation-only 4R outcomes,
-and the current ADX 22 / ER 0.30 policy. They **must not** be quoted as the
-current win rate. No compatible local candle set is present in this checkout and
-MEXC is unreachable from the development sandbox, so there is no honest v4
-historical result to report yet.
+strict left-context structure, breaker-local stops, mitigation-first activation,
+the confirmation-leg H/L exit, and the current ADX 22 / ER 0.30 policy. They
+**must not** be quoted as the current win rate. No compatible local candle set is
+present in this checkout and MEXC is unreachable from the development sandbox,
+so there is no honest lifecycle-v5 historical result to report yet.
 
 The earlier experiment used two years of BTCUSDT 1-minute candles. One year was
 the exploratory sample and the other was held out.
@@ -495,9 +513,9 @@ with and without that trend gate:
 | 2023-07 → 2024-06 | −0.03 | −0.09 |
 
 Read that honestly: the legacy trend gate was a discipline rule, not proven
-alpha. Current lifecycle-v4 results must instead count only setups that meet the
+alpha. Current lifecycle-v5 results must instead count only setups that meet the
 new structure rules, are actually mitigated, and then reach either their
-post-fill stop or fixed 4R target.
+post-fill stop or their frozen confirmation-leg H/L target.
 
 Re-run the current policy on a compatible local dataset (the counts will not
 match the superseded tables above):
@@ -637,6 +655,6 @@ tdigm-live/
 | `check` fails on REST and websocket | network/DNS/VPN blocks the exchange. Try the other exchange, a VPN, or another machine. |
 | page says `disconnected` | browser lost the websocket; it reconnects by itself. Check the server terminal. |
 | instruments stay `warming` | TDIGM needs ~110 candles per timeframe. Live warms from REST at start; replay needs those candles to play. |
-| very few alerts | that is the strategy. Untick "setups only" to see the sweeps; loosen HVB or `min_rr` in ⚙. |
+| very few alerts | inspect `/api/health` coverage and the rejection funnel first; untick "setups only" to see sweeps. Do not loosen the mandatory same-candle HVB/structure chain to manufacture signals. |
 | "add all" stops early | `max_symbols` safety cap (shipped as 2000). Raise it only if an exchange lists more active contracts. |
 | MEXC stream silent but REST fine | MEXC occasionally rate-limits new sockets; the feed reconnects with backoff. Try `--exchange binance` to compare. |

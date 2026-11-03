@@ -9,8 +9,8 @@ scrolled away, and there was no such thing as "the state of a setup".
 Here every published setup becomes a record with a state machine:
 
     pending      neither the order block nor eligible breaker was mitigated
-    active       a mitigation fixed the entry and armed the 1:4 target
-    win          the post-mitigation 4R target was reached
+    active       a mitigation fixed the entry and armed the confirmation-leg H/L target
+    win          the post-mitigation leg target was reached
     stopped      the post-mitigation stop was reached
     expired      optional positive max-bars limit elapsed (disabled by default)
     invalidated  the stop was taken before any mitigation (no trade was filled)
@@ -38,8 +38,11 @@ from typing import Any
 
 VALID = {"pending", "active"}
 DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
-LIFECYCLE_VERSION = 4
+LIFECYCLE_VERSION = 5
+# Retained for book-plan compatibility only. Sweep setups use the frozen H/L of
+# their own HVB/BOS confirmation leg and derive the achieved R from that price.
 DEFAULT_TARGET_RR = 4.0
+LEG_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
 def order_block(candles: list[dict], side: str, lookback: int = 12) -> dict[str, Any] | None:
@@ -180,7 +183,12 @@ class SetupRecord:
     bos_level: float
     bos_ms: int
     zones: list[dict[str, Any]] = field(default_factory=list)
-    target_rr: float = DEFAULT_TARGET_RR
+    target_rr: float | None = None  # actual R to the frozen target after mitigation
+    target_model: str = LEG_TARGET_MODEL
+    leg_target: float | None = None
+    leg_target_ms: int | None = None
+    leg_start_ms: int | None = None
+    leg_break_ms: int | None = None
     lifecycle_version: int = LIFECYCLE_VERSION
     mitigation_kind: str | None = None
     mitigation_zone: dict[str, Any] | None = None
@@ -210,7 +218,8 @@ class SetupRecord:
 
     def __post_init__(self) -> None:
         self.state_since = self.created_ms
-        self.target_rr = max(0.1, float(self.target_rr or DEFAULT_TARGET_RR))
+        if self.target_rr is not None:
+            self.target_rr = max(0.0, float(self.target_rr))
         if not self.stop0:
             self.stop0 = self.stop
         if self.zone is None:
@@ -219,21 +228,28 @@ class SetupRecord:
         if not self.zones:
             self.zones = [self.zone]
         # Risk/reward does not exist until mitigation creates an actual fill.
-        # Book plans are born active; sweep plans are born pending.
+        # The target level can be known while pending, but `target` remains
+        # unarmed: the favorable confirmation-leg extreme keeps extending until
+        # the first later candle mitigates an eligible zone.
+        if self.leg_target is None and self.target is not None:
+            self.leg_target = float(self.target)
         if self.state == "active" or self.touched_ms is not None:
             if not self.risk0:
                 self.risk0 = abs(self.entry - self.stop)
-            if self.risk0 > 0:
-                if self.rr is None:
-                    self.rr = self.target_rr
-                if self.target is None:
-                    self.target = (
-                        self.entry - self.target_rr * self.risk0 if self.side == "SHORT"
-                        else self.entry + self.target_rr * self.risk0
-                    )
+            if self.target is None and self.leg_target is not None:
+                self.target = float(self.leg_target)
+            if self.risk0 > 0 and self.target is not None:
+                reward = (
+                    self.entry - self.target if self.side == "SHORT"
+                    else self.target - self.entry
+                )
+                actual_rr = max(0.0, reward / self.risk0)
+                self.rr = round(actual_rr, 4)
+                self.target_rr = self.rr
         elif self.state == "pending":
             self.target = None
             self.rr = None
+            self.target_rr = None
             self.risk0 = 0.0
 
     # ------------------------------------------------------------------ view
@@ -254,15 +270,10 @@ class SetupRecord:
 
     @property
     def target_rr_price(self) -> float | None:
-        """The fixed-R target, available only after a mitigation fill."""
-        if not self.mitigated:
+        """Compatibility field: the armed leg target after mitigation."""
+        if not self.mitigated or self.target is None:
             return None
-        risk = self.risk0 or abs(self.entry - self.stop0)
-        if risk <= 0:
-            return None
-        if self.side == "SHORT":
-            return self.entry - self.target_rr * risk
-        return self.entry + self.target_rr * risk
+        return self.target
 
     @property
     def target_2r(self) -> float | None:
@@ -293,7 +304,7 @@ class SetupRecord:
             if target is None:
                 return None
             move = (self.entry - target) if self.side == "SHORT" else (target - self.entry)
-            return round(move / risk, 2)
+            return round(move / risk, 4)
         if self.state == "stopped":
             move = (self.stop0 - self.entry) if self.side == "SHORT" else (self.entry - self.stop0)
             return round(-abs(move) / risk, 2)
@@ -333,6 +344,11 @@ class SetupRecord:
             "target_2r": None,  # retained only so old CSV consumers do not break
             "target_rr": self.target_rr,
             "target_rr_price": None if self.target_rr_price is None else round(self.target_rr_price, 8),
+            "target_model": self.target_model,
+            "leg_target": None if self.leg_target is None else round(self.leg_target, 8),
+            "leg_target_ms": self.leg_target_ms,
+            "leg_start_ms": self.leg_start_ms,
+            "leg_break_ms": self.leg_break_ms,
             "rr": self.rr,
             "r_now": self.realized_r if self.state in DONE else self.r_multiple(),
             "zone": self.zone,
@@ -363,12 +379,30 @@ class SetupRecord:
         }
 
     # --------------------------------------------------------------- lifecycle
-    def advance(self, bar: dict, max_bars: int | None = None) -> bool:
-        """Advance one closed candle through mitigation, 4R target, and stop.
+    def _extend_pending_leg(self, high: float, low: float, at: int) -> bool:
+        """Extend only the favorable extreme before the mitigation candle.
 
-        No P/L is measured while pending. The first order-block or eligible
-        breaker-block touch creates the fill and therefore creates risk and the
-        fixed-R target. If one candle contains both stop and target, stop wins.
+        SHORT confirmation legs seek their low; LONG legs seek their high. The
+        mitigation candle is deliberately excluded because OHLC cannot prove
+        whether its extension happened before or after it touched the entry zone.
+        """
+        candidate = low if self.side == "SHORT" else high
+        if self.leg_target is None:
+            self.leg_target, self.leg_target_ms = candidate, at
+            return True
+        improved = candidate < self.leg_target if self.side == "SHORT" else candidate > self.leg_target
+        if improved:
+            self.leg_target, self.leg_target_ms = candidate, at
+        return improved
+
+    def advance(self, bar: dict, max_bars: int | None = None) -> bool:
+        """Advance one closed candle through mitigation, leg target, and stop.
+
+        No P/L is measured while pending. The confirmation leg starts at the
+        sweep and contains the same-candle HVB/body break. Its favorable extreme
+        may extend on later pending candles. The first order-block or eligible
+        breaker-block mitigation freezes that prior extreme as the target. If one
+        candle contains both stop and target, stop wins.
         """
         if self.state in DONE:
             return False
@@ -409,32 +443,44 @@ class SetupRecord:
                     self.state_reason = "mitigation zone produced no correctly sided risk to the stop"
                     return True
 
+                target = self.leg_target
+                reward = (
+                    fill - target if self.side == "SHORT" and target is not None
+                    else target - fill if self.side == "LONG" and target is not None
+                    else 0.0
+                )
+                if target is None or reward <= 0:
+                    self.state, self.state_since, self.closed_ms = "invalidated", at, at
+                    self.state_reason = (
+                        "confirmation-leg target was missing or not beyond the mitigation entry; "
+                        "no trade was armed"
+                    )
+                    return True
+
                 self.entry = fill
                 self.stop0 = self.stop
                 self.risk0 = risk
-                self.rr = self.target_rr
-                self.target = (
-                    fill - self.target_rr * risk if self.side == "SHORT"
-                    else fill + self.target_rr * risk
-                )
+                self.target = float(target)
+                self.rr = round(reward / risk, 4)
+                self.target_rr = self.rr
                 self.touched_ms = at
                 self.mitigation_zone = dict(selected)
                 self.mitigation_kind = str(selected.get("type") or selected.get("kind") or "zone")
                 self.state, self.state_since = "active", at
                 stop_note = " with buffered breaker stop" if self.mitigation_kind == "breaker_block" else ""
+                target_name = "leg low" if self.side == "SHORT" else "leg high"
                 self.state_reason = (
                     f"mitigated at the {self.mitigation_kind}{stop_note}; "
-                    f"fixed 1:{self.target_rr:g} target armed"
+                    f"HVB/BOS confirmation-{target_name} target armed ({self.rr:.2f}R)"
                 )
 
                 hit_stop = high >= self.stop if self.side == "SHORT" else low <= self.stop
-                hit_target = low <= self.target if self.side == "SHORT" else high >= self.target
                 if hit_stop:
                     self.state, self.closed_ms = "stopped", at
                     self.state_reason = "mitigated and stopped on the same candle (conservative ordering)"
-                elif hit_target:
-                    self.state, self.closed_ms = "win", at
-                    self.state_reason = f"mitigated and reached the 1:{self.target_rr:g} target"
+                # Never award a target on the mitigation candle: OHLC cannot
+                # prove whether its favorable extreme occurred before or after
+                # the zone touch. A later candle must revisit the frozen H/L.
                 return True
 
             if beyond_stop:
@@ -442,11 +488,12 @@ class SetupRecord:
                 kinds = "/".join(sorted({str(z.get("type") or "zone") for z in self.zones}))
                 self.state_reason = f"stop was reached before {kinds or 'entry-zone'} mitigation; no trade was filled"
                 return True
+            leg_extended = self._extend_pending_leg(high, low, at)
             if limit > 0 and self.bars >= limit:
                 self.state, self.state_since, self.closed_ms = "expired", at, at
                 self.state_reason = "the unmitigated setup exceeded its configured bar limit"
                 return True
-            return False
+            return leg_extended
 
         # Active means mitigation already happened, so stop/target now count.
         stop_level = self.stop
@@ -464,7 +511,7 @@ class SetupRecord:
             return True
         if hit_target:
             self.state, self.state_since, self.closed_ms = "win", at, at
-            self.state_reason = f"fixed 1:{self.target_rr:g} target reached after mitigation"
+            self.state_reason = "frozen HVB/BOS confirmation-leg target reached after mitigation"
             return True
 
         changed = False

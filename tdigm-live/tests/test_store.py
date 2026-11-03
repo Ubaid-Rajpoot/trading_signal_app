@@ -13,6 +13,7 @@ so far. These tests pin what the database has to guarantee:
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -21,7 +22,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot.engine import Engine  # noqa: E402
-from bot.store import SignalStore, row_of  # noqa: E402
+from bot.store import SCHEMA, SignalStore, row_of  # noqa: E402
 
 PAYLOAD = {
     "key": "BTCUSDT|1h|1700000000000",
@@ -36,7 +37,12 @@ PAYLOAD = {
     "entry": 100.0,
     "stop": 104.0,
     "target": 92.0,
-    "target_2r": 92.0,
+    "target_2r": None,
+    "target_model": "hvb_bos_leg_extreme_v1",
+    "leg_target": 92.0,
+    "leg_target_ms": 1_699_999_900_000,
+    "leg_start_ms": 1_699_996_400_000,
+    "leg_break_ms": 1_700_000_000_000,
     "rr": 2.0,
     "score": 100.0,
     "zone": {"high": 101.0, "low": 99.0, "mid": 100.0},
@@ -68,6 +74,7 @@ def test_a_row_carries_everything_a_trader_filters_on():
     assert row["symbol"] == "BTCUSDT" and row["timeframe"] == "1h"
     assert row["zone_high"] == 101.0 and row["zone_low"] == 99.0
     assert row["depth"] == 2 and row["grade"] == "A"
+    assert row["target_model"] == "hvb_bos_leg_extreme_v1" and row["leg_target"] == 92.0
     assert json.loads(row["evidence"])[0].startswith("swept the high")
     assert json.loads(row["payload"])["key"] == PAYLOAD["key"]
 
@@ -127,13 +134,13 @@ def test_a_new_lifecycle_version_can_regrade_an_old_final_outcome(tmp_path):
     store.record({**PAYLOAD, "state": "win", "valid": False, "r_now": 2.0})
     upgraded = {
         **PAYLOAD,
-        "lifecycle_version": 4,
+        "lifecycle_version": 5,
         "state": "pending", "valid": True, "mitigated": False,
         "target": None, "rr": None, "r_now": None,
     }
     store.record(upgraded)
     row = store.get(PAYLOAD["key"])
-    assert row["lifecycle_version"] == 4
+    assert row["lifecycle_version"] == 5
     assert row["state"] == "pending" and row["target"] is None
 
 
@@ -150,6 +157,28 @@ def test_the_archive_outlives_the_process(tmp_path):
     )
 
 
+def test_an_existing_database_is_migrated_for_confirmation_leg_evidence(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    new_columns = {
+        "target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms",
+    }
+    legacy_schema = "\n".join(
+        line for line in SCHEMA.splitlines()
+        if not line.strip().split(maxsplit=1)[0:1]
+        or line.strip().split(maxsplit=1)[0] not in new_columns
+    )
+    with sqlite3.connect(path) as database:
+        database.executescript(legacy_schema)
+
+    store = SignalStore(path)
+    assert store.enabled and store.record({**PAYLOAD, "lifecycle_version": 5})
+    columns = {row[1] for row in store._db.execute("PRAGMA table_info(signals)").fetchall()}
+    assert new_columns <= columns
+    restored = store.get(PAYLOAD["key"])
+    assert restored["target_model"] == "hvb_bos_leg_extreme_v1"
+    assert restored["leg_target"] == 92.0
+
+
 def test_filters_read_the_archive_not_the_process(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
     store.record(PAYLOAD)
@@ -160,22 +189,34 @@ def test_filters_read_the_archive_not_the_process(tmp_path):
     assert store.list(valid=0) == []
 
 
-def test_results_are_4r_after_mitigation_and_exclude_legacy_or_unfilled_rows(tmp_path):
+def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
-    current = {**PAYLOAD, "lifecycle_version": 4, "mitigated": True, "target_rr": 4.0}
-    store.record({**current, "key": "A", "state": "win", "valid": False, "r_now": 4.0})
-    store.record({**current, "key": "B", "state": "stopped", "valid": False, "r_now": -1.0})
+    current = {
+        **PAYLOAD,
+        "lifecycle_version": 5,
+        "target_model": "hvb_bos_leg_extreme_v1",
+        "mitigated": True,
+    }
+    store.record({**current, "key": "A", "state": "win", "valid": False,
+                  "target_rr": 2.25, "r_now": 2.25})
+    store.record({**current, "key": "B", "state": "stopped", "valid": False,
+                  "target_rr": 1.4, "r_now": -1.0})
     store.record({**current, "key": "C", "state": "pending", "valid": True,
-                  "mitigated": False, "r_now": None})
+                  "mitigated": False, "target_rr": None, "r_now": None})
     store.record({**PAYLOAD, "key": "legacy", "state": "win", "valid": False})
+    store.record({**current, "key": "book", "state": "win", "valid": False,
+                  "target_model": "book_plan", "r_now": 9.0})
+    store.record({**current, "key": "future", "state": "win", "valid": False,
+                  "lifecycle_version": 6, "r_now": 9.0})
     results = store.results()["all"]
     assert results["wins"] == 1 and results["losses"] == 1
     assert results["mitigated"] == 2
     assert results["win_rate"] == 0.5
-    assert results["r_per_trade"] == 1.5, "(+4R - 1R) / 2 decided mitigated trades"
+    assert results["r_per_trade"] == 0.625, "(+2.25R - 1R) / 2 decided mitigated trades"
     full = store.results()
-    assert full["target_rr"] == 4.0 and full["lifecycle_version"] == 4
-    assert "after mitigation" in full["r_basis"]
+    assert full["target_rr"] is None and full["lifecycle_version"] == 5
+    assert full["target_model"] == "hvb_bos_leg_extreme_v1"
+    assert "confirmation-leg H/L" in full["r_basis"]
 
 
 def test_a_broken_disk_never_stops_the_scanner(tmp_path):
@@ -202,7 +243,7 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     current = {
         **PAYLOAD,
         "chain_version": 4,
-        "lifecycle_version": 4,
+        "lifecycle_version": 5,
         "setup": {
             **PAYLOAD["setup"],
             "leg_model": "directional_outer_v1",
@@ -357,6 +398,38 @@ def test_startup_requires_deep_replay_for_a_tradeable_v3_row(tmp_path):
     assert old_current["key"] not in engine.registry
 
 
+def test_startup_quarantines_v5_without_confirmation_leg_target_proof(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    versioned = {
+        key: value for key, value in PAYLOAD.items()
+        if key not in {"target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms"}
+    }
+    versioned.update({
+        "chain_version": 4,
+        "lifecycle_version": 5,
+        "setup": {
+            **PAYLOAD["setup"],
+            "leg_model": "directional_outer_v1",
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 104.0}],
+            "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
+            "broke_level_time": PAYLOAD["setup"]["sweep_time"] - 1,
+        },
+    })
+    store.record(versioned)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(versioned["key"])
+    assert row["state"] == "invalidated"
+    assert any("confirmation-leg H/L target proof" in reason for reason in row["chain_errors"])
+    assert versioned["key"] not in engine.registry
+
+
 def test_startup_quarantines_v4_without_directional_outer_leg_proof(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
     versioned = {
@@ -389,8 +462,15 @@ def test_the_record_carries_an_honest_error_bar(tmp_path):
     """An average without a confidence interval is a claim the page cannot back."""
     store = SignalStore(tmp_path / "sig.sqlite3")
     for i in range(12):
-        row = dict(PAYLOAD, key=f"BTCUSDT|1h|{1_700_000_000_000 + i}", state="win")
-        store.record(row_of(row))
+        row = dict(
+            PAYLOAD,
+            key=f"BTCUSDT|1h|{1_700_000_000_000 + i}",
+            state="win",
+            mitigated=True,
+            lifecycle_version=5,
+            r_now=1.5 if i % 2 else -1.0,
+        )
+        store.record(row)
     rows = store.results()["all"]
     assert {"se", "t", "ci_low", "ci_high", "verdict", "scored"} <= set(rows)
     assert rows["verdict"] in {"not enough trades", "not proven", "positive", "negative"}

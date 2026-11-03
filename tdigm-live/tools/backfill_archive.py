@@ -50,7 +50,6 @@ async def replay(args: argparse.Namespace, candles: list[dict], store: SignalSto
             "require_bos": args.trend_context,
             "max_internal_depth": 2,
             "hvb_window": args.hvb_window,
-            "setup_target_rr": 4.0,
             "breaker_body_atr": 1.0,
             "breaker_stop_buffer_atr": 0.10,
             "confirm_mode": "all",
@@ -109,7 +108,8 @@ def main() -> int:
           + (" (dry run, nothing written)" if args.dry_run else f" -> {args.db}"))
 
     # The engine has already advanced every setup over every later candle using
-    # the exact live lifecycle: pending until mitigation, then fixed 4R/stop.
+    # the exact live lifecycle: pending leg H/L extension, then freeze before
+    # the mitigation candle and evaluate the variable target or stop.
     # A second formula here used to overwrite that truth with a synthetic 2R
     # result, including setups that were never filled.
     states: Counter[str] = Counter(payload.get("state") or "pending" for payload in setups.values())

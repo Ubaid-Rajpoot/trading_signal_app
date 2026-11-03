@@ -195,7 +195,12 @@ def record(**kwargs) -> SetupRecord:
         stop=104.0,
         target=None,
         rr=None,
-        target_rr=4.0,
+        target_rr=None,
+        target_model="hvb_bos_leg_extreme_v1",
+        leg_target=90.0,
+        leg_target_ms=950,
+        leg_start_ms=900,
+        leg_break_ms=1_000,
         zone={"high": 101.0, "low": 99.0, "mid": 100.0, "type": "order_block"},
         swept_level=104.0,
         swept_side="high",
@@ -219,21 +224,39 @@ def test_a_setup_is_pending_until_price_comes_back_into_the_zone():
     assert setup.advance(bar_at(100.5, 99.2, 100.0)) is True
     assert setup.state == "active" and setup.touched_ms == 2_000
     assert setup.stop == 104.0, "order-block mitigation retains the structural sweep stop"
-    assert setup.target == 79.0 and setup.rr == 4.0
-    assert "fixed 1:4 target armed" in setup.state_reason
+    assert setup.target == 90.0 and setup.rr == 1.8
+    assert "confirmation-leg low target armed" in setup.state_reason
 
 
-def test_active_setup_arms_4r_after_mitigation_then_wins_or_stops():
+def test_confirmation_leg_extends_while_pending_and_excludes_mitigation_candle():
+    setup = record(leg_target=96.0, leg_target_ms=1_000)
+    assert setup.advance(bar_at(97.5, 94.0, 95.0, ms=2_000)) is True
+    assert setup.state == "pending" and setup.leg_target == 94.0
+    assert setup.leg_target_ms == 2_000
+
+    # This candle touches the order block and also wicks much lower. That low is
+    # excluded from the leg definition because OHLC cannot order it against the
+    # mitigation touch; the prior 94 low freezes as the target, and no same-bar
+    # win is awarded.
+    assert setup.advance(bar_at(100.5, 80.0, 99.5, ms=3_000)) is True
+    assert setup.state == "active" and setup.target == 94.0
+    assert setup.leg_target == 94.0 and setup.leg_target_ms == 2_000
+    assert setup.rr == 1.0
+    assert setup.advance(bar_at(99.0, 93.8, 94.2, ms=4_000)) is True
+    assert setup.state == "win"
+
+
+def test_active_setup_arms_the_frozen_leg_low_then_wins_or_stops():
     setup = record()
     setup.advance(bar_at(100.5, 99.2, 100.0))          # filled at zone.low = 99
-    assert setup.entry == 99.0 and setup.target == 79.0 and setup.rr == 4.0
-    assert setup.advance(bar_at(99.0, 78.8, 79.5)) is True
-    assert setup.state == "win" and setup.realized_r == 4.0
+    assert setup.entry == 99.0 and setup.target == 90.0 and setup.rr == 1.8
+    assert setup.advance(bar_at(99.0, 89.8, 90.5)) is True
+    assert setup.state == "win" and setup.realized_r == 1.8
 
     stopped = record()
     stopped.advance(bar_at(100.5, 99.2, 100.0))
-    # one candle touches both the 4R target and the stop: assume the stop
-    assert stopped.advance(bar_at(104.5, 78.5, 100.0)) is True
+    # one candle touches both the leg target and the stop: assume the stop
+    assert stopped.advance(bar_at(104.5, 89.5, 100.0)) is True
     assert stopped.state == "stopped", "both in one bar is a loss, not a win"
 
 
@@ -285,7 +308,8 @@ def test_an_eligible_breaker_can_mitigate_before_the_order_block():
     assert setup.entry == 100.0
     assert setup.stop == setup.stop0 == 101.2, "breaker uses its buffered distal edge, not sweep 104"
     assert setup.risk0 == pytest.approx(1.2)
-    assert setup.target == pytest.approx(95.2)
+    assert setup.target == pytest.approx(90.0)
+    assert setup.rr == pytest.approx(10.0 / 1.2, abs=1e-4)
 
 
 def test_a_breaker_stop_on_the_profit_side_is_rejected():
@@ -302,9 +326,9 @@ def test_a_breaker_stop_on_the_profit_side_is_rejected():
     assert "correctly sided risk" in setup.state_reason
 
 
-def test_long_breaker_touch_arms_the_4r_trade_like_the_bnb_example():
+def test_long_breaker_touch_arms_the_confirmation_leg_high_like_the_bnb_example():
     setup = record(
-        side="LONG", stop=703.7, entry=704.8,
+        side="LONG", stop=703.7, entry=704.8, leg_target=710.0,
         zone={"high": 703.9, "low": 703.75, "type": "order_block", "kind": "demand"},
         zones=[
             {"high": 704.8, "low": 704.6, "type": "breaker_block", "kind": "bullish_breaker",
@@ -316,7 +340,8 @@ def test_long_breaker_touch_arms_the_4r_trade_like_the_bnb_example():
     assert setup.state == "active" and setup.mitigation_kind == "breaker_block"
     assert setup.entry == 704.8
     assert setup.stop == setup.stop0 == 704.5, "long breaker stop sits below its distal low"
-    assert setup.target == pytest.approx(706.0)  # 704.8 + 4 * (704.8 - 704.5)
+    assert setup.target == pytest.approx(710.0)
+    assert setup.rr == pytest.approx((710.0 - 704.8) / (704.8 - 704.5), abs=1e-4)
 
 
 def test_aggressive_same_leg_endpoint_becomes_a_breaker_block():

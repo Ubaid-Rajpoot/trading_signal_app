@@ -39,16 +39,19 @@ be held up by an fsync, and a crash must not corrupt the file.
 |---|---|---|
 | a signal is saved as soon as it exists | `Engine._remember()` on publish and on every state change | `test_the_engine_writes_through_and_reads_back_on_boot` |
 | a restart shows the archive **before any candle arrives** | `load_stored()` at build time, `/api/signals` reads SQLite | `test_the_archive_outlives_the_process` |
-| a decided outcome is final within one lifecycle version | ordinary rescans cannot rewrite it; a versioned rule change (such as post-mitigation 4R) intentionally regrades history | `test_a_decided_outcome_is_final`, `test_a_new_lifecycle_version_can_regrade_an_old_final_outcome` |
+| a decided outcome is final within one lifecycle version | ordinary rescans cannot rewrite it; a versioned exit-rule change intentionally requires deep replay | `test_a_decided_outcome_is_final`, `test_a_new_lifecycle_version_can_regrade_an_old_final_outcome` |
 | a broken disk never stops the scanner | the store degrades to `enabled=False` and reports the problem; `/api/health` shows it | `test_a_broken_disk_never_stops_the_scanner` |
 | old databases keep working | columns added later are migrated in place, never by recreating the table | `MIGRATIONS` in `bot/store.py` |
 
 The "final" rule matters more than it looks. Ordinary rescans cannot turn a win
 back into `pending`. The exception is explicit `lifecycle_version` advancement:
-v2 changed the fill to mitigation and the target to 4R; v3 added one selected
-structural sweep and breaker-local post-fill stops; v4 adds degree-aware clean
-outer legs plus full remembered trend consistency. Rows graded under any older
-rule must be replayed rather than contaminating the current win rate.
+v2 changed the fill to mitigation and used a fixed 4R target; v3 added one
+selected structural sweep and breaker-local post-fill stops; v4 added
+degree-aware clean outer legs plus full remembered trend consistency. Lifecycle
+v5 replaces fixed R with the favorable H/L of the sweep→same-candle HVB/BOS leg,
+extended only by fully closed pre-mitigation candles and frozen before the
+mitigation candle. Rows graded under any older rule must be replayed rather than
+contaminating the current win rate.
 
 ## Reading it back
 
@@ -58,19 +61,23 @@ rule must be replayed rather than contaminating the current win rate.
   cannot take out is a trap.
 * The page has **include archive** (on by default) in the filter bar. The live
   list and the stored list are merged by key; a live row always wins because it
-  is newer. State filters expose pending, active, 4R wins, stops and unfilled
-  invalidations separately, and every row displays its stored `state_reason`.
+  is newer. State filters expose pending, active, confirmation-leg target wins,
+  stops and unfilled invalidations separately, and every row displays its stored
+  `state_reason`.
 
 The archive line on the setups card is computed from current-version rows, not
 from memory:
 
-> win rate = mitigated 4R wins / (mitigated 4R wins + mitigated stops)
+> win rate = mitigated confirmation-leg target wins / (those wins + mitigated stops)
 
-Risk/reward does not begin on the body-break candle. A later order-block or
-eligible aggressive-breaker touch freezes entry and risk; the target is exactly
-**4R** from that fill. A pre-mitigation stop is `invalidated`, carries no realised
-R and is excluded. Legacy 2R studies remain below as labelled historical
-experiments, but they are not mixed into lifecycle-v4 results.
+Risk/reward does not begin on the body-break candle. The target starts as the
+favorable extreme of the sweep→same-candle HVB/BOS displacement leg and may
+extend on fully closed candles while pending. A later order-block or eligible
+aggressive-breaker touch freezes entry, risk, and the last extreme before that
+mitigation candle. The mitigation candle itself is excluded. A pre-mitigation
+stop is `invalidated`, carries no realised R and is excluded. Legacy fixed-R
+studies remain below as labelled historical experiments, but they are not mixed
+into lifecycle-v5 results.
 
 ## Filling it from history
 
@@ -86,9 +93,14 @@ python tools/backfill_archive.py data/btc --symbol BTCUSDT --dry-run  # writes n
 
 An older BTCUSDT 2023-01-01 → 2025-06-30 report produced **107 setups, 43 won,
 54 stopped, 10 never filled under legacy 2R scoring**. It is retained only as a
-historical audit; the backfill command now applies lifecycle v4 and is not
+historical audit; the backfill command now applies lifecycle v5 and is not
 expected to reproduce those counts. A compatible real dataset is not present in
-this checkout, so a current 4R rate is intentionally not claimed.
+this checkout, so that legacy archive cannot provide a current
+confirmation-leg-target rate. A separately fetched, hash-pinned BTCUSDT sample
+was replayed under lifecycle v5 as a deterministic regression; its 22.22% win
+rate and −0.256R/trade were statistically **not proven** and must not be
+extrapolated to the production universe. See
+[`lifecycle-v5-regression-2026-11-03.md`](lifecycle-v5-regression-2026-11-03.md).
 
 ## Thirty instruments at a time
 
@@ -119,7 +131,8 @@ speed-up claim I cannot test at 500 symbols.
 
 The archive made sparsity measurable. The following table is a **legacy gate
 experiment**, retained for reproduction only; it used fixed 2R and does not
-represent the current same-candle HVB, trend-gated, mitigation-first 4R policy:
+represent the current same-candle HVB, trend-gated, mitigation-first
+confirmation-leg-target policy:
 
 | variant | signals | win% | R/trade |
 |---|---|---|---|
@@ -129,7 +142,7 @@ represent the current same-candle HVB, trend-gated, mitigation-first 4R policy:
 
 Those numbers do not override the shipped rules: `hvb_window: 0` requires the
 same candle, and current trend/structure gates remain configured in
-`config.json`. New lifecycle-v4 results are reported separately only after a
+`config.json`. New lifecycle-v5 results are reported separately only after a
 fresh deep replay.
 
 ### A caveat about the grades

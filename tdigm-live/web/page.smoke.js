@@ -111,7 +111,7 @@ async function main() {
         toast: true,
         event: {
           key: `burst-${i}`, title: `LONG SYM${i}USDT 15m`, severity: "action",
-          category: "signal", grade: "A", detail: "entry 1 · draw 2 · 1:4.0",
+          category: "signal", grade: "A", detail: "entry 1 · confirmation-leg target 2 · 1.7R",
           time: Date.now(), count: 1,
         },
       }),

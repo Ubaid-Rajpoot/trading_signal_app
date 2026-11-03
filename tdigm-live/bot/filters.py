@@ -22,10 +22,8 @@ condition on/off or narrows the same condition:
     confirm_mode     "all" = every switched-on condition must hold;
                      "score" = the weighted confluence score must reach
                      confirm_min_score (bos + hvb + volume + fvg + trend + depth)
-    hvb_window       the HVB may print on the break candle or up to N bars after
-                     it (the TDI cross and the structure break are two different
-                     measurements; demanding the same candle was the single
-                     biggest reason a real setup never appeared)
+    hvb_window       retained for configuration compatibility; chain integrity
+                     requires the directed HVB on the body-break candle (0 lag)
     hvb              the TDIGM price line crosses the CENTRE band on the signal bar
     hvb_min_points   and how far past the centre it closed, in RSI points
     hvb_min_speed    and how fast: this candle's step vs the line's average step
@@ -41,7 +39,8 @@ condition on/off or narrows the same condition:
     structure_atr_min / _max  the swept->broken structure has to be this tall (ATR)
     break            the classic 20-bar high/low close break, same bar
     sides            long only / short only / both
-    min_rr           skip setups whose next-liquidity target pays less than this
+    min_rr           legacy provisional gate at confirmation; keep 0 because
+                     actual variable R freezes only at mitigation
     max_bars_since_sweep  skip a reversal that took too long to happen
     trend            "off", "with" (only trade in the EMA direction) or
                      "against" (only the reversal kind)
@@ -68,8 +67,8 @@ DEFAULT_FILTERS: dict[str, Any] = {
     # 0 = an untouched setup remains valid until price invalidates it.  This is
     # essential for historical discovery: age alone is not mitigation.
     "setup_max_bars": 0,
-    # Risk/reward starts at mitigation, never at the body-break close.
-    "setup_target_rr": 4.0,
+    # Risk/reward starts at mitigation, never at the body-break close. The
+    # target price comes from the setup's own HVB/BOS confirmation-leg H/L.
     # A paired endpoint becomes a breaker only after an aggressive price shift.
     "breaker_body_atr": 1.0,
     "breaker_stop_buffer_atr": 0.10,

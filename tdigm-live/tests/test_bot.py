@@ -275,6 +275,9 @@ SHORT_PATTERN = [
 # first takes 106, establishes another high at 107 while oscillating back to the
 # same 95 low, then takes 107 too. That is one run through multiple highs, not a
 # single clean sweep-and-release leg.
+LONG_PATTERN = [(200 - low, 200 - high, 200 - close) for high, low, close in SHORT_PATTERN]
+
+
 OSCILLATING_MULTI_SWEEP_PATTERN = [
     (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
     (105, 100, 101), (101, 96, 97), (98, 95, 96),
@@ -296,13 +299,27 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     assert setup.entry == 91.0
     assert setup.stop == 107.0, "the stop is just beyond the sweep extreme"
     assert setup.broke.price == 95.0, "the opposite swing low is what broke"
-    assert setup.target is None, "no pre-sweep liquidity was left below the entry"
+    assert setup.target == 90.0, "SHORT targets the low of its own sweep-to-HVB/BOS leg"
     proof = setup.as_dict()
+    assert proof["target_model"] == "hvb_bos_leg_extreme_v1"
+    assert proof["confirmation_leg"]["low"] == proof["leg_target"] == 90.0
+    assert proof["confirmation_leg"]["start_time"] == proof["sweep_time"]
+    assert proof["confirmation_leg"]["break_time"] == proof["break_time"]
     assert proof["sweep_time"] < proof["break_time"]
     assert proof["sweep_high"] > proof["swept_level"]
     assert proof["sweep_low"] == 101.0
     assert proof["swept_level"] == 106.0
     assert proof["swept_level_time"] < proof["broke_level_time"] < proof["sweep_time"]
+
+
+def test_sweep_then_opposite_break_makes_a_long_with_its_leg_high_target():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(LONG_PATTERN)
+    assert sweeps and setups
+    _index, setup = setups[0]
+    assert setup.side == "LONG" and setup.target == 110.0
+    proof = setup.as_dict()
+    assert proof["confirmation_leg"]["high"] == proof["leg_target"] == 110.0
+    assert proof["confirmation_leg"]["target_side"] == "high"
 
 
 def test_oscillation_that_takes_two_highs_before_the_break_is_invalid():

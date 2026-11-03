@@ -59,6 +59,7 @@ DEFAULTS: dict[str, Any] = {
 
 SIDES = ("high", "low")
 LEG_MODEL = "directional_outer_v1"
+TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
 @dataclass
@@ -132,6 +133,7 @@ class Setup:
     index: int
     time: int
     broke: Level
+    confirmation_leg: dict[str, Any]
     break_kind: str = "SHIFT"  # "SHIFT" (minor) or "MS" (major, p.53)
 
     def as_dict(self) -> dict[str, Any]:
@@ -141,6 +143,10 @@ class Setup:
             "stop": self.stop,
             "target": self.target,
             "rr": self.rr,
+            "target_model": TARGET_MODEL,
+            "leg_target": self.target,
+            "leg_target_ms": self.confirmation_leg.get("target_time"),
+            "confirmation_leg": self.confirmation_leg,
             "swept_side": self.sweep.side,
             "swept_level": self.sweep.level,
             "swept_count": 1,
@@ -571,11 +577,37 @@ class Structure:
     def _make_setup(self, side: str, bar: dict, index: int, sweep: Sweep) -> Setup:
         entry = float(bar["close"])
         stop = sweep.extreme
-        target_level = self.next_target(side, entry, before=sweep.index)
-        target = target_level.price if target_level else None
+
+        # The target belongs to the new displacement leg that starts with the
+        # selected sweep and contains the same-candle HVB/body break—not to an
+        # unrelated older range and not to an arbitrary R multiple. At structure
+        # time this is the leg-so-far; SetupRecord may extend its favorable H/L
+        # on later pending candles and freezes it immediately before mitigation.
+        first_index = self.count - len(self.highs)
+        start = max(0, min(len(self.highs) - 1, sweep.index - first_index))
+        highs = list(self.highs)[start:]
+        lows = list(self.lows)[start:]
+        times = list(self.times)[start:]
+        high_pos = max(range(len(highs)), key=lambda pos: highs[pos])
+        low_pos = min(range(len(lows)), key=lambda pos: lows[pos])
+        leg_high, leg_low = highs[high_pos], lows[low_pos]
+        target = leg_low if side == "SHORT" else leg_high
+        target_time = times[low_pos] if side == "SHORT" else times[high_pos]
+        confirmation_leg = {
+            "model": TARGET_MODEL,
+            "start_time": sweep.time,
+            "break_time": int(self.times[-1]),
+            "high": leg_high,
+            "high_time": times[high_pos],
+            "low": leg_low,
+            "low_time": times[low_pos],
+            "target_side": "low" if side == "SHORT" else "high",
+            "target": target,
+            "target_time": target_time,
+        }
         risk = abs(entry - stop)
-        reward = abs(target - entry) if target is not None else None
-        rr = (reward / risk) if risk > 0 and reward is not None else None
+        reward = (entry - target) if side == "SHORT" else (target - entry)
+        rr = reward / risk if risk > 0 and reward > 0 else None
         setup = Setup(
             side=side,
             entry=entry,
@@ -586,6 +618,7 @@ class Structure:
             index=index,
             time=int(self.times[-1]),
             broke=sweep.opposite,  # type: ignore[arg-type]
+            confirmation_leg=confirmation_leg,
             break_kind="MS" if getattr(sweep.opposite, "kind", "minor") == "major" else "SHIFT",
         )
         self.last_setup = setup

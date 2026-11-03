@@ -145,6 +145,11 @@
       mitigation_zone: raw.mitigation_zone || null,
       state_reason: raw.state_reason || "",
       target_rr: raw.target_rr,
+      target_model: raw.target_model || "",
+      leg_target: raw.leg_target,
+      leg_target_ms: Number(raw.leg_target_ms || 0),
+      leg_start_ms: Number(raw.leg_start_ms || 0),
+      leg_break_ms: Number(raw.leg_break_ms || 0),
       lifecycle_version: Number(raw.lifecycle_version || 1),
       mitigated: !!raw.mitigated,
       swept_level: raw.swept_level,
@@ -392,12 +397,12 @@
     var rows = [];
     rows.push(row("signals stored", num(counts.total, 0), "every plan ever recorded, across restarts"));
     rows.push(row("mitigated", num(all.mitigated, 0), "order-block or eligible aggressive-breaker touches under the current lifecycle"));
-    rows.push(row("decided", num(all.decided, 0), "mitigated trades closed at fixed 4R or at the stop"));
-    rows.push(row("4R win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
-      "4R wins / (4R wins + stopped trades), after mitigation only. Break-even before fees is 20%."));
+    rows.push(row("decided", num(all.decided, 0), "mitigated trades closed at their frozen confirmation-leg target or at the stop"));
+    rows.push(row("win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
+      "leg-target wins / (leg-target wins + stopped trades), after mitigation only"));
     var rpt = all.r_per_trade;
     rows.push(row("R / trade", rpt == null ? "—" : (rpt > 0 ? "+" : "") + Number(rpt).toFixed(3),
-      "measured only after mitigation: +4R for a target, -1R for a stop"));
+      "measured only after mitigation: variable R at the frozen leg H/L, -1R at the stop"));
     rows.push(row("95% interval", all.ci_low == null ? "—"
       : (all.ci_low > 0 ? "+" : "") + Number(all.ci_low).toFixed(2) + " … "
         + (all.ci_high > 0 ? "+" : "") + Number(all.ci_high).toFixed(2),
@@ -452,12 +457,12 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
-    if (row.lifecycle_version < 2) {
-      bits.push('<div class="chain-invalid"><b>LEGACY LIFECYCLE</b> · excluded from the mitigation-first 4R win rate until deep replay regrades it</div>');
+    if (row.lifecycle_version < 5) {
+      bits.push('<div class="chain-invalid"><b>LEGACY LIFECYCLE</b> · excluded from the confirmation-leg target win rate until deep replay regrades it</div>');
     }
     var stateLabel = stateOf(row).toUpperCase();
     var stateWhy = row.state_reason || (row.state === "pending"
-      ? "waiting for order-block or eligible aggressive-breaker mitigation; no trade or 4R target exists yet"
+      ? "waiting for order-block or eligible aggressive-breaker mitigation; the leg H/L is tracked but no trade target is armed yet"
       : "no lifecycle reason was stored for this legacy row");
     bits.push('<div class="nums"><span>state <b>' + escapeHtml(stateLabel) + "</b> · "
       + escapeHtml(stateWhy) + "</span></div>");
@@ -465,8 +470,11 @@
     ["entry", "stop", "target"].forEach(function (k) {
       if (row[k] !== null && row[k] !== undefined) nums.push(k + " <b>" + escapeHtml(num(row[k])) + "</b>");
     });
-    if (row.rr) nums.push("armed <b>1:" + Number(row.rr).toFixed(1) + " after mitigation</b>");
-    else nums.push("target <b>arms at 1:" + Number(row.target_rr || 4).toFixed(0) + " after mitigation</b>");
+    if (row.rr) nums.push("armed <b>1:" + Number(row.rr).toFixed(2) + " to confirmation-leg H/L</b>");
+    else if (row.leg_target !== null && row.leg_target !== undefined) {
+      nums.push("pending leg " + (sideOf(row) === "short" ? "low" : "high") + " <b>"
+        + escapeHtml(num(row.leg_target)) + "</b> · freezes before mitigation");
+    } else nums.push("target <b>awaiting confirmation-leg H/L proof</b>");
     if (row.mitigation_kind) nums.push("filled from <b>" + escapeHtml(row.mitigation_kind.replace(/_/g, " ")) + "</b>");
     if (row.r_now !== null && row.r_now !== undefined) nums.push("now <b>" + (Number(row.r_now) > 0 ? "+" : "") + Number(row.r_now).toFixed(2) + "R</b>");
     if (row.fee_r !== null && row.fee_r !== undefined) nums.push("fee <b>" + Number(row.fee_r).toFixed(2) + "R</b>");
@@ -486,7 +494,7 @@
     var bucket = bucketRecord(row);
     if (bucket) {
       bits.push('<div class="nums" title="Every mitigated trade in this instrument-timeframe bucket, '
-        + 'at fixed 1:4. Unfilled invalidations are not losses. The interval is what the sample supports.">'
+        + 'at its own frozen confirmation-leg H/L. Unfilled invalidations are not losses. The interval is what the sample supports.">'
         + "<span>" + escapeHtml(row.timeframe) + " " + escapeHtml(sideOf(row)) + " so far: <b>"
         + bucket.decided + "</b> decided · <b>" + (bucket.r_per_trade > 0 ? "+" : "")
         + Number(bucket.r_per_trade || 0).toFixed(2) + "R</b>"
@@ -721,7 +729,8 @@
     for (var i = i0; i <= i1; i++) { lo = Math.min(lo, Number(candles[i].l)); hi = Math.max(hi, Number(candles[i].h)); }
     if (!isFinite(lo) || !isFinite(hi)) return;
     if (selected && breakIndex >= i0 && breakIndex <= i1) {
-      [selected.entry, selected.stop, selected.target, selected.swept_level, selected.bos_level].forEach(function (v) {
+      [selected.entry, selected.stop, selected.target, selected.leg_target,
+        selected.swept_level, selected.bos_level].forEach(function (v) {
         v = Number(v); if (isFinite(v) && v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
       });
       (selected.zones || []).forEach(function (zone) {
@@ -845,16 +854,24 @@
       outlineCandle(breakIndex, "#67a9ff", "BODY BREAK + HVB", false);
     }
 
-    // Entry and 4R begin at mitigation, not at the body-break close. Pending
-    // rows show only a planned fill and invalidation stop.
+    // Entry and the trade target arm at mitigation, not at the body-break close.
+    // Pending rows still show the evolving confirmation-leg H/L as unarmed proof.
     if (selected && breakIndex >= 0) {
       var touchedIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
       var startX = Math.max(padL, x(touchedIndex >= 0 ? touchedIndex : breakIndex));
       var entryLabel = selected.mitigated ? "entry after mitigation" : "planned mitigation fill";
       var breakX = Math.max(padL, x(breakIndex));
+      var targetValue = selected.mitigated ? selected.target : selected.leg_target;
+      var targetLabel = selected.mitigated
+        ? "frozen confirmation-leg target"
+        : "pending leg " + (sideOf(selected) === "short" ? "low" : "high") + " (unarmed)";
+      var targetIndex = selected.leg_target_ms ? barAtTime(candles, selected.leg_target_ms) : -1;
+      var targetStartX = selected.mitigated
+        ? startX
+        : Math.max(padL, x(targetIndex >= 0 ? targetIndex : breakIndex));
       [[selected.entry, "#dfe6f2", entryLabel, [], startX],
         [selected.stop, "#ff5c7a", "stop", [5, 4], breakX],
-        [selected.target, "#2ee6a8", "4R target", [5, 4], startX],
+        [targetValue, "#2ee6a8", targetLabel, [5, 4], targetStartX],
         [selected.bos_level, "#b487ff", "body break", [2, 3], breakX]]
         .forEach(function (line) {
           var value = Number(line[0]); if (!isFinite(value)) return;

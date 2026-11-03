@@ -47,6 +47,7 @@ from .book.runner import BookRunner
 from .setups import (
     DEFAULT_TARGET_RR,
     DONE,
+    LEG_TARGET_MODEL,
     LIFECYCLE_VERSION,
     SetupRecord,
     breaker_block,
@@ -154,6 +155,36 @@ def sweep_chain_errors(
             errors.append("HVB and body break are not on the same candle")
         if lag not in (None, 0, "0"):
             errors.append("HVB lag is not zero")
+
+    lifecycle_version = as_int(payload.get("lifecycle_version"))
+    target_model = str(payload.get("target_model") or setup.get("target_model") or "")
+    if lifecycle_version >= 5 or target_model:
+        confirmation = setup.get("confirmation_leg") or {}
+        if target_model != LEG_TARGET_MODEL:
+            errors.append("current confirmation-leg H/L target proof is missing")
+        leg_target = payload.get("leg_target", setup.get("leg_target", setup.get("target")))
+        leg_target_ms = as_int(
+            payload.get("leg_target_ms")
+            or setup.get("leg_target_ms")
+            or confirmation.get("target_time")
+        )
+        leg_start_ms = as_int(
+            payload.get("leg_start_ms") or confirmation.get("start_time") or sweep_ms
+        )
+        leg_break_ms = as_int(
+            payload.get("leg_break_ms") or confirmation.get("break_time") or break_ms
+        )
+        try:
+            leg_target_value = float(leg_target)
+        except (TypeError, ValueError):
+            leg_target_value = 0.0
+        if not math.isfinite(leg_target_value) or leg_target_value <= 0:
+            errors.append("confirmation-leg target price is missing")
+        if leg_start_ms != sweep_ms or leg_break_ms != break_ms:
+            errors.append("target leg must run from the selected sweep through the HVB/body break")
+        touched_ms = as_int(payload.get("touched_ms"))
+        if leg_target_ms < sweep_ms or (touched_ms and leg_target_ms >= touched_ms):
+            errors.append("target extreme must form before mitigation")
 
     # Strong proof on rows produced by this version.  Legacy rows remain
     # inspectable through their timestamps/level instead of being destroyed.
@@ -638,7 +669,18 @@ class Engine:
                 rr=payload.get("rr"),
                 zone=payload.get("zone"),
                 zones=list(payload.get("zones") or []),
-                target_rr=float(payload.get("target_rr") or DEFAULT_TARGET_RR),
+                target_rr=(
+                    None if payload.get("target_rr") is None
+                    else float(payload["target_rr"])
+                ),
+                target_model=str(payload.get("target_model") or LEG_TARGET_MODEL),
+                leg_target=(
+                    None if payload.get("leg_target") is None
+                    else float(payload["leg_target"])
+                ),
+                leg_target_ms=payload.get("leg_target_ms"),
+                leg_start_ms=payload.get("leg_start_ms"),
+                leg_break_ms=payload.get("leg_break_ms"),
                 lifecycle_version=int(payload.get("lifecycle_version") or 1),
                 mitigation_kind=payload.get("mitigation_kind"),
                 mitigation_zone=payload.get("mitigation_zone"),
@@ -1622,6 +1664,11 @@ class Engine:
             zone=zone,
             zones=[zone],
             target_rr=float(plan.get("rr") or DEFAULT_TARGET_RR),
+            target_model="book_plan",
+            leg_target=float(plan["target"]) if plan.get("target") else None,
+            leg_target_ms=int(plan["created_ms"]),
+            leg_start_ms=int(trap.get("time") or plan["created_ms"]),
+            leg_break_ms=int((plan.get("shift") or {}).get("time") or plan["created_ms"]),
             lifecycle_version=LIFECYCLE_VERSION,
             mitigation_kind="fvg",
             mitigation_zone=zone,
@@ -1695,7 +1742,7 @@ class Engine:
         zones = [zone for zone in (breaker, block) if zone is not None]
         # Until a zone is actually mitigated this is only the nearest planned
         # fill. The lifecycle will replace it with the touched zone's proximal
-        # edge and create the 1:4 target at that moment.
+        # edge and freeze the favorable H/L of this setup's confirmation leg.
         if zones:
             planned_entry = (
                 min(float(zone["low"]) for zone in zones) if side == "SHORT"
@@ -1703,6 +1750,8 @@ class Engine:
             )
         else:
             planned_entry = float(setup.get("entry") or alert.get("price") or 0.0)
+        confirmation_leg = setup.get("confirmation_leg") or {}
+        leg_target = setup.get("leg_target", setup.get("target"))
         record = SetupRecord(
             key=key,
             symbol=alert["symbol"],
@@ -1715,7 +1764,12 @@ class Engine:
             rr=None,
             zone=block,
             zones=zones,
-            target_rr=float(self.filters.config.get("setup_target_rr") or DEFAULT_TARGET_RR),
+            target_rr=None,
+            target_model=str(setup.get("target_model") or LEG_TARGET_MODEL),
+            leg_target=None if leg_target is None else float(leg_target),
+            leg_target_ms=setup.get("leg_target_ms") or confirmation_leg.get("target_time"),
+            leg_start_ms=confirmation_leg.get("start_time") or setup.get("sweep_time"),
+            leg_break_ms=confirmation_leg.get("break_time") or setup.get("break_time"),
             lifecycle_version=LIFECYCLE_VERSION,
             swept_level=float(setup.get("swept_level") or 0.0),
             swept_side=str(setup.get("swept_side") or ""),
@@ -1740,8 +1794,10 @@ class Engine:
                 f"aggressive {breaker['body_atr']:.2f} ATR shift armed a "
                 f"{breaker['kind'].replace('_', ' ')}"
             )
+        target_side = "low" if side == "SHORT" else "high"
         record.reasons.append(
-            f"target is fixed at 1:{record.target_rr:g} only after order-block or breaker mitigation"
+            f"target is the {target_side} of the sweep-to-HVB/BOS confirmation leg; "
+            "it can extend while pending and freezes immediately before mitigation"
         )
         self.registry[key] = record
         cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])

@@ -15,9 +15,10 @@ makes each of them a switch:
 This page is the honest record: what each rule computes, what it rejects, and
 where old measurements are too weak or too stale to support a claim.
 
-> **Current-policy boundary (lifecycle v4).** The historical tables below predate
-> exactly-one-sweep structure, breaker-local stops and mitigation-only 4R. They
-> are retained as labelled research, not presented as current results. The live
+> **Current-policy boundary (lifecycle v5).** The historical tables below predate
+> exactly-one-sweep structure, breaker-local stops, mitigation-first activation,
+> and the variable confirmation-leg H/L exit. They are retained as labelled
+> research, not presented as current results. The live
 > policy now requires repeated major/macro progression (at least two high and two
 > low steps, with 100% remembered recent-step consistency) plus a clear local leg
 > or range release. A mixed left-side range passes only after a fresh major/macro
@@ -211,9 +212,10 @@ turn `trend_context` off and keep `require_bos`.
   on.
 * **The old structure-target study is not current scoring.** In that study the
   next opposite range extreme left 34 of 37 trades unscorable and median R:R was
-  0.28, so the table used synthetic 2R. The live lifecycle now waits for actual
-  order-block/breaker mitigation and then arms fixed 4R from the selected
-  post-fill stop.
+  0.28, so the table used synthetic 2R. The live lifecycle now extends the
+  favorable sweep→HVB/BOS leg H/L while pending, waits for actual
+  order-block/breaker mitigation, and freezes the previous extreme as its
+  variable target.
 * **Eight configs, chosen after looking at the data.** This is exploratory
   fitting on one dataset, not a pre-registered test. Out-of-sample confirmation
   would need `data/btc_oos` (2023-07 → 2024-06), which is not in this workspace.
