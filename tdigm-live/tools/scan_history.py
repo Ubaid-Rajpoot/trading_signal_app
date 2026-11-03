@@ -86,8 +86,16 @@ async def main() -> int:
                     help="how many bars back a break of structure still counts (0 = forever)")
     ap.add_argument("--max-depth", type=int, default=2,
                     help="1 = external only, 2 = one level of internal (default), 3+ allows nesting")
-    ap.add_argument("--hvb-window", type=int, default=3,
-                    help="the HVB may print on the break candle or up to N bars after it")
+    ap.add_argument("--no-clear-structure", dest="clear_structure", action="store_false",
+                    help="research only: allow one recent HH/HL pair without wider left context")
+    ap.add_argument("--trend-steps", type=int, default=2,
+                    help="consecutive high and low swing steps required at major/macro degree")
+    ap.add_argument("--directional-ratio", type=float, default=0.75,
+                    help="fraction of recent structural steps that must agree")
+    ap.add_argument("--fresh-shift-bars", type=int, default=20,
+                    help="bars for a major close beyond the remembered range edge to establish direction")
+    ap.add_argument("--hvb-window", type=int, default=0,
+                    help="0 = shipped same-candle HVB; larger windows are research only")
     ap.add_argument("--volume-break", action="store_true",
                     help="the signal candle must be a high-volume bar")
     ap.add_argument("--volume-mult", type=float, default=1.5, help="how many x the average volume")
@@ -96,8 +104,8 @@ async def main() -> int:
                     help="all = every condition must hold; score = weighted confluence >= --confirm-min")
     ap.add_argument("--confirm-min", type=float, default=60.0, help="the confluence score needed")
     ap.add_argument("--macro-len", type=int, default=80, help="bars each side of the macro swing")
-    ap.add_argument("--adx-min", type=float, default=20.0, help="ADX(14) needed for a trending market")
-    ap.add_argument("--er-min", type=float, default=0.10, help="efficiency ratio (50) needed for a trending market")
+    ap.add_argument("--adx-min", type=float, default=22.0, help="ADX(14) needed for a trending market")
+    ap.add_argument("--er-min", type=float, default=0.30, help="efficiency ratio (50) needed for a trending market")
     ap.add_argument("--regime-dir", default="any", choices=["any", "with"], help="also demand the EMA direction")
     ap.add_argument("--horizon", type=int, default=300, help="bars to look ahead when scoring a signal")
     ap.add_argument("--score-target", default="structure", choices=["structure", "fixed"],
@@ -170,6 +178,10 @@ async def main() -> int:
             "structure_atr_max": args.structure_atr_max,
             "trend_context": args.trend_context,
             "require_hh_hl": args.require_hh_hl,
+            "clear_structure": args.clear_structure,
+            "min_trend_steps": args.trend_steps,
+            "min_directional_ratio": args.directional_ratio,
+            "fresh_shift_max_bars": args.fresh_shift_bars,
             "require_bos": args.require_bos,
             "bos_max_age": args.bos_age,
             "max_internal_depth": args.max_depth,

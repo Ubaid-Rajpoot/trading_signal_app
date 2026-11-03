@@ -32,11 +32,9 @@ RISE = [(90 + i * 0.06 + 0.3, 90 + i * 0.06 - 0.3, 90 + i * 0.06) for i in range
 SHORT = [
     (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
     (105, 100, 101), (101, 96, 97), (98, 95, 96),
-    (100, 95, 99), (103, 98, 102), (107, 101, 106),
-    (106, 101, 102), (102, 97, 98), (99, 95, 96),
-    (100, 97, 98), (101, 98, 99), (102, 99, 100), (103, 100, 101),
-    (104, 101, 102), (108, 102, 104),   # sweep of the 107 high
-    (104, 90, 91),                      # break of the 95 low: the setup
+    (100, 96, 99), (103, 98, 102),
+    (107, 101, 106),                    # sweep exactly one high (106)
+    (104, 90, 91),                      # break that leg's paired low (95)
 ]
 START = 1_735_689_600_000
 
@@ -220,6 +218,7 @@ def test_a_setup_is_pending_until_price_comes_back_into_the_zone():
     assert setup.state == "pending", "still valid: the zone has not been mitigated"
     assert setup.advance(bar_at(100.5, 99.2, 100.0)) is True
     assert setup.state == "active" and setup.touched_ms == 2_000
+    assert setup.stop == 104.0, "order-block mitigation retains the structural sweep stop"
     assert setup.target == 79.0 and setup.rr == 4.0
     assert "fixed 1:4 target armed" in setup.state_reason
 
@@ -274,7 +273,8 @@ def test_mitigation_and_stop_on_one_candle_is_stopped_not_unfilled_invalidation(
 def test_an_eligible_breaker_can_mitigate_before_the_order_block():
     setup = record(
         zones=[
-            {"high": 101.0, "low": 100.0, "type": "breaker_block", "kind": "bearish_breaker"},
+            {"high": 101.0, "low": 100.0, "type": "breaker_block", "kind": "bearish_breaker",
+             "breaker_stop": 101.2, "stop_buffer": 0.2},
             {"high": 103.0, "low": 102.0, "type": "order_block", "kind": "supply"},
         ],
         zone={"high": 103.0, "low": 102.0, "type": "order_block", "kind": "supply"},
@@ -282,7 +282,24 @@ def test_an_eligible_breaker_can_mitigate_before_the_order_block():
     )
     assert setup.advance(bar_at(100.5, 99.8, 100.2)) is True
     assert setup.state == "active" and setup.mitigation_kind == "breaker_block"
-    assert setup.entry == 100.0 and setup.target == 84.0
+    assert setup.entry == 100.0
+    assert setup.stop == setup.stop0 == 101.2, "breaker uses its buffered distal edge, not sweep 104"
+    assert setup.risk0 == pytest.approx(1.2)
+    assert setup.target == pytest.approx(95.2)
+
+
+def test_a_breaker_stop_on_the_profit_side_is_rejected():
+    setup = record(
+        zones=[
+            {"high": 101.0, "low": 100.0, "type": "breaker_block",
+             "kind": "bearish_breaker", "breaker_stop": 99.5},
+        ],
+        zone={"high": 101.0, "low": 100.0, "type": "breaker_block"},
+        entry=100.0,
+    )
+    assert setup.advance(bar_at(100.5, 99.8, 100.2)) is True
+    assert setup.state == "invalidated" and setup.mitigated is False
+    assert "correctly sided risk" in setup.state_reason
 
 
 def test_long_breaker_touch_arms_the_4r_trade_like_the_bnb_example():
@@ -290,14 +307,16 @@ def test_long_breaker_touch_arms_the_4r_trade_like_the_bnb_example():
         side="LONG", stop=703.7, entry=704.8,
         zone={"high": 703.9, "low": 703.75, "type": "order_block", "kind": "demand"},
         zones=[
-            {"high": 704.8, "low": 704.6, "type": "breaker_block", "kind": "bullish_breaker"},
+            {"high": 704.8, "low": 704.6, "type": "breaker_block", "kind": "bullish_breaker",
+             "breaker_stop": 704.5, "stop_buffer": 0.1},
             {"high": 703.9, "low": 703.75, "type": "order_block", "kind": "demand"},
         ],
     )
     assert setup.advance(bar_at(705.2, 704.65, 705.0)) is True
     assert setup.state == "active" and setup.mitigation_kind == "breaker_block"
     assert setup.entry == 704.8
-    assert setup.target == pytest.approx(709.2)  # 704.8 + 4 * (704.8 - 703.7)
+    assert setup.stop == setup.stop0 == 704.5, "long breaker stop sits below its distal low"
+    assert setup.target == pytest.approx(706.0)  # 704.8 + 4 * (704.8 - 704.5)
 
 
 def test_aggressive_same_leg_endpoint_becomes_a_breaker_block():
@@ -315,6 +334,13 @@ def test_aggressive_same_leg_endpoint_becomes_a_breaker_block():
     assert zone["type"] == "breaker_block" and zone["kind"] == "bearish_breaker"
     assert zone["low"] == 99.0 and zone["high"] == 102.0
     assert zone["body_atr"] >= 1.0
+    assert zone["stop_buffer"] == pytest.approx(0.1 * zone["atr"])
+    assert zone["breaker_stop"] == pytest.approx(zone["high"] + zone["stop_buffer"])
+    assert zone["breaker_stop"] < 105.0, "local breaker risk must improve on the sweep stop"
+    no_buffer = breaker_block(
+        candles, "SHORT", 2, 105.0, min_body_atr=1.0, stop_buffer_atr=0.0,
+    )
+    assert no_buffer is not None and no_buffer["breaker_stop"] == 102.0
 
     quiet = {**candles[-1], "open": 96.0, "close": 95.0}
     assert breaker_block(candles[:-1] + [quiet], "SHORT", 2, 105.0, min_body_atr=1.0) is None

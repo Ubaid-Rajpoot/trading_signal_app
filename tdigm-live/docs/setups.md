@@ -74,6 +74,22 @@ contract endpoints because the default market is futures.
 
 ## 4. Valid vs invalid — a setup is a living object
 
+Before lifecycle starts, structural validity is exact:
+
+1. the swept pivot and opposite broken pivot must be the two endpoints of one
+   completed leg;
+2. the liquidity run may take **exactly one** resting high for a short or one
+   resting low for a long;
+3. continuing farther beyond that same swept level is allowed, but reaching a
+   second same-side pivot—on the sweep candle or sequentially before the opposite
+   body break—invalidates the candidate;
+4. the body break must occur later and through the exact paired endpoint.
+
+Repeated back-and-forth at similar highs/lows is therefore a range, not a chain
+from which the detector may cherry-pick a convenient pair. `chain_version: 3`
+stores `swept_count: 1` and the publication/database integrity boundary refuses
+a current-version row without that proof.
+
 A setup is not a moment. Each one becomes a record with a state:
 
 | state | meaning | still tradeable? |
@@ -116,10 +132,16 @@ displacement close and stop. A normal break does not invent a breaker.
 
 The order block and breaker are parallel mitigation choices. The first proximal
 edge touched after confirmation fills the setup. For SHORT that is a zone's low;
-for LONG it is its high. At that moment—and not at the break close—the engine
-freezes risk and computes `target = entry ± 4 × |entry − stop|`. If a mitigation
-candle also reaches stop and target, stop wins; if it reaches a zone and stop,
-the row is `stopped`, not the factually wrong “unfilled invalidated”.
+for LONG it is its high. An **order-block** fill retains the structural sweep
+stop. A **breaker-block** fill replaces that distant stop with the breaker distal
+edge plus `breaker_stop_buffer_atr` (shipped as 0.10 ATR): above the breaker high
+for shorts, below its low for longs. A breaker is omitted if that local stop would
+not improve risk over the structural stop.
+
+At mitigation—and not at the break close—the engine freezes entry and the
+selected post-fill stop, then computes `target = entry ± 4 × |entry − stop|`. If
+a mitigation candle also reaches stop and target, stop wins; if it reaches a zone
+and stop, the row is `stopped`, not the factually wrong “unfilled invalidated”.
 
 ## 5. What the page draws
 
@@ -172,7 +194,8 @@ python run.py serve                 # LIVE perps, 9 timeframes
 python -m pytest tests -q           # deterministic offline suite
 ```
 
-The setup rules themselves are unchanged from round 17 and still measured in
-[`trend-rules.md`](trend-rules.md): `docs/trend-rules.md` explains which of those
-gates the data supports and which it does not, and the page always shows the
-evidence for a setup rather than asking you to trust it.
+The current structural-context rules are documented in
+[`trend-rules.md`](trend-rules.md). Its old measurements are explicitly labelled
+legacy; no current v3 win rate is claimed without replaying compatible real data.
+The page shows the evidence and rejection reason instead of asking you to trust a
+silent decision.

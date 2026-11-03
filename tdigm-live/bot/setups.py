@@ -38,7 +38,7 @@ from typing import Any
 
 VALID = {"pending", "active"}
 DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
-LIFECYCLE_VERSION = 2
+LIFECYCLE_VERSION = 3
 DEFAULT_TARGET_RR = 4.0
 
 
@@ -88,6 +88,7 @@ def breaker_block(
     stop: float,
     *,
     min_body_atr: float = 1.0,
+    stop_buffer_atr: float = 0.10,
     atr_period: int = 14,
 ) -> dict[str, Any] | None:
     """Return the paired endpoint candle as an aggressive-shift breaker block.
@@ -137,6 +138,13 @@ def breaker_block(
         return None
     if side == "LONG" and not (float(stop) < low < high < closed):
         return None
+    buffer = max(0.0, float(stop_buffer_atr)) * atr
+    breaker_stop = high + buffer if side == "SHORT" else low - buffer
+    # The breaker stop must improve risk versus the structural sweep stop.
+    if side == "SHORT" and breaker_stop >= float(stop):
+        return None
+    if side == "LONG" and breaker_stop <= float(stop):
+        return None
     return {
         "high": high,
         "low": low,
@@ -145,6 +153,9 @@ def breaker_block(
         "kind": "bearish_breaker" if side == "SHORT" else "bullish_breaker",
         "type": "breaker_block",
         "body_atr": round(body_atr, 3),
+        "atr": atr,
+        "stop_buffer": buffer,
+        "breaker_stop": breaker_stop,
         "break_time": int(shift["close_time"]),
     }
 
@@ -255,7 +266,7 @@ class SetupRecord:
 
     @property
     def target_2r(self) -> float | None:
-        """Legacy 2R reference; never used as the lifecycle-v2 target."""
+        """Legacy 2R reference; never used by the current lifecycle target."""
         if not self.mitigated:
             return None
         risk = self.risk0 or abs(self.entry - self.stop0)
@@ -390,10 +401,12 @@ class SetupRecord:
                 else:
                     selected = max(touched, key=lambda z: float(z["high"]))
                     fill = float(selected["high"])
-                risk = abs(fill - self.stop)
+                if selected.get("type") == "breaker_block" and selected.get("breaker_stop") is not None:
+                    self.stop = float(selected["breaker_stop"])
+                risk = (self.stop - fill) if self.side == "SHORT" else (fill - self.stop)
                 if risk <= 0:
                     self.state, self.state_since, self.closed_ms = "invalidated", at, at
-                    self.state_reason = "mitigation zone produced no positive risk to the stop"
+                    self.state_reason = "mitigation zone produced no correctly sided risk to the stop"
                     return True
 
                 self.entry = fill
@@ -408,7 +421,11 @@ class SetupRecord:
                 self.mitigation_zone = dict(selected)
                 self.mitigation_kind = str(selected.get("type") or selected.get("kind") or "zone")
                 self.state, self.state_since = "active", at
-                self.state_reason = f"mitigated at the {self.mitigation_kind}; fixed 1:{self.target_rr:g} target armed"
+                stop_note = " with buffered breaker stop" if self.mitigation_kind == "breaker_block" else ""
+                self.state_reason = (
+                    f"mitigated at the {self.mitigation_kind}{stop_note}; "
+                    f"fixed 1:{self.target_rr:g} target armed"
+                )
 
                 hit_stop = high >= self.stop if self.side == "SHORT" else low <= self.stop
                 hit_target = low <= self.target if self.side == "SHORT" else high >= self.target

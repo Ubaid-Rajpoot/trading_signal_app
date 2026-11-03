@@ -142,6 +142,8 @@ class Setup:
             "rr": self.rr,
             "swept_side": self.sweep.side,
             "swept_level": self.sweep.level,
+            "swept_count": 1,
+            "swept_levels": [self.sweep.boundary.as_dict()] if self.sweep.boundary else [],
             "sweep_time": self.sweep.time,
             "sweep_extreme": self.sweep.extreme,
             "sweep_open": self.sweep.open,
@@ -234,6 +236,7 @@ class Structure:
             "sweeps": [],
             "setup": None,
             "invalidated": False,
+            "invalid_reason": None,
         }
         price = float(bar["close"])
         high = float(bar["high"])
@@ -307,61 +310,63 @@ class Structure:
         # LONG leg:  LOW  -> later HIGH. The low must be taken; that exact high
         # must later receive the body close.
         #
-        # A large run can take several completed legs before reversing, so keep
-        # every paired candidate. Selecting a recent high and an unrelated old
-        # low is explicitly impossible here.
-        existing = {
-            (s.side, s.boundary.index if s.boundary else -1,
-             s.opposite.index if s.opposite else -1)
-            for values in self._candidates.values() for s in values
-        }
+        # Exactly one structural high/low may be taken in a liquidity run. If
+        # one candle crosses two resting pivots, or an active run later reaches a
+        # second pivot before reversal, it is the range/multi-sweep shape the
+        # trader explicitly rejects. Do not choose whichever pair is convenient.
         for side in SIDES:
-            grouped: dict[int, tuple[Level, list[Level]]] = {}
-            for boundary, opposite in self._completed_legs(side, index):
-                key = (side, boundary.index, opposite.index)
-                if key in existing:
-                    continue
-                bucket = grouped.setdefault(boundary.index, (boundary, []))[1]
-                bucket.append(opposite)
+            taken_levels = self._taken_levels(side, high, low, index)
+            if not taken_levels:
+                continue
+            self.sweep_count += 1
 
-            for boundary, opposites in grouped.values():
-                taken = high > boundary.price if side == "high" else low < boundary.price
-                if not taken:
-                    continue
-                made: list[Sweep] = []
-                for opposite in opposites:
-                    sweep = Sweep(
-                        side=side,
-                        level=boundary.price,
-                        index=index,
-                        time=int(self.times[-1]),
-                        extreme=high if side == "high" else low,
-                        opposite=opposite,
-                        boundary=boundary,
-                        open=float(bar["open"]),
-                        high=high,
-                        low=low,
-                        close=price,
-                    )
-                    self._candidates[side].append(sweep)
-                    events["sweeps"].append(sweep)
-                    made.append(sweep)
-                if made:
-                    boundary.swept = True
-                    self.sweep_count += 1
-                    latest = max(made, key=lambda row: row.opposite.index if row.opposite else -1)
-                    if events["sweep"] is None or (
-                        latest.opposite is not None
-                        and events["sweep"].opposite is not None
-                        and latest.opposite.index > events["sweep"].opposite.index
-                    ):
-                        events["sweep"] = latest
+            active = self._candidates[side]
+            if active or len(taken_levels) != 1:
+                for level in taken_levels:
+                    level.swept = True
+                if active:
+                    self._candidates[side] = []
+                self.invalidated += 1
+                events["invalidated"] = True
+                events["invalid_reason"] = (
+                    f"multiple {side}s swept before the opposite body break"
+                )
+                continue
 
-        # 3. Extend the stop to the run's final extreme and wait for the paired
-        # endpoint. A close above an earlier swept high is not enough to kill the
-        # candidate: the supplied BTC example deliberately runs through that old
-        # high before reversing. Time expiry or consumption of the paired level
-        # removes it; a true inside->outside body close confirms it.
+            boundary = taken_levels[0]
+            pairs = [pair for pair in self._completed_legs(side, index) if pair[0] is boundary]
+            boundary.swept = True
+            if len(pairs) != 1:
+                # No completed leg means there is nothing to confirm. More than
+                # one endpoint means the left-side structure itself is a range.
+                if len(pairs) > 1:
+                    self.invalidated += 1
+                    events["invalidated"] = True
+                    events["invalid_reason"] = "swept pivot belongs to multiple ambiguous legs"
+                continue
+
+            _boundary, opposite = pairs[0]
+            sweep = Sweep(
+                side=side,
+                level=boundary.price,
+                index=index,
+                time=int(self.times[-1]),
+                extreme=high if side == "high" else low,
+                opposite=opposite,
+                boundary=boundary,
+                open=float(bar["open"]),
+                high=high,
+                low=low,
+                close=price,
+            )
+            self._candidates[side].append(sweep)
+            events["sweeps"].append(sweep)
+            events["sweep"] = sweep
+
+        # 3. Extend the stop while no second structural pivot is taken, and wait
+        # for the exact paired endpoint. A candle may continue beyond the one
+        # swept level, but reaching any other resting high/low invalidates the
+        # run in step 2. Time expiry also removes it.
         for side in SIDES:
             survivors: list[Sweep] = []
             broken: list[Sweep] = []
@@ -406,6 +411,27 @@ class Structure:
         self._expire(index)
         self.events = events
         return events
+
+    def _taken_levels(
+        self, side: str, high: float, low: float, index: int
+    ) -> list[Level]:
+        """Every still-resting pivot of one side crossed by this candle.
+
+        Returning the complete set—not merely the latest level—is what makes the
+        single-liquidity rule auditable. Equal-price pivots separated by an
+        opposite swing are separate highs/lows and therefore count separately.
+        """
+        return [
+            level
+            for level in self.levels
+            if (
+                level.side == side
+                and not level.swept
+                and index > level.index
+                and index - level.index <= self.level_max_age
+                and ((side == "high" and high > level.price) or (side == "low" and low < level.price))
+            )
+        ]
 
     def _completed_legs(self, side: str, index: int) -> list[tuple[Level, Level]]:
         """Completed, intact legs whose boundary on ``side`` can be swept.

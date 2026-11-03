@@ -264,13 +264,24 @@ def run_structure(rows, settings=None):
 # a swing high at 106, a swing low at 95, then the sweep of the high and the
 # break back through the low - the drawing, as numbers
 SHORT_PATTERN = [
-    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),   # high 106
-    (105, 100, 101), (101, 96, 97), (98, 95, 96),                      # low 95
-    (100, 95, 99), (103, 98, 102), (107, 101, 106),                    # high 107
-    (106, 101, 102), (102, 97, 98), (99, 95, 96),                      # low 95 again
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),   # one high 106
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),                      # paired low 95
+    (100, 96, 99), (103, 98, 102),
+    (107, 101, 106),                   # sweep exactly that one high
+    (104, 90, 91),                     # then break its paired low -> SHORT
+]
+
+# The former "valid" fixture is intentionally retained as an X regression. It
+# first takes 106, establishes another high at 107 while oscillating back to the
+# same 95 low, then takes 107 too. That is one run through multiple highs, not a
+# single clean sweep-and-release leg.
+OSCILLATING_MULTI_SWEEP_PATTERN = [
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),
+    (100, 95, 99), (103, 98, 102), (107, 101, 106),
+    (106, 101, 102), (102, 97, 98), (99, 95, 96),
     (100, 97, 98), (101, 98, 99), (102, 99, 100), (103, 100, 101),
-    (104, 101, 102), (108, 102, 104),  # sweep the 107 high (high 108 > 107)
-    (104, 90, 91),                     # break below the 95 low -> SHORT setup
+    (104, 101, 102), (108, 102, 104), (104, 90, 91),
 ]
 
 
@@ -283,22 +294,32 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     index, setup = setups[0]
     assert setup.side == "SHORT"
     assert setup.entry == 91.0
-    assert setup.stop == 108.0, "the stop is just beyond the sweep extreme"
+    assert setup.stop == 107.0, "the stop is just beyond the sweep extreme"
     assert setup.broke.price == 95.0, "the opposite swing low is what broke"
     assert setup.target is None, "no pre-sweep liquidity was left below the entry"
     proof = setup.as_dict()
     assert proof["sweep_time"] < proof["break_time"]
     assert proof["sweep_high"] > proof["swept_level"]
-    assert proof["sweep_low"] == 102.0
-    assert proof["swept_level"] == 107.0
+    assert proof["sweep_low"] == 101.0
+    assert proof["swept_level"] == 106.0
     assert proof["swept_level_time"] < proof["broke_level_time"] < proof["sweep_time"]
+
+
+def test_oscillation_that_takes_two_highs_before_the_break_is_invalid():
+    _st, _pivots, sweeps, setups, invalid = run_structure(OSCILLATING_MULTI_SWEEP_PATTERN)
+    assert sweeps, "the first high was genuinely swept"
+    assert invalid, "taking the next resting high must invalidate that same liquidity run"
+    assert not setups, "a later opposite break cannot rescue a multi-sweep range"
 
 
 def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
     valid = {
-        "kind": "signal", "side": "SHORT", "time": 20_000, "hvb": "down", "hvb_lag": 0,
+        "kind": "signal", "chain_version": 3,
+        "side": "SHORT", "time": 20_000, "hvb": "down", "hvb_lag": 0,
         "setup": {
             "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 107.0, "time": 5_000}],
             "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
             "swept_level_time": 5_000, "broke_level_time": 8_000,
             "broke_level": 95.0, "break_time": 20_000,
@@ -312,6 +333,15 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
     assert any("down HVB" in reason for reason in sweep_chain_errors(wrong_hvb))
     fake_wick = {**valid, "setup": {**valid["setup"], "sweep_high": 106.9}}
     assert any("did not take" in reason for reason in sweep_chain_errors(fake_wick))
+    multiple = {**valid, "setup": {**valid["setup"], "swept_count": 2}}
+    assert any("exactly one" in reason for reason in sweep_chain_errors(multiple))
+    ambiguous = {
+        **valid,
+        "setup": {**valid["setup"], "swept_levels": [
+            {"side": "high", "price": 106.0}, {"side": "high", "price": 107.0},
+        ]},
+    }
+    assert any("ambiguous" in reason for reason in sweep_chain_errors(ambiguous))
     unrelated = {**valid, "setup": {**valid["setup"], "swept_level_time": 9_000,
                                       "broke_level_time": 6_000}}
     assert any("same completed leg" in reason for reason in sweep_chain_errors(unrelated))
@@ -361,9 +391,8 @@ def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
     # The sweep candle itself closes below the opposite low.  Because the rule
     # requires the break *subsequently*, a following candle that merely stays
     # below 95 must not be mislabelled as the body-break candle.
-    rows = list(SHORT_PATTERN[:19])
-    rows[9] = (105.5, 101, 104)  # do not sweep the original 106 high early
-    rows[-1] = (108, 90, 91)     # sweep high + close below low on this one bar
+    rows = list(SHORT_PATTERN[:-1])
+    rows[-1] = (107, 90, 91)  # sweep high + close below low on this one bar
     rows.append((94, 89, 90))
     _st, _pivots, sweeps, setups, _invalid = run_structure(rows)
     assert sweeps and not setups
@@ -373,19 +402,20 @@ def test_swept_leg_survives_an_extension_and_stop_follows_the_final_extreme():
     # The BTC reference does exactly this: price takes the paired leg high,
     # continues higher, and only then reverses through that leg's low. Accepting
     # above the first swept price must not make the later valid chain disappear.
-    rows = SHORT_PATTERN[:19] + [(110, 103, 109), (109, 90, 91)]
+    rows = SHORT_PATTERN[:-1] + [(110, 103, 109), (109, 90, 91)]
     _st, _, sweeps, setups, invalid = run_structure(rows)
     assert sweeps and setups
     assert not invalid
     assert setups[-1][1].stop == 110.0
 
 
-def test_break_must_use_the_other_endpoint_of_the_same_completed_leg():
+def test_crossing_a_paired_high_and_newer_unpaired_high_is_multi_sweep():
     from bot.structure import Level
 
     st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
-    # Completed leg: high 120 -> low 100. The newer high 130 has no later low,
-    # so it is not the high of the leg whose low 100 is about to break.
+    # The completed high-120 -> low-100 leg is exact, but the same candle also
+    # takes a newer resting high at 130.  One run took two highs, so no candidate
+    # may be rescued by silently ignoring the unpaired level.
     st.levels.extend([
         Level("high", 120.0, 1, 60_000),
         Level("low", 100.0, 2, 120_000),
@@ -393,23 +423,37 @@ def test_break_must_use_the_other_endpoint_of_the_same_completed_leg():
     ])
     st.count = 4
     swept = st.add(bar(240_000, 129.0, high=131.0, low=121.0))
-    assert swept["sweep"] is not None
-    assert swept["sweep"].level == 120.0, "the unpaired newer high cannot be substituted"
-    assert swept["sweep"].opposite.price == 100.0
-
+    assert swept["sweep"] is None
+    assert swept["invalidated"] is not None
+    assert "multiple highs" in swept["invalid_reason"]
     broken = st.add(bar(300_000, 95.0, high=129.0, low=94.0))
-    assert broken["setup"] is not None
-    proof = broken["setup"].as_dict()
-    assert proof["swept_level"] == 120.0
-    assert proof["broke_level"] == 100.0
-    assert proof["swept_level_time"] < proof["broke_level_time"]
+    assert broken["setup"] is None
 
 
-def test_long_break_uses_the_high_of_the_same_low_to_high_leg():
+def test_sequential_second_high_invalidates_the_active_liquidity_run():
     from bot.structure import Level
 
     st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
-    # Completed leg: low 80 -> high 100. The newer low 70 is unpaired.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 130.0, 3, 180_000),
+    ])
+    st.count = 4
+    first = st.add(bar(240_000, 119.0, high=121.0, low=115.0))
+    assert first["sweep"] is not None and first["sweep"].level == 120.0
+
+    second = st.add(bar(300_000, 129.0, high=131.0, low=121.0))
+    assert second["sweep"] is None and second["invalidated"] is True
+    assert "multiple highs" in second["invalid_reason"]
+    broken = st.add(bar(360_000, 95.0, high=129.0, low=94.0))
+    assert broken["setup"] is None
+
+
+def test_crossing_a_paired_low_and_newer_unpaired_low_is_multi_sweep():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
     st.levels.extend([
         Level("low", 80.0, 1, 60_000),
         Level("high", 100.0, 2, 120_000),
@@ -417,22 +461,15 @@ def test_long_break_uses_the_high_of_the_same_low_to_high_leg():
     ])
     st.count = 4
     swept = st.add(bar(240_000, 71.0, high=79.0, low=69.0))
-    assert swept["sweep"] is not None
-    assert swept["sweep"].side == "low"
-    assert swept["sweep"].level == 80.0
-    assert swept["sweep"].opposite.price == 100.0
-
+    assert swept["sweep"] is None
+    assert swept["invalidated"] is not None
+    assert "multiple lows" in swept["invalid_reason"]
     broken = st.add(bar(300_000, 105.0, high=106.0, low=71.0))
-    assert broken["setup"] is not None
-    proof = broken["setup"].as_dict()
-    assert proof["side"] == "LONG"
-    assert proof["swept_level"] == 80.0
-    assert proof["broke_level"] == 100.0
-    assert proof["swept_level_time"] < proof["broke_level_time"]
+    assert broken["setup"] is None
 
 
 def test_no_setup_without_the_opposite_break():
-    rows = SHORT_PATTERN[:19] + [(104, 96, 97)]  # sweeps the high, stays inside
+    rows = SHORT_PATTERN[:-1] + [(104, 96, 97)]  # after sweep, stays inside
     _, _, sweeps, setups, _ = run_structure(rows)
     assert sweeps and not setups
 
@@ -445,7 +482,7 @@ def test_long_mirror_of_the_pattern():
     assert sweeps and setups
     assert sweeps[0][1].side == "low"
     assert setups[0][1].side == "LONG"
-    assert setups[0][1].stop == 92.0
+    assert setups[0][1].stop == 93.0
 
 
 def test_target_is_the_next_liquidity_level_beyond_the_entry():
@@ -680,7 +717,7 @@ async def test_engine_emits_a_signal_for_the_complete_setup():
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
-    assert alert["setup"]["stop"] == 108.0, "the stop sits just beyond the swept high"
+    assert alert["setup"]["stop"] == 107.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
     assert alert["filtered"] == []
 

@@ -97,6 +97,80 @@ def test_a_trend_that_agrees_passes():
     assert ok, reasons
 
 
+def strict_degree(
+    *, direction=1, steps=2, ratio=1.0, range_like=False,
+    bos_direction=1, bos_age=2, range_break=False,
+):
+    return {
+        "direction": direction,
+        "clean": direction is not None,
+        "trend_steps": steps,
+        "directional_ratio": ratio,
+        "range_like": range_like,
+        "bos_direction": bos_direction,
+        "bos_age": bos_age,
+        "bos_range_break": range_break,
+    }
+
+
+def strict_context(*, major=None, internal=None, macro=None):
+    return {
+        "major": major or {},
+        "macro": macro or {},
+        "internal": internal or {},
+        "external": major or macro or {},
+    }
+
+
+def strict_gates(**overrides):
+    return gates(
+        clear_structure=True,
+        min_trend_steps=2,
+        min_directional_ratio=0.75,
+        fresh_shift_max_bars=20,
+        **overrides,
+    )
+
+
+def test_strict_gate_rejects_a_recent_directional_flicker_inside_a_range():
+    flicker = strict_degree(steps=1, ratio=0.5, range_like=True, range_break=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=flicker, internal=flicker))
+    )
+    assert not ok
+    assert any("ranging/unclear structure to the left" in reason for reason in reasons)
+
+
+def test_strict_gate_accepts_repeated_major_structure_and_its_directional_leg():
+    major = strict_degree(steps=3, ratio=1.0)
+    internal = strict_degree(steps=2, ratio=1.0)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=major, internal=internal))
+    )
+    assert ok, reasons
+
+
+def test_fresh_major_range_break_can_establish_the_new_direction():
+    # Prior major swings can still be mixed at the exact reversal.  What makes
+    # this admissible is a body close beyond the full remembered range edge,
+    # not a small internal BOS or a briefly directional indicator.
+    reversal = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=0, range_break=True,
+    )
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=reversal))
+    )
+    assert ok, reasons
+
+    stale = {**reversal, "bos_age": 21}
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=stale))
+    )
+    assert not ok
+    assert any("ranging/unclear structure" in reason for reason in reasons)
+
+
 # ------------------------------------------------------- break of structure
 def test_no_break_of_structure_no_trade():
     ok, reasons = gates().apply(candidate(context=context(bos_direction=None, bos_age=None)))
@@ -266,6 +340,18 @@ async def test_the_engine_reports_depth_among_the_candidates_it_rejects():
     assert engine.alerts or seen
 
 
+def test_shipped_config_keeps_the_production_structure_gate_strict():
+    shipped = json.loads((ROOT / "config.json").read_text())["filters"]
+    assert shipped["trend_context"] is True
+    assert shipped["require_hh_hl"] is True
+    assert shipped["clear_structure"] is True
+    assert shipped["min_trend_steps"] == 2
+    assert shipped["min_directional_ratio"] == 0.75
+    assert shipped["fresh_shift_max_bars"] == 20
+    assert shipped["regime_adx_min"] == 22.0 and shipped["regime_er_min"] == 0.30
+    assert shipped["breaker_stop_buffer_atr"] == 0.10
+
+
 def test_filters_config_round_trips_through_the_store(tmp_path):
     from bot import config_store
 
@@ -274,10 +360,16 @@ def test_filters_config_round_trips_through_the_store(tmp_path):
         "bos_max_age": 180, "max_internal_depth": 2, "volume_break": True,
         "volume_mult": 2.0, "volume_period": 30, "confirm_mode": "score",
         "confirm_min_score": 70,
+        "clear_structure": True, "min_trend_steps": 3,
+        "min_directional_ratio": 0.8, "fresh_shift_max_bars": 12,
+        "breaker_stop_buffer_atr": 0.15,
     }
     cleaned = config_store.validate_filters(payload)
     for key, value in payload.items():
         assert cleaned[key] == value, key
     # rubbish is rejected, not stored
-    bad = config_store.validate_filters({"max_internal_depth": "deep", "confirm_mode": "maybe"})
+    bad = config_store.validate_filters({
+        "max_internal_depth": "deep", "confirm_mode": "maybe", "min_directional_ratio": 4,
+    })
     assert bad["max_internal_depth"] == 2 and bad["confirm_mode"] == "all"
+    assert bad["min_directional_ratio"] == 1.0

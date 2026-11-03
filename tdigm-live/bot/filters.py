@@ -72,6 +72,14 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "setup_target_rr": 4.0,
     # A paired endpoint becomes a breaker only after an aggressive price shift.
     "breaker_body_atr": 1.0,
+    "breaker_stop_buffer_atr": 0.10,
+    # Kept opt-in at the reusable Filters boundary so focused callers can test
+    # one gate without fabricating a full multi-degree trend context.  The
+    # shipped config explicitly enables this mandatory production gate.
+    "clear_structure": False,
+    "min_trend_steps": 2,
+    "min_directional_ratio": 0.75,
+    "fresh_shift_max_bars": 20,
     "volume_break": False,
     "volume_mult": 1.5,
     "volume_period": 20,
@@ -173,26 +181,73 @@ class Filters:
 
         if cfg.get("trend_context", True) and side:
             external = context.get("external") or {}
-            direction = external.get("direction")
-            if direction is None:
-                reasons.append("no clear external trend (swings are not making higher highs + higher lows or the mirror)")
-            elif direction * want < 0:
-                which = "higher highs + higher lows" if direction > 0 else "lower highs + lower lows"
-                reasons.append(f"against the external trend ({which})")
-            elif cfg.get("require_hh_hl", True) and not external.get("clean"):
-                reasons.append("external structure is not a clean HH+HL / LH+LL sequence")
+            if cfg.get("clear_structure", True):
+                major = context.get("major") or {}
+                macro = context.get("macro") or {}
+                internal = context.get("internal") or context.get("minor") or {}
+                steps = int(cfg.get("min_trend_steps") or 2)
+                ratio = float(cfg.get("min_directional_ratio", 0.75))
+                fresh_bars = int(cfg.get("fresh_shift_max_bars") or 0)
+
+                def clear(degree: dict) -> bool:
+                    return bool(
+                        degree.get("direction") == want
+                        and degree.get("clean")
+                        and int(degree.get("trend_steps") or 0) >= steps
+                        and float(degree.get("directional_ratio") or 0.0) >= ratio
+                        and not degree.get("range_like", True)
+                    )
+
+                def released(degree: dict) -> bool:
+                    age = degree.get("bos_age")
+                    return bool(
+                        degree.get("bos_direction") == want
+                        and degree.get("bos_range_break")
+                        and age is not None
+                        and (fresh_bars <= 0 or int(age) <= fresh_bars)
+                    )
+
+                established = clear(major) or clear(macro)
+                local_release = clear(internal) or released(internal) or released(major)
+                fresh_reversal = released(major) or released(macro)
+                if not (fresh_reversal or (established and local_release)):
+                    reasons.append(
+                        "ranging/unclear structure to the left: needs repeated directional swings "
+                        f"({steps}+ steps, {ratio:.0%} consistency) and a clear local leg/range release, "
+                        "or a fresh major range-breaking shift"
+                    )
+            else:
+                direction = external.get("direction")
+                if direction is None:
+                    reasons.append("no clear external trend (swings are not making higher highs + higher lows or the mirror)")
+                elif direction * want < 0:
+                    which = "higher highs + higher lows" if direction > 0 else "lower highs + lower lows"
+                    reasons.append(f"against the external trend ({which})")
+                elif cfg.get("require_hh_hl", True) and not external.get("clean"):
+                    reasons.append("external structure is not a clean HH+HL / LH+LL sequence")
 
         if cfg.get("require_bos", True) and side:
-            external = context.get("external") or {}
-            bos_direction = external.get("bos_direction")
-            age = external.get("bos_age")
             limit = int(cfg.get("bos_max_age") or 0)
-            if bos_direction is None:
-                reasons.append("no break of structure yet in this trend")
-            elif bos_direction * want < 0:
-                reasons.append("the last break of structure is the other way")
-            elif limit > 0 and age is not None and age > limit:
-                reasons.append(f"the last break of structure was {age} bars ago (max {limit})")
+            if cfg.get("clear_structure", True):
+                degrees = [context.get(name) or {} for name in ("internal", "major", "macro")]
+                matching = [
+                    degree for degree in degrees
+                    if degree.get("bos_direction") == want
+                    and degree.get("bos_age") is not None
+                    and (limit <= 0 or int(degree["bos_age"]) <= limit)
+                ]
+                if not matching:
+                    reasons.append("no recent structure break in the trade direction")
+            else:
+                external = context.get("external") or {}
+                bos_direction = external.get("bos_direction")
+                age = external.get("bos_age")
+                if bos_direction is None:
+                    reasons.append("no break of structure yet in this trend")
+                elif bos_direction * want < 0:
+                    reasons.append("the last break of structure is the other way")
+                elif limit > 0 and age is not None and age > limit:
+                    reasons.append(f"the last break of structure was {age} bars ago (max {limit})")
 
         if side and depth.get("value") is not None:
             allowed = int(cfg.get("max_internal_depth") or 2)

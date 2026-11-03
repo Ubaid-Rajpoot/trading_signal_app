@@ -104,7 +104,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_LIFECYCLE_VERSION = 2
+CURRENT_LIFECYCLE_VERSION = 3
 
 
 def _num(value: Any) -> float | None:
@@ -507,7 +507,7 @@ class SignalStore:
         def r_of(row: sqlite3.Row) -> float:
             """Risk units won or lost - the trade's own outcome, not a convention.
 
-            Lifecycle-v2 rows store realised post-mitigation R: +4R at the
+            Current lifecycle rows store realised post-mitigation R: +4R at the
             fixed target, -1R at the stop, and 0R at break-even. Unfilled
             invalidations never enter this sample. Rows missing ``r_now`` fall
             back to their configured target-R value.

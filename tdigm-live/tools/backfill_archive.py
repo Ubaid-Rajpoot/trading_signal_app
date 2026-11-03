@@ -40,10 +40,24 @@ async def replay(args: argparse.Namespace, candles: list[dict], store: SignalSto
         symbols=[args.symbol],
         timeframes=args.timeframes.split(","),
         tdi_settings=TDI,
-        filters={"trend_context": args.trend_context, "require_hh_hl": args.trend_context,
-                 "max_internal_depth": 2, "hvb_window": args.hvb_window,
-                 "setup_target_rr": 4.0, "breaker_body_atr": 1.0,
-                 "confirm_mode": "all", "regime": not args.no_regime},
+        filters={
+            "trend_context": args.trend_context,
+            "require_hh_hl": args.trend_context,
+            "clear_structure": args.trend_context,
+            "min_trend_steps": 2,
+            "min_directional_ratio": 0.75,
+            "fresh_shift_max_bars": 20,
+            "require_bos": args.trend_context,
+            "max_internal_depth": 2,
+            "hvb_window": args.hvb_window,
+            "setup_target_rr": 4.0,
+            "breaker_body_atr": 1.0,
+            "breaker_stop_buffer_atr": 0.10,
+            "confirm_mode": "all",
+            "regime": not args.no_regime,
+            "regime_adx_min": 22.0,
+            "regime_er_min": 0.30,
+        },
         structure={"pivot_len": 5, "major_len": 20, "macro_len": 80, "sweep_max_wait": 60,
                    "target_mode": "next"},
     )
@@ -69,7 +83,11 @@ def main() -> int:
                     help="0 keeps the shipped same-candle body-break + HVB rule")
     ap.add_argument("--db", default=str(ROOT / "data" / "tdigm.sqlite3"))
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--trend-context", action="store_true", help="re-apply the HH/HL gate")
+    trend = ap.add_mutually_exclusive_group()
+    trend.add_argument("--trend-context", dest="trend_context", action="store_true", default=True,
+                       help="apply the shipped strict structural-context gate (default)")
+    trend.add_argument("--no-trend-context", dest="trend_context", action="store_false",
+                       help="research only: disable structural-context and BOS gates")
     ap.add_argument("--no-regime", action="store_true")
     args = ap.parse_args()
 

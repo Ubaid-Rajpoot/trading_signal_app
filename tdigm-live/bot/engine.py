@@ -60,7 +60,8 @@ MAX_CANDLES = 180
 
 
 def sweep_chain_errors(
-    payload: dict[str, Any], *, require_hvb: bool = True, require_leg_proof: bool = False
+    payload: dict[str, Any], *, require_hvb: bool = True, require_leg_proof: bool = False,
+    require_single_sweep: bool = False,
 ) -> list[str]:
     """Return hard integrity failures for a TDIGM sweep signal.
 
@@ -84,7 +85,9 @@ def sweep_chain_errors(
         except (TypeError, ValueError, OverflowError):
             return 0
 
-    require_leg_proof = require_leg_proof or as_int(payload.get("chain_version")) >= 2
+    chain_version = as_int(payload.get("chain_version"))
+    require_leg_proof = require_leg_proof or chain_version >= 2
+    require_single_sweep = require_single_sweep or chain_version >= 3
     side = str(payload.get("side") or setup.get("side") or "").upper()
     swept_side = str(setup.get("swept_side") or payload.get("swept_side") or "").lower()
     swept_level = setup.get("swept_level", payload.get("swept_level"))
@@ -98,6 +101,12 @@ def sweep_chain_errors(
 
     if side not in {"LONG", "SHORT"}:
         errors.append("signal side is missing")
+    swept_levels = setup.get("swept_levels", payload.get("swept_levels"))
+    if require_single_sweep:
+        if as_int(setup.get("swept_count") or payload.get("swept_count")) != 1:
+            errors.append("signal must sweep exactly one structural high/low")
+        if not isinstance(swept_levels, list) or len(swept_levels) != 1:
+            errors.append("single swept-level proof is missing or ambiguous")
     expected_sweep = "low" if side == "LONG" else "high"
     if swept_side != expected_sweep:
         errors.append(f"{side or 'signal'} requires a preceding {expected_sweep} sweep")
@@ -107,6 +116,14 @@ def sweep_chain_errors(
         level = 0.0
     if not math.isfinite(level) or level <= 0:
         errors.append("swept level is missing")
+    if require_single_sweep and isinstance(swept_levels, list) and len(swept_levels) == 1:
+        proof = swept_levels[0] if isinstance(swept_levels[0], dict) else {}
+        try:
+            proof_price = float(proof.get("price"))
+        except (TypeError, ValueError):
+            proof_price = 0.0
+        if proof.get("side") != swept_side or not math.isclose(proof_price, level, rel_tol=1e-9):
+            errors.append("single swept-level proof does not match the swept endpoint")
     if sweep_ms <= 0:
         errors.append("sweep time is missing")
     if break_ms <= sweep_ms:
@@ -526,7 +543,17 @@ class Engine:
             key = str(row.get("key") or "")
             if not key:
                 continue
-            errors = sweep_chain_errors(row, require_hvb=require_hvb)
+            # A row that still claims to be tradeable must prove every current
+            # invariant, regardless of which older binary wrote it. Historical
+            # closed rows remain inspectable, but no legacy pending row may be
+            # rehydrated on weaker same-leg/single-sweep evidence.
+            tradeable = bool(row.get("valid"))
+            errors = sweep_chain_errors(
+                row,
+                require_hvb=require_hvb,
+                require_leg_proof=tradeable,
+                require_single_sweep=tradeable,
+            )
             audited[key] = errors
             self.integrity_checked += 1
             if not errors:
@@ -546,7 +573,15 @@ class Engine:
             key = row.get("key")
             if not key or key in self.setup_payloads:
                 continue
-            errors = audited.get(str(key), sweep_chain_errors(row, require_hvb=require_hvb))
+            errors = audited.get(str(key))
+            if errors is None:
+                tradeable = bool(row.get("valid"))
+                errors = sweep_chain_errors(
+                    row,
+                    require_hvb=require_hvb,
+                    require_leg_proof=tradeable,
+                    require_single_sweep=tradeable,
+                )
             row.update({"chain_valid": not errors, "chain_errors": errors})
             self.setup_payloads[key] = row
             self._restore_stored_record(row)
@@ -1406,6 +1441,7 @@ class Engine:
                 alert,
                 require_hvb=bool(self.filters.config.get("hvb", True)),
                 require_leg_proof=True,
+                require_single_sweep=True,
             )
             if errors:
                 reason = "integrity: " + "; ".join(errors)
@@ -1541,6 +1577,7 @@ class Engine:
             int(setup.get("broke_level_time") or 0),
             stop,
             min_body_atr=float(self.filters.config.get("breaker_body_atr") or 1.0),
+            stop_buffer_atr=float(self.filters.config.get("breaker_stop_buffer_atr", 0.10)),
         )
         zones = [zone for zone in (breaker, block) if zone is not None]
         # Until a zone is actually mitigated this is only the nearest planned
@@ -1604,7 +1641,7 @@ class Engine:
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
         payload["kind"] = "signal"
         payload["strategy"] = "sweep"
-        payload["chain_version"] = 2
+        payload["chain_version"] = 3
         payload["key"] = key
         payload["setup"] = setup
         payload["chain_valid"] = True

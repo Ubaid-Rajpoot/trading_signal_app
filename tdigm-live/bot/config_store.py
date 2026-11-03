@@ -36,14 +36,15 @@ _INT_KEYS = {"max_bars_since_sweep", "trend_ema", "cooldown_minutes", "bos_max_a
 _FLOAT_KEYS = {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
                "premium_level", "pool_tolerance", "pool_count", "structure_atr_min",
                "structure_atr_max", "volume_mult", "confirm_min_score", "setup_target_rr",
-               "breaker_body_atr"}
+               "breaker_body_atr", "breaker_stop_buffer_atr", "min_directional_ratio"}
 _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
-              "trend_context", "require_hh_hl", "require_bos", "volume_break"}
+              "trend_context", "require_hh_hl", "require_bos", "volume_break",
+              "clear_structure"}
 # whole-number keys that must stay integers.  Depth starts at one; windows may
 # intentionally be zero (same-candle HVB, and no age-only setup expiry).
-_COUNT_KEYS = {"max_internal_depth"}
-_ZERO_COUNT_KEYS = {"setup_max_bars", "hvb_window"}
+_COUNT_KEYS = {"max_internal_depth", "min_trend_steps"}
+_ZERO_COUNT_KEYS = {"setup_max_bars", "hvb_window", "fresh_shift_max_bars"}
 
 
 def read(path: str | Path) -> dict[str, Any]:
@@ -147,4 +148,5 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
             merged[key] = sides or ["long", "short"]
         elif key == "sessions":
             merged[key] = [str(s) for s in (value or [])][:8]
+    merged["min_directional_ratio"] = min(1.0, merged["min_directional_ratio"])
     return merged

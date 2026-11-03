@@ -12,12 +12,19 @@ makes each of them a switch:
 4. a **high-volume bar** can be demanded as well — and (3) and (4) can be
    combined, either as hard AND rules or as a weighted score.
 
-This page is the honest record: what each rule computes, what it rejects, what
-it measured on real candles, and where the measurement is too weak to claim
-anything.
+This page is the honest record: what each rule computes, what it rejects, and
+where old measurements are too weak or too stale to support a claim.
 
-Legend: **on** = shipped default · **off** = implemented, switchable, left off
-because the data did not support it.
+> **Current-policy boundary (lifecycle v3).** The historical tables below predate
+> exactly-one-sweep structure, breaker-local stops and mitigation-only 4R. They
+> are retained as labelled research, not presented as current results. The live
+> policy now requires repeated major/macro progression (at least two high and two
+> low steps, at least 75% recent directional consistency) plus a clear local leg
+> or range release. A mixed left-side range passes only after a fresh major/macro
+> body close beyond the furthest remembered range edge. ADX ≥ 22 and ER ≥ 0.30
+> remain additional gates; they cannot certify trend by themselves.
+
+Legend: **on** = shipped default · **off** = implemented, switchable, left off.
 
 ---
 
@@ -34,17 +41,21 @@ at three degrees:
 
 From those pivots it keeps:
 
-* `external.direction` — `+1` if the last two major (or, if there are none,
-  macro) swing highs **and** lows both rose, `-1` if both fell, `0` if mixed.
-  `hh_tolerance_atr` (0.10 ATR) lets an "equal" high count as an extension, so
-  one flat swing does not flip the label;
-* `external.clean` — true only when the *whole* visible sequence is HH+HL (or
-  LH+LL), not just the last leg. This is the stricter of the two readings and is
-  what the "clean HH+HL" switch tests;
+* `direction` / `clean` — `+1` when the latest highs and lows both rose, `-1`
+  when both fell, and no direction when mixed;
+* `trend_steps` — the smaller of the consecutive high-side and low-side runs, so
+  one side cannot hide repeated oscillation on the other;
+* `directional_ratio` — how many of up to four recent steps on each side agree
+  with that direction; the shipped gate requires at least 75%;
+* `range_like` — true when direction is mixed, either side has no continuing
+  step, or recent agreement is below the structural floor;
 * `external.source` — `major` or `macro`, printed on the card so you can see how
   much history the label rests on;
-* `bos_direction` / `bos_age` — the direction of the last close through a swing,
-  and how many bars ago it happened;
+* `bos_direction` / `bos_age` — the direction and age of the last body close
+  through a swing;
+* `bos_range_break` / `bos_range_edge` — whether that close passed the furthest
+  remembered same-side boundary, rather than merely breaking a newer pivot still
+  inside an older range;
 * `depth(side, kind, index)` — how many degrees of structure the setup sits
   inside: **1** = the break that created it is itself the external break,
   **2** = the first internal break inside an external trend, **3+** = internal
@@ -57,9 +68,11 @@ The card shows all of it: `external bullish (HH+HL) · last break of structure u
 
 | rule | config key | default | rejection text on the page |
 |---|---|---|---|
-| trade must agree with the external trend | `trend_context` | **on** | `against external trend`, `no external trend` |
-| the whole sequence must be HH+HL / LH+LL | `require_hh_hl` | **on** | `external structure is mixed, not a clean HH+HL sequence` |
-| a break of structure must have happened in the trade's direction | `require_bos` | **on** | `break of structure the other way`, `no break of structure` |
+| evaluate structural context | `trend_context` / `clear_structure` | **on / on** | `ranging/unclear structure to the left` |
+| repeated high-side and low-side progression | `min_trend_steps` | **2** | included in the clear-structure reason |
+| recent structural consistency | `min_directional_ratio` | **0.75** | included in the clear-structure reason |
+| fresh full-range shift may establish a new direction | `fresh_shift_max_bars` | **20** | stale/internal-only breaks do not clear the context gate |
+| a break of structure must have happened in the trade's direction | `require_bos` | **on** | `no recent structure break in the trade direction` |
 | …and it must be recent | `bos_max_age` | **240 bars** | `break of structure is stale (312 bars)` |
 | how deep inside the structure a setup may sit | `max_internal_depth` | **2** | `internal within internal` |
 | high-volume signal candle (≥ N× average) | `volume_break` / `volume_mult` / `volume_period` | **off** / 1.5× / 20 | `volume 0.83× < 1.5×` |
@@ -75,9 +88,10 @@ so a signal is never just "trust me".
 All switches live in ⚙ **Trend & structure** and **Confirm the break** in the
 page, and are written to `config.json`.
 
-## 3. What it rejected, and how often
+## 3. Legacy replay: what the earlier policy rejected
 
-One full replay of BTCUSDT 1-minute candles, 2024-07-01 → 2025-06-29 (911 days),
+These counts are **not lifecycle-v3 counts** and cannot be used as current signal
+frequency or performance. One earlier replay of BTCUSDT 1-minute candles, 2024-07-01 → 2025-06-29 (911 days),
 on 5m / 15m / 30m / 1h, with the shipped defaults
 (`python tools/scan_history.py data/btc --timeframes 5m,15m,30m,1h`):
 
@@ -103,9 +117,9 @@ reason each was dropped:
 That is **~0.07 signals per day per symbol** on four timeframes. The point of
 round 17 was selectivity, and this is what selectivity looks like.
 
-## 4. Measured: does each new gate earn its place?
+## 4. Legacy measurement (2R research, not the current lifecycle)
 
-Same data, same replay, 2R fixed target (`--score-target fixed --score-r 2`),
+Same old data and replay, with a synthetic 2R fixed target (`--score-target fixed --score-r 2`),
 signals walked forward on their own timeframe. 8 signals are unscored because
 price never reached either level inside the horizon; they count in *signals*,
 not in *win%* or *R*.
@@ -186,29 +200,34 @@ turn `trend_context` off and keep `require_bos`.
 * **BOS-other-way is the one exception worth naming**: −0.12 vs +0.24 is
   directionally consistent across the buckets and is the reason `require_bos` is
   on.
-* **The structure target is usually absent.** Scored with the *structure* target
-  (the next opposite range extreme) 34 of 37 trades were unscorable and the
-  median R:R was 0.28 — the target is usually behind the entry. Every number
-  here therefore uses a **fixed 2R** target, which is not what the live bot
-  trades; the live bot still uses the structure target and a minimum R:R.
+* **The old structure-target study is not current scoring.** In that study the
+  next opposite range extreme left 34 of 37 trades unscorable and median R:R was
+  0.28, so the table used synthetic 2R. The live lifecycle now waits for actual
+  order-block/breaker mitigation and then arms fixed 4R from the selected
+  post-fill stop.
 * **Eight configs, chosen after looking at the data.** This is exploratory
   fitting on one dataset, not a pre-registered test. Out-of-sample confirmation
   would need `data/btc_oos` (2023-07 → 2024-06), which is not in this workspace.
 * **Timeframe pooling.** All four timeframes are pooled in the headline rows;
   per-timeframe counts are 25–48 each, which is far too few to compare.
 
-## 6. Reproduce it
+## 6. Re-run the study method
+
+The current detector intentionally will not reproduce the superseded counts: it
+rejects multi-sweep fixtures and uses the stricter defaults. These commands show
+the study workflow on a compatible local dataset and produce current-policy
+output.
 
 ```bash
 cd tdigm-live
-# the shipped default
+# the current shipped policy
 python tools/scan_history.py data/btc --timeframes 5m,15m,30m,1h \
     --target range --score-target fixed --score-r 2
 
 # row A: switch the round-17 gates off
 python tools/scan_history.py data/btc --timeframes 5m,15m,30m,1h \
     --target range --score-target fixed --score-r 2 \
-    --no-trend-context --no-hh-hl --no-bos --max-depth 9
+    --no-trend-context --no-hh-hl --no-clear-structure --no-bos --max-depth 9
 
 # row F: add the high-volume requirement;  row G: score mode
 python tools/scan_history.py data/btc --timeframes 5m,15m,30m,1h \

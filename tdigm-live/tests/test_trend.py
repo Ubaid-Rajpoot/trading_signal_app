@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot.trend import TrendMap  # noqa: E402
+from bot.trend import Pivot, TrendMap  # noqa: E402
 
 SMALL = {"minor_len": 2, "major_len": 4, "macro_len": 8, "hh_tolerance_atr": 0.0}
 
@@ -88,6 +88,44 @@ def test_a_range_is_not_a_trend_no_matter_how_often_it_sweeps():
     # it still has swings and still detects breaks - structure is not absent,
     # the *trend* is. That is what the gate is for.
     assert state["minor"]["pivots"]["highs"] > 0
+
+
+def test_range_release_closes_beyond_the_furthest_remembered_edge():
+    """Breaking a newer pivot inside a range is not the same as leaving it."""
+    tmap = TrendMap(SMALL)
+    highs = tmap.degrees["major"].highs
+    highs.extend([
+        Pivot("high", 110.0, 1),  # visible left-side range edge
+        Pivot("high", 108.0, 2),  # newer, but still inside that range
+    ])
+    tmap.count = 10
+
+    inside = {"open": 107.0, "high": 109.5, "low": 106.5, "close": 109.0,
+              "close_time": 10 * 60_000, "volume": 10.0}
+    state = tmap.add(inside, atr=1.0)
+    assert state["major"]["bos_direction"] == 1
+    assert state["major"]["bos_range_break"] is False
+    assert highs[-1].broken and not highs[0].broken
+
+    release = {"open": 109.0, "high": 112.0, "low": 108.5, "close": 111.0,
+               "close_time": 11 * 60_000, "volume": 10.0}
+    state = tmap.add(release, atr=1.0)
+    assert state["major"]["bos_range_break"] is True
+    assert state["major"]["bos_range_edge"] == 110.0
+    assert tmap.degrees["major"].bos(1)["price"] == 110.0
+
+
+def test_one_displacement_can_clear_local_and_outer_range_boundaries():
+    tmap = TrendMap(SMALL)
+    highs = tmap.degrees["major"].highs
+    highs.extend([Pivot("high", 110.0, 1), Pivot("high", 108.0, 2)])
+    tmap.count = 10
+    release = {"open": 107.0, "high": 112.0, "low": 106.5, "close": 111.0,
+               "close_time": 10 * 60_000, "volume": 10.0}
+    state = tmap.add(release, atr=1.0)
+    assert state["major"]["bos_range_break"] is True
+    assert all(pivot.broken for pivot in highs)
+    assert len(tmap.degrees["major"].bos_events) == 1
 
 
 def test_a_break_of_structure_needs_a_close_not_a_wick():
