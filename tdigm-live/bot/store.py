@@ -116,8 +116,8 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_CHAIN_VERSION = 5
-CURRENT_LIFECYCLE_VERSION = 6
+CURRENT_CHAIN_VERSION = 6
+CURRENT_LIFECYCLE_VERSION = 7
 CURRENT_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 

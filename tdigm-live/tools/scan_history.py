@@ -7,7 +7,7 @@ a folder of real CSV files. Nothing here can produce a signal the live bot would
 not produce.
 
     python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 5m,15m,30m,1h
-    python tools/scan_history.py data/btc --symbol BTCUSDT --no-hvb --min-rr 1.5
+    python tools/scan_history.py data/btc --symbol BTCUSDT --hvb-points 1.5
 """
 
 from __future__ import annotations
@@ -69,9 +69,7 @@ async def main() -> int:
     ap.add_argument("--max-bars", type=int, default=0)
     ap.add_argument("--trend", default="off")
     ap.add_argument("--target", default="next", choices=["next", "range"])
-    ap.add_argument("--no-hvb", action="store_true")
-    ap.add_argument("--hvb-points", type=float, default=1.0, help="how far the price line must break the centre band, in RSI points")
-    ap.add_argument("--centre", default="mbl", choices=["mbl", "fifty"], help="which line is the centre band")
+    ap.add_argument("--hvb-points", type=float, default=1.0, help="how far the price line must break the moving centre band, in RSI points")
     ap.add_argument("--hvb-speed", type=float, default=1.5,
                     help="this candle's step must be this many times the price line's average step")
     ap.add_argument("--no-regime", action="store_true", help="switch the ADX/ER trend gate off")
@@ -151,10 +149,10 @@ async def main() -> int:
         symbols=[args.symbol],
         timeframes=args.timeframes.split(","),
         tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9,
-                      "band_mult": 1.6185, "hvb_reference": args.centre},
+                      "band_mult": 1.6185, "hvb_reference": "mbl"},
         filters={
             "structure": not args.no_structure,
-            "hvb": not args.no_hvb,
+            "hvb": True,
             "hvb_min_points": args.hvb_points,
             "hvb_window": args.hvb_window,
             "break": bool(args.require_break),

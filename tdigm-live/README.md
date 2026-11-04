@@ -71,12 +71,12 @@ both sides first.
 r        = RSI(close, 50)
 fast     = SMA(r, 1)              # the price line (purple)
 slow     = SMA(r, 9)              # trade signal line (red)
-mbl      = SMA(r, 50)             # market base line = YELLOW line
+mbl      = SMA(r, 50)             # moving centre line (black in the supplied chart)
 upper    = mbl + 1.6185*stdev(r, 50)
 lower    = mbl - 1.6185*stdev(r, 50)
 centre   = (upper + lower) / 2    # exactly equals mbl - this is the centre band
 
-HVB up   = on this candle: fast was at/below the centre, closes above it,
+HVB up   = previous candle: fast <= previous MBL; this candle: fast > current MBL,
            by at least `hvb_min_points` RSI points, with a step of at least
            `hvb_min_speed` x the line's own average step
 HVB down = the mirror image
@@ -89,21 +89,23 @@ What is **not** an HVB, and never was meant to be:
 | price line touches / rides the **upper** band | no | outer bands are context, not the trigger |
 | price line touches / rides the **lower** band | no | same |
 | price line crosses the **slow** (red) line | no | that is the TDI's own signal-line cross |
+| price line crosses the fixed RSI **50 axis** but not the moving MBL | no | the fixed-axis alternate has been removed |
 | price line drifts back across the centre by 0.1 pts | no | no speed, no break |
 | price line crosses the centre and closes 2 pts beyond it in one candle | **yes** | the HVB |
 
 The bands are drawn on the page, but `bot/indicators.py` never reads `upper` /
-`lower` in any rule - only `centre_of(point)` decides. There is a test that
-proves a ride along an outer band produces no HVB.
+`lower` in any rule - only the moving MBL from `centre_of(point)` decides. A
+purple spike that crosses an outer blue band while already above/below the MBL
+is explicitly tested and is **not** an HVB. The old fixed RSI-50 alternative has
+been removed.
 
-Two settings control the "with speed" part, both live on the page and saved to
-`config.json`:
+Two settings control the "with speed" part and are saved to `config.json`:
 
 | setting | default | meaning |
 |---|---|---|
 | `hvb_min_points` | **1.0** | how far past the centre the line must **close**, in RSI points |
 | `hvb_min_speed` | **1.5** | this candle's step, in multiples of the line's average step over 50 candles |
-| `tdi.hvb_reference` | `mbl` | which line is "the centre": `mbl` (middle of the bands) or `fifty` |
+| `tdi.hvb_reference` | **fixed `mbl`** | compatibility field only; the moving middle band is the sole trigger |
 
 Why those numbers: on real 1m BTC the median centre break is only **0.60 RSI
 points** (43% under 0.5, 70% under 1.0), and only **4%** of centre crossings
@@ -112,6 +114,9 @@ the grazes, and the speed gate removes the slow drifts, without touching the
 genuine breaks.
 
 The HVB must happen **on the confirming candle** — same candle, not "recently".
+It cannot be disabled by saved filters, and score mode cannot replace it with
+other confluence points. Current chain-v6 rows store previous/current purple-line
+and MBL values so the crossing is auditable rather than merely labelled `HVB`.
 
 **Setups only form in a trending market.**
 
@@ -168,16 +173,16 @@ first internal break inside an external trend (allowed) · **3+** internal withi
 internal (**skipped**). Read from three degrees of pivots — minor 5, major 20,
 macro 80 — with a 0.10 ATR tolerance.
 
-### Confirming the break: HVB, volume, or both
+### Confirming the break: HVB mandatory, volume optional
 
-The HVB (price line through the centre band) and a **high-volume bar** (candle
-volume ≥ N× the average of the previous bars) can be required separately or
-together:
+The same-candle moving-MBL HVB is always required. A **high-volume bar** (candle
+volume ≥ N× the average of previous bars) and other confluences can then be
+combined in either mode:
 
-* `confirm_mode: "all"` — hard AND; every switch that is on must hold (default);
-* `confirm_mode: "score"` — each piece of evidence contributes a weight and the
-  total must reach `confirm_min_score`. The score and its parts are printed on
-  every card (`score 85`), so you can see exactly what it was worth.
+* `confirm_mode: "all"` — hard AND for every enabled optional gate (default);
+* `confirm_mode: "score"` — optional evidence contributes a weight and the total
+  must reach `confirm_min_score`, but the score can never replace the HVB. The
+  score and its parts are printed on every card (`score 85`).
 
 Every alert now shows its evidence: `external bullish (HH+HL) · last break of
 structure up, 42 bars ago · depth 2 internal · volume 1.81× · score 85`.
@@ -246,15 +251,18 @@ remembered trend consistency. **Lifecycle v5 replaced the fixed exit** with the
 favorable H/L of the displacement leg that starts at the sweep and contains the
 same-candle HVB/body break. Fully closed pending candles may extend that extreme;
 the mitigation candle is excluded and the previous extreme freezes on fill.
-**Lifecycle v6 / chain v5 adds the direct-approach rule:** after the paired
+Lifecycle v6 / chain v5 added the direct-approach rule: after the paired
 opposite endpoint forms, price must travel into the sweep without an intervening
 pivot. It may take any path only after that sweep while seeking the opposite body
-break. Deep replay intentionally replaces outcomes graded under any older rule set. The
-board computes win rate and R/trade from current-version mitigated rows, not
-memory.
+break. **Lifecycle v7 / chain v6 makes the HVB exact:** only a same-candle cross
+of the moving MBL counts, and every row stores the four crossing values under
+`mbl_centre_cross_v1`. Fixed-50, outer-band, slow-line, filter-disable, and score
+substitution paths cannot publish a sweep signal. Deep replay intentionally
+replaces outcomes graded under any older rule set. The board computes win rate
+and R/trade from current-version mitigated rows, not memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
-`paired opposite endpoint → direct move with no intervening pivot → exactly one H/L sweep → later body close through that paired endpoint → correctly directed same-candle HVB`.
+`paired opposite endpoint → direct move with no intervening pivot → exactly one H/L sweep → later body close through that paired endpoint + mathematically proven same-candle moving-MBL cross`.
 Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
@@ -270,15 +278,15 @@ there is no universal fixed break-even percentage.
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
 
-A deterministic lifecycle-v6 / chain-v5 regression over 1,317,520 BTCUSDT
+A deterministic lifecycle-v7 / chain-v6 regression over 1,317,520 BTCUSDT
 one-minute bars (2022-07-01 through 2024-12-31), rolled into all nine configured
 timeframes, retained 64 setups: 17 target wins, 46 stops, and one still-pending
 unmitigated setup. That sample's win rate was 26.98%, mean result −0.310R/trade,
 and 95% interval −0.713R to +0.094R (**not proven**). It is a single-symbol
 regression, not a claim about the live MEXC universe. All 64 rows carried zero
-approach pivots. Input hash, exact command, per-timeframe counts, comparison with
-the superseded broader policy, and limitations are in
-[`docs/lifecycle-v6-regression-2026-11-04.md`](docs/lifecycle-v6-regression-2026-11-04.md).
+approach pivots and valid four-value moving-MBL crossing proof. Input hash, exact
+command, per-timeframe counts, proof audit, and limitations are in
+[`docs/lifecycle-v7-regression-2026-11-04.md`](docs/lifecycle-v7-regression-2026-11-04.md).
 
 ### Concurrent history and live scanning
 
@@ -442,7 +450,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | filter | default | what it does |
 |---|---|---|
 | **structure** | on | the sweep → opposite break must be present. This is the setup itself. |
-| **HVB** | on | the price line crosses the **centre band** on the signal candle |
+| **HVB** | **mandatory** | the purple price line crosses the moving black MBL on the signal/body-break candle; cannot be disabled or replaced by score |
 | **HVB break** | 1.0 pts | the cross must close at least this far past the centre (0 = every graze counts) |
 | **HVB speed** | 1.5× | this candle's step against the line's average step (0 = no speed requirement) |
 | **trending markets only** | on | ADX(14) and the efficiency ratio must both clear their lines |
@@ -455,7 +463,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 | **FVG required** | off | the displacement must leave an imbalance (p.87) |
 | **MS required** | off | the confirming break must be major (it never is — see the doc) |
 | **premium / discount** | off, 0.5 | the sweep (or the entry) must sit in premium for shorts / discount for longs |
-| **centre band** | middle of bands | `mbl` (yellow line, middle of upper/lower) or `fifty` (the 50 axis) |
+| **centre band** | **fixed moving MBL** | middle of the outer bands; fixed-50, slow-line and outer-band triggers are invalid |
 | **20-bar break** | off | the older rule (close beyond the last 20 highs/lows) as an extra condition |
 | **min R:R** | 0 | legacy/provisional confirmation-close gate; keep at 0 because the final entry, stop and variable target R are not all frozen until mitigation |
 | **max bars after sweep** | 0 | skip reversals that took too long to arrive |
@@ -473,7 +481,7 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 Every rejection is counted and shown ("no HVB on this candle 623"), so a quiet
 screen is explained instead of looking broken.
 
-### Legacy regime experiment (not current v6 results)
+### Legacy regime experiment (not current v7 results)
 
 The tables below are retained as an audit of an earlier detector and its
 range-extreme/2R research scoring. They predate exactly-one-sweep validation,
@@ -481,7 +489,7 @@ strict left-context structure, breaker-local stops, mitigation-first activation,
 the confirmation-leg H/L exit, the direct paired-endpoint-to-sweep rule, and the
 current ADX 22 / ER 0.30 policy. They **must not** be quoted as the current win
 rate. MEXC is unreachable from the development sandbox, so there is no honest
-production-universe lifecycle-v6 result to report yet.
+production-universe lifecycle-v7 result to report yet.
 
 The earlier experiment used two years of BTCUSDT 1-minute candles. One year was
 the exploratory sample and the other was held out.
@@ -527,9 +535,10 @@ with and without that trend gate:
 | 2023-07 → 2024-06 | −0.03 | −0.09 |
 
 Read that honestly: the legacy trend gate was a discipline rule, not proven
-alpha. Current lifecycle-v6 results must instead count only setups that meet the
-new direct-approach structure rules, are actually mitigated, and then reach either their
-post-fill stop or their frozen confirmation-leg H/L target.
+alpha. Current lifecycle-v7 results count only setups with a proven same-candle
+moving-MBL cross and the direct-approach structure rules. Each trade must then be
+mitigated and reach either its post-fill stop or frozen confirmation-leg H/L
+target.
 
 Re-run the current policy on a compatible local dataset (the counts will not
 match the superseded tables above):
@@ -552,14 +561,12 @@ python tools/scan_history.py data/btc_oos --symbol BTCUSDT --timeframes 1m,5m,15
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,5m,15m,30m,1h --target range --adx-min 22 --er-min 0.15
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,5m,15m,30m,1h --target range --no-regime --hvb-speed 0
 
-# the tolerance sweep, and the two reference lines
+# moving-MBL crossing-strength tolerance sweep
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --hvb-points 0
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --hvb-points 0.5
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --hvb-points 2
-python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --centre fifty
 
-# the comparisons
-python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --no-hvb
+# a legacy/provisional confirmation-close RR comparison
 python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 1m,3m,5m,15m,30m,1h --target range --min-rr 1.0
 ```
 

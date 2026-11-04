@@ -7,10 +7,11 @@ A complete setup is the drawing:
     2. price pokes through it                    -> the liquidity is taken
     3. price then closes through the OPPOSITE swing, on the other side
                                                  -> the reversal is confirmed
-    4. the TDIGM purple line crosses the centre band (HVB) -> momentum agrees
+    4. on that same candle, TDIGM purple crosses the moving MBL -> HVB
 
-Step 2 and 3 are the structure, step 4 is the trader's TDIGM (50, 50, 1, 9).
-Everything the trader switched on in ``filters`` must also agree, and every
+Step 2 and 3 are the structure; step 4 is the mandatory trader's TDIGM
+(50, 50, 1, 9) trigger. Everything else switched on in ``filters`` must also
+agree, and every
 rejection is counted so the page can explain the quiet.
 
 Alerts only ever come from CLOSED candles. The candle that is still forming is
@@ -40,7 +41,16 @@ from .confluence import (
     zone_of,
 )
 from .filters import Filters
-from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
+from .indicators import (
+    HVB_MODEL,
+    TdiPoint,
+    TdiTracker,
+    break_signal,
+    centre_cross_evidence,
+    centre_of,
+    hvb_signal,
+    tdi,
+)
 from .regime import RegimePoint, RegimeTracker
 from .book.narrative import BookSettings
 from .book.runner import BookRunner
@@ -58,9 +68,10 @@ from .structure import APPROACH_MODEL, LEG_MODEL, Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
-CURRENT_CHAIN_VERSION = 5
+CURRENT_CHAIN_VERSION = 6
 CURRENT_LEG_MODEL = LEG_MODEL
 CURRENT_APPROACH_MODEL = APPROACH_MODEL
+CURRENT_HVB_MODEL = HVB_MODEL
 
 
 def sweep_chain_errors(
@@ -92,6 +103,7 @@ def sweep_chain_errors(
     chain_version = as_int(payload.get("chain_version"))
     require_leg_proof = require_leg_proof or chain_version >= 2
     require_single_sweep = require_single_sweep or chain_version >= 3
+    require_hvb = require_hvb or chain_version >= 6
     side = str(payload.get("side") or setup.get("side") or "").upper()
     swept_side = str(setup.get("swept_side") or payload.get("swept_side") or "").lower()
     swept_level = setup.get("swept_level", payload.get("swept_level"))
@@ -190,6 +202,28 @@ def sweep_chain_errors(
             errors.append("HVB and body break are not on the same candle")
         if lag not in (None, 0, "0"):
             errors.append("HVB lag is not zero")
+    if chain_version >= 6:
+        hvb_model = str(payload.get("hvb_model") or "")
+        proof_names = (
+            "hvb_prev_fast", "hvb_prev_centre", "hvb_fast", "hvb_centre",
+        )
+        try:
+            proof = {name: float(payload[name]) for name in proof_names}
+            proof_valid = all(math.isfinite(value) for value in proof.values())
+        except (KeyError, TypeError, ValueError, OverflowError):
+            proof, proof_valid = {}, False
+        if hvb_model != CURRENT_HVB_MODEL or not proof_valid:
+            errors.append("moving-centre-band HVB crossing proof is missing")
+        elif hvb == "up" and not (
+            proof["hvb_prev_fast"] <= proof["hvb_prev_centre"]
+            and proof["hvb_fast"] > proof["hvb_centre"]
+        ):
+            errors.append("bullish HVB did not cross the moving centre band on this candle")
+        elif hvb == "down" and not (
+            proof["hvb_prev_fast"] >= proof["hvb_prev_centre"]
+            and proof["hvb_fast"] < proof["hvb_centre"]
+        ):
+            errors.append("bearish HVB did not cross the moving centre band on this candle")
 
     lifecycle_version = as_int(payload.get("lifecycle_version"))
     target_model = str(payload.get("target_model") or setup.get("target_model") or "")
@@ -403,12 +437,17 @@ class Engine:
     ) -> None:
         self.symbols = list(dict.fromkeys(s.upper() for s in symbols))
         self.timeframes = [tf for tf in timeframes if tf in TIMEFRAMES]
-        self.tdi_settings = tdi_settings
-        self.centre_reference = str(tdi_settings.get("hvb_reference", "mbl"))
+        self.tdi_settings = {**tdi_settings, "hvb_reference": "mbl"}
+        # HVB has exactly one trigger: the purple price line crossing TDIGM's
+        # moving middle band. Older configs may still contain ``fifty``; never
+        # let that fixed-axis option change signal classification.
+        self.centre_reference = "mbl"
         self.break_lookback = int(break_lookback)
         self.structure_settings = dict(structure or {})
         self.broadcast = broadcast
         self.filters = Filters(filters or {})
+        self.filters.config["hvb"] = True
+        self.filters.config["hvb_window"] = 0
         # The active filter values are the one source of truth.  Previously the
         # engine started at the obsolete top-level value (usually zero) until a
         # user edited the settings page.
@@ -560,6 +599,8 @@ class Engine:
 
     def set_filters(self, filters: dict[str, Any]) -> None:
         self.filters = Filters(filters or {})
+        self.filters.config["hvb"] = True
+        self.filters.config["hvb_window"] = 0
         # the HVB gates live in the filter config: one source of truth
         self.hvb_min_points = float(self.filters.config.get("hvb_min_points", self.hvb_min_points) or 0)
         self.hvb_min_speed = float(self.filters.config.get("hvb_min_speed", self.hvb_min_speed) or 0)
@@ -571,9 +612,9 @@ class Engine:
             cell.regime_limits = limits
 
     def set_centre(self, reference: str) -> str:
-        """Which line is "the centre band" the price line must cross."""
-        self.centre_reference = reference if reference in {"mbl", "fifty"} else "mbl"
-        self.tdi_settings = {**self.tdi_settings, "hvb_reference": self.centre_reference}
+        """Keep legacy callers compatible while enforcing the sole MBL trigger."""
+        self.centre_reference = "mbl"
+        self.tdi_settings = {**self.tdi_settings, "hvb_reference": "mbl"}
         return self.centre_reference
 
     def set_structure(self, settings: dict[str, Any]) -> None:
@@ -1325,26 +1366,23 @@ class Engine:
     async def _evaluate(self, cell: Cell, bar: dict, point: TdiPoint) -> None:
         if len(cell.candles) < self.min_bars:
             return
-        prev = cell.tracker.prev
         hvb = None
         hvb_points = 0.0
         centre_cross = None
         hvb_speed = None
-        if prev is not None:
-            before = centre_of(prev, self.centre_reference)
-            centre = centre_of(point, self.centre_reference)
-            if before is not None and centre is not None:
-                if crossed_above(prev.fast, before, point.fast, centre):
-                    centre_cross = "up"
-                elif crossed_below(prev.fast, before, point.fast, centre):
-                    centre_cross = "down"
-                if centre_cross:
-                    hvb_points = (point.fast - centre) if centre_cross == "up" else (centre - point.fast)
-                    hvb_speed = line_speed(cell.tracker.history, len(cell.tracker.history) - 1)
-                    enough_points = self.hvb_min_points <= 0 or hvb_points >= self.hvb_min_points
-                    enough_speed = self.hvb_min_speed <= 0 or (hvb_speed is not None and hvb_speed >= self.hvb_min_speed)
-                    if enough_points and enough_speed:
-                        hvb = centre_cross
+        hvb_proof: dict[str, Any] | None = None
+        cross = centre_cross_evidence(
+            cell.tracker.history, len(cell.tracker.history) - 1
+        )
+        if cross is not None:
+            centre_cross = str(cross["side"])
+            hvb_points = float(cross["points"])
+            hvb_speed = float(cross["speed"])
+            enough_points = self.hvb_min_points <= 0 or hvb_points >= self.hvb_min_points
+            enough_speed = self.hvb_min_speed <= 0 or hvb_speed >= self.hvb_min_speed
+            if enough_points and enough_speed:
+                hvb = centre_cross
+                hvb_proof = cross
 
         brk = break_signal(list(cell.candles), len(cell.candles) - 1, self.break_lookback)
         structure = cell.structure
@@ -1364,9 +1402,14 @@ class Engine:
             "fast": _r(point.fast),
             "slow": _r(point.slow),
             "mbl": _r(point.mbl),
-            "centre": _r(centre_of(point, self.centre_reference)),
-            "centre_reference": self.centre_reference,
-            "centre_label": "middle of bands" if self.centre_reference == "mbl" else "50 midline",
+            "centre": _r(centre_of(point)),
+            "centre_reference": "mbl",
+            "centre_label": "moving middle band",
+            "hvb_model": HVB_MODEL if hvb_proof else None,
+            "hvb_prev_fast": float(hvb_proof["prev_fast"]) if hvb_proof else None,
+            "hvb_prev_centre": float(hvb_proof["prev_centre"]) if hvb_proof else None,
+            "hvb_fast": float(hvb_proof["fast"]) if hvb_proof else None,
+            "hvb_centre": float(hvb_proof["centre"]) if hvb_proof else None,
             "upper": _r(point.upper),
             "lower": _r(point.lower),
             "trend": cell.trend,
@@ -1524,17 +1567,22 @@ class Engine:
                 index = i - self.break_lookback if i >= self.break_lookback else 0
                 level = max(float(c["high"]) for c in candles[max(0, i - self.break_lookback):i]) if brk == "high" else min(float(c["low"]) for c in candles[max(0, i - self.break_lookback):i])
                 bos.append({"t": int(bar["open_time"]), "dir": 1 if brk == "high" else -1, "level": level})
-            prev, point = points[i - 1], points[i]
-            if prev is None or point is None:
-                continue
-            before = centre_of(prev, self.centre_reference)
-            centre = centre_of(point, self.centre_reference)
-            if before is None or centre is None:
-                continue
-            if crossed_above(prev.fast, before, point.fast, centre):
-                hvb.append({"t": int(bar["open_time"]), "side": "up"})
-            elif crossed_below(prev.fast, before, point.fast, centre):
-                hvb.append({"t": int(bar["open_time"]), "side": "down"})
+            proof = centre_cross_evidence(points, i)
+            side = hvb_signal(
+                points, i,
+                min_points=self.hvb_min_points,
+                min_speed=self.hvb_min_speed,
+            )
+            if side and proof is not None:
+                hvb.append({
+                    "t": int(bar["open_time"]),
+                    "side": side,
+                    "model": HVB_MODEL,
+                    "prev_fast": round(float(proof["prev_fast"]), 4),
+                    "prev_centre": round(float(proof["prev_centre"]), 4),
+                    "fast": round(float(proof["fast"]), 4),
+                    "centre": round(float(proof["centre"]), 4),
+                })
         return {"bos": bos[-40:], "hvb": hvb[-40:]}
 
     async def _confirm_pending(
@@ -1633,9 +1681,12 @@ class Engine:
     async def _publish(self, cell: Cell, alert: dict, bar: dict) -> None:
         kind = alert["kind"]
         if kind == "signal" and self.strategy == "sweep":
+            validation_payload = {**alert, "chain_version": CURRENT_CHAIN_VERSION}
             errors = sweep_chain_errors(
-                alert,
-                require_hvb=bool(self.filters.config.get("hvb", True)),
+                validation_payload,
+                # HVB is a structural invariant, not an optional score/filter:
+                # no sweep setup can publish without the same-candle MBL cross.
+                require_hvb=True,
                 require_leg_proof=True,
                 require_single_sweep=True,
             )
@@ -2263,7 +2314,11 @@ class Engine:
                 float(self.tdi_settings.get("band_mult", 1.6185)),
             )
             index = len(tail) - 1
-            hvb = hvb_signal(points, index, self.hvb_min_points, self.centre_reference)
+            hvb = hvb_signal(
+                points, index,
+                min_points=self.hvb_min_points,
+                min_speed=self.hvb_min_speed,
+            )
             cell.preview = {
                 "hvb": hvb,
                 "break": break_signal(tail, index, self.break_lookback),
@@ -2346,7 +2401,7 @@ class Engine:
         enough for the trader to see that the cross really happens at the band.
         """
         tail = list(cell.tracker.history)[-40:]
-        return [[round(p.fast, 2), round(centre_of(p, self.centre_reference) or 0.0, 2)] for p in tail if p.fast is not None]
+        return [[round(p.fast, 2), round(centre_of(p) or 0.0, 2)] for p in tail if p.fast is not None]
 
     # ------------------------------------------------------------ snapshot
     def snapshot(self) -> dict[str, Any]:
@@ -2431,7 +2486,15 @@ def _evidence(alert: dict) -> list[str]:
             f"({setup.get('break_kind', 'SHIFT')}{pairing})"
         )
     if alert.get("hvb"):
-        out.append(f"HVB {alert['hvb']} on the break candle ({_fmt(alert.get('hvb_points'))} pts)")
+        relation = "≤" if alert["hvb"] == "up" else "≥"
+        crossed = ">" if alert["hvb"] == "up" else "<"
+        out.append(
+            f"HVB {alert['hvb']} is an MBL cross on the break candle: "
+            f"{_fmt(alert.get('hvb_prev_fast'))} {relation} "
+            f"{_fmt(alert.get('hvb_prev_centre'))} → "
+            f"{_fmt(alert.get('hvb_fast'))} {crossed} "
+            f"{_fmt(alert.get('hvb_centre'))}"
+        )
     if alert.get("range_clearance"):
         out.append(str(alert["range_clearance"]))
     if external.get("direction"):

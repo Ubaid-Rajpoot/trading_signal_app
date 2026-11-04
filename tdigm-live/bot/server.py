@@ -527,7 +527,8 @@ def create_app(
                   "valid", "mitigated", "entry", "stop", "target", "target_rr", "target_rr_price", "rr",
                   "target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms",
                   "approach_model", "approach_start_ms", "approach_end_ms", "approach_bars",
-                  "approach_pivot_count",
+                  "approach_pivot_count", "hvb_model", "hvb_prev_fast", "hvb_prev_centre",
+                  "hvb_fast", "hvb_centre",
                   "score", "r_now", "zone_low", "zone_high", "mitigation_kind", "state_reason",
                   "lifecycle_version", "swept_level", "bos_level",
                   "break_kind", "hvb_side", "hvb_lag", "volume_ratio", "trend_dir",
@@ -741,8 +742,9 @@ def create_app(
 
     @app.post("/api/tdi")
     async def set_tdi(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """Which line is the centre band the price line must cross."""
-        reference = engine.set_centre(str(payload.get("hvb_reference", engine.centre_reference)))
+        """Retained for compatibility; HVB is permanently bound to the MBL."""
+        requested = str(payload.get("hvb_reference") or "mbl").lower()
+        reference = engine.set_centre(requested)
         if config_path:
             config["tdi"] = {**config.get("tdi", {}), "hvb_reference": reference}
             try:
@@ -752,8 +754,12 @@ def create_app(
         await engine._emit_state(force=True)  # noqa: SLF001
         return {
             "ok": True,
-            "hvb_reference": reference,
-            "label": "middle of the volatility bands" if reference == "mbl" else "50 midline",
+            "hvb_reference": "mbl",
+            "label": "moving middle band",
+            "warning": (
+                "fixed 50-axis HVB mode has been removed; only the moving middle-band cross is valid"
+                if requested != "mbl" else None
+            ),
         }
 
     @app.post("/api/structure")

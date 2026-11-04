@@ -1,5 +1,10 @@
 # Lifecycle-v6 / chain-v5 deterministic regression — 2026-11-04
 
+> **Superseded historical evidence.** Lifecycle v7 / chain v6 makes the moving
+> MBL crossing mathematically auditable and removes the alternate fixed-50/score
+> bypasses. Current-policy evidence is in
+> [`lifecycle-v7-regression-2026-11-04.md`](lifecycle-v7-regression-2026-11-04.md).
+
 This is a reproducibility and policy-regression check, **not a profitability
 claim for the MEXC futures universe**. It runs the shipped sweep/HVB/structure
 policy on one public BTCUSDT candle file because no production signal archive is

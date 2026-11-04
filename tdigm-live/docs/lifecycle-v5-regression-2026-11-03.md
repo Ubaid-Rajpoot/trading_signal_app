@@ -1,8 +1,9 @@
 # Lifecycle-v5 deterministic regression — 2026-11-03 (superseded)
 
-> Historical only. Lifecycle v6 / chain v5 adds the stricter direct
-> paired-endpoint-to-sweep approach and excludes these rows from current
-> statistics. Do not quote the result below as the current policy result.
+> Historical only. Current lifecycle v7 / chain v6 adds the stricter direct
+> paired-endpoint-to-sweep approach plus mathematical moving-MBL HVB proof and
+> excludes these rows from current statistics. Do not quote the result below as
+> the current policy result.
 
 This is a reproducibility and lifecycle check, **not a profitability claim for
 the MEXC futures universe**. It runs the shipped sweep/HVB/structure policy on

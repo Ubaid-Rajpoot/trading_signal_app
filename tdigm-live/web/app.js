@@ -168,6 +168,11 @@
       break_kind: raw.break_kind,
       hvb_side: raw.hvb_side,
       hvb_ms: Number(raw.hvb_ms || raw.created_ms || raw.time || 0),
+      hvb_model: raw.hvb_model || "",
+      hvb_prev_fast: raw.hvb_prev_fast,
+      hvb_prev_centre: raw.hvb_prev_centre,
+      hvb_fast: raw.hvb_fast,
+      hvb_centre: raw.hvb_centre,
       chain_valid: raw.chain_valid !== false,
       chain_errors: raw.chain_errors || [],
       volume_ratio: raw.volume_ratio,
@@ -456,7 +461,7 @@
     if (row.bos_level !== null && row.bos_level !== undefined) {
       chain.push("same-leg opposite body break @ " + num(row.bos_level) + " [" + clock(row.created_ms) + "]");
     }
-    if (row.hvb_side) chain.push("same-candle HVB " + row.hvb_side);
+    if (row.hvb_side) chain.push("same-candle MBL-cross HVB " + row.hvb_side);
     if (row.trap) chain.push("trap " + (row.trap.side || "") + " @ " + num(row.trap.level));
     if (row.ac) chain.push("imbalance " + num(row.ac.bottom) + "–" + num(row.ac.top));
     if (row.shift) chain.push("shift " + (row.shift.kind || "MS") + " @ " + num(row.shift.level));
@@ -465,8 +470,15 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
-    if (row.lifecycle_version !== 6 || row.chain_version !== 5 || row.target_model !== "hvb_bos_leg_extreme_v1") {
-      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current direct-sweep lifecycle statistics until deep replay regrades it</div>');
+    if (row.lifecycle_version !== 7 || row.chain_version !== 6 || row.target_model !== "hvb_bos_leg_extreme_v1") {
+      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current MBL-cross/direct-sweep lifecycle statistics until deep replay regrades it</div>');
+    }
+    if (row.hvb_model === "mbl_centre_cross_v1") {
+      var beforeSign = row.hvb_side === "up" ? " ≤ " : " ≥ ";
+      var afterSign = row.hvb_side === "up" ? " > " : " < ";
+      bits.push('<div class="nums"><span>HVB proof <b>moving centre crossed on this candle</b> · '
+        + escapeHtml(num(row.hvb_prev_fast) + beforeSign + num(row.hvb_prev_centre)
+          + " → " + num(row.hvb_fast) + afterSign + num(row.hvb_centre)) + '</span></div>');
     }
     if (row.approach_model === "direct_from_paired_endpoint_v1" && row.approach_pivot_count === 0) {
       bits.push('<div class="nums"><span>approach <b>direct paired endpoint → sweep</b> · '
@@ -814,6 +826,18 @@
 
     var selected = data.selected || null;
     var liveEnabled = !!(data.live && data.live.enabled);
+    var hvbProofValid = !!(selected && selected.hvb_model === "mbl_centre_cross_v1"
+      && selected.hvb_prev_fast != null && selected.hvb_prev_centre != null
+      && selected.hvb_fast != null && selected.hvb_centre != null
+      && Number.isFinite(Number(selected.hvb_prev_fast))
+      && Number.isFinite(Number(selected.hvb_prev_centre))
+      && Number.isFinite(Number(selected.hvb_fast))
+      && Number.isFinite(Number(selected.hvb_centre))
+      && (selected.hvb_side === "up"
+        ? Number(selected.hvb_prev_fast) <= Number(selected.hvb_prev_centre)
+          && Number(selected.hvb_fast) > Number(selected.hvb_centre)
+        : Number(selected.hvb_prev_fast) >= Number(selected.hvb_prev_centre)
+          && Number(selected.hvb_fast) < Number(selected.hvb_centre)));
     var rawSetup = selected && selected.setup || {};
     var sweepTime = selected ? Number(selected.sweep_ms || rawSetup.sweep_time || 0) : 0;
     var breakTime = selected ? Number(selected.created_ms || rawSetup.break_time || 0) : 0;
@@ -886,7 +910,8 @@
     }
 
     // The exact setup window is unmistakable: amber sweep candle/level, a
-    // shaded time range, then a blue body-break + HVB candle.
+    // shaded time range, then the body-break candle. It is labelled HVB only
+    // when the archived four-value MBL crossing proof is mathematically valid.
     if (selected && sweepIndex >= 0 && breakIndex >= 0) {
       var sx = x(sweepIndex), bx = x(breakIndex);
       ctx.fillStyle = "rgba(255,179,71,.055)";
@@ -968,7 +993,10 @@
         selected.swept_side === "low" ? "PAIRED HIGH" : "PAIRED LOW", false
       );
       outlineCandle(sweepIndex, "#ffb347", selected.swept_side === "low" ? "LOW SWEEP" : "HIGH SWEEP", true);
-      outlineCandle(breakIndex, "#67a9ff", "BODY BREAK + HVB", false);
+      outlineCandle(
+        breakIndex, hvbProofValid ? "#67a9ff" : "#ff5c7a",
+        hvbProofValid ? "BODY BREAK + MBL CROSS HVB" : "BODY BREAK · HVB UNPROVEN", false
+      );
     }
 
     // Entry and the trade target arm at mitigation, not at the body-break close.
@@ -1040,6 +1068,9 @@
       if (selected.chain_valid === false) {
         audit.className = "chart-audit bad";
         audit.textContent = "QUARANTINED · " + (selected.chain_errors || []).join(" · ");
+      } else if (!hvbProofValid) {
+        audit.className = "chart-audit bad";
+        audit.textContent = "NON-CURRENT · this row does not prove a same-candle moving-centre-band cross";
       } else if (liveEnabled && (sweepIndex < 0 || breakIndex < 0)) {
         audit.className = "chart-audit ok";
         audit.textContent = "LIVE MARKET · setup proof remains available in SETUP view";
@@ -1049,7 +1080,7 @@
           + (data.history_error ? " · " + data.history_error : "");
       } else {
         audit.className = "chart-audit ok";
-        audit.textContent = "✓ paired endpoint → direct sweep (no intervening pivot) → opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
+        audit.textContent = "✓ paired endpoint → direct sweep → opposite body break + same-candle MBL cross " + String(selected.hvb_side || "HVB").toUpperCase();
       }
     } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
     $("chart-tf").textContent = candles.length + (liveEnabled ? " market bars" : " historical bars")

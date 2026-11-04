@@ -149,4 +149,9 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
         elif key == "sessions":
             merged[key] = [str(s) for s in (value or [])][:8]
     merged["min_directional_ratio"] = min(1.0, merged["min_directional_ratio"])
+    # These are strategy invariants, not optional confluence knobs. Keeping them
+    # fixed prevents saved settings or score mode from admitting a body-break
+    # candle without its own moving-centre-band HVB.
+    merged["hvb"] = True
+    merged["hvb_window"] = 0
     return merged

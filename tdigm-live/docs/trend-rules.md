@@ -15,10 +15,10 @@ makes each of them a switch:
 This page is the honest record: what each rule computes, what it rejects, and
 where old measurements are too weak or too stale to support a claim.
 
-> **Current-policy boundary (lifecycle v6 / chain v5).** The historical tables
+> **Current-policy boundary (lifecycle v7 / chain v6).** The historical tables
 > below predate exactly-one-sweep structure, the direct paired-endpoint-to-sweep
-> approach, breaker-local stops, mitigation-first activation, and the variable
-> confirmation-leg H/L exit. They are retained as labelled
+> approach, four-value moving-MBL HVB proof, breaker-local stops, mitigation-first
+> activation, and the variable confirmation-leg H/L exit. They are retained as labelled
 > research, not presented as current results. The live
 > policy now requires repeated major/macro progression (at least two high and two
 > low steps, with 100% remembered recent-step consistency) plus a clear local leg
@@ -89,15 +89,17 @@ The card shows all of it: `external bullish (HH+HL) · last break of structure u
 | high-volume signal candle (≥ N× average) | `volume_break` / `volume_mult` / `volume_period` | **off** / 1.5× / 20 | `volume 0.83× < 1.5×` |
 | how the switched-on conditions combine | `confirm_mode`, `confirm_min_score` | `all` / 60 | `confluence score 55 < 60` |
 
-`confirm_mode: "all"` is a hard AND: every switch that is on must hold. In
-`"score"` mode each piece of evidence contributes a weight
+`confirm_mode: "all"` is a hard AND: every optional switch that is on must hold.
+In `"score"` mode the remaining evidence contributes a weight
 (`bot/filters.py::SCORE_WEIGHTS` — trend agreement, clean sequence, BOS, HVB,
-volume, depth ≤ 2, regime, pool block) and the sum must reach the threshold. The
-score and its parts are on every alert (`score`, `score_parts`) and on the card,
-so a signal is never just "trust me".
+volume, depth ≤ 2, regime, pool block) and the sum must reach the threshold.
+**Score mode never replaces HVB:** the confirming candle must still prove the
+moving-MBL cross before its other confluences are scored. The score and its parts
+are on every alert (`score`, `score_parts`) and on the card.
 
-All switches live in ⚙ **Trend & structure** and **Confirm the break** in the
-page, and are written to `config.json`.
+Optional switches live in ⚙ **Trend & structure** and **Confirm the break** in
+the page and are written to `config.json`; HVB itself and `hvb_window: 0` are
+fixed sweep-strategy invariants.
 
 ## 3. Legacy replay: what the earlier policy rejected
 

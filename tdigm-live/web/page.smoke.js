@@ -36,6 +36,14 @@ try {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(predicate, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(50);
+  }
+  return false;
+}
 
 async function main() {
   let probe;
@@ -114,10 +122,18 @@ async function main() {
   window.eval(read("notify.js"));
   window.eval(read("app.js"));
 
-  await sleep(1500);
+  await waitFor(() => doc.querySelectorAll("#rows tr").length > 0
+    && doc.getElementById("story").textContent.includes("moving centre crossed on this candle"));
 
   const rows = doc.querySelectorAll("#rows tr").length;
   if (!rows) throw new Error("the table is empty after boot - the archive never reached the page");
+  const story = doc.getElementById("story").textContent;
+  if (!story.includes("moving centre crossed on this candle")) {
+    throw new Error("the selected signal does not display its four-value MBL-cross proof: " + story.slice(0, 300));
+  }
+  if (story.includes("NON-CURRENT POLICY")) {
+    throw new Error("the chain-v6/lifecycle-v7 archive was incorrectly labelled non-current");
+  }
   if (doc.getElementById("sort-select").value !== "symbol") {
     throw new Error("saved page settings were reset during reload");
   }

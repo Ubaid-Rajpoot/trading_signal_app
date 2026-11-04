@@ -20,11 +20,10 @@ condition on/off or narrows the same condition:
     volume_break     the signal candle must be a high-volume bar (volume_mult x
                      the average of the previous volume_period candles)
     confirm_mode     "all" = every switched-on condition must hold;
-                     "score" = the weighted confluence score must reach
-                     confirm_min_score (bos + hvb + volume + fvg + trend + depth)
-    hvb_window       retained for configuration compatibility; chain integrity
-                     requires the directed HVB on the body-break candle (0 lag)
-    hvb              the TDIGM price line crosses the CENTRE band on the signal bar
+                     "score" ranks the remaining confluences, but can never
+                     substitute them for the mandatory HVB
+    hvb_window       retained for configuration compatibility; fixed to zero
+    hvb              mandatory moving-MBL cross on the body-break candle
     hvb_min_points   and how far past the centre it closed, in RSI points
     hvb_min_speed    and how fast: this candle's step vs the line's average step
     regime           only trade a trending market (ADX + efficiency ratio)
@@ -277,7 +276,10 @@ class Filters:
         if cfg.get("structure", True) and not candidate.get("structure"):
             reasons.append("no structure (needs a sweep, then the opposite side breaking)")
 
-        if cfg.get("hvb", True) and not score_mode:
+        # HVB is mandatory even in score mode. A score can rank otherwise valid
+        # setups, but it can never substitute volume/BOS/trend points for the
+        # actual same-candle moving-centre-band cross.
+        if cfg.get("hvb", True):
             need = float(cfg.get("hvb_min_points") or 0)
             need_speed = float(cfg.get("hvb_min_speed") or 0)
             if candidate.get("hvb"):

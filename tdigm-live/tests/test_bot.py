@@ -466,6 +466,27 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
     }
     assert any("oscillated" in reason for reason in sweep_chain_errors(oscillated))
 
+    mbl_proved = {
+        **direct,
+        "chain_version": 6,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 55.0,
+        "hvb_prev_centre": 50.0,
+        "hvb_fast": 45.0,
+        "hvb_centre": 49.0,
+    }
+    assert sweep_chain_errors(mbl_proved) == []
+    same_side_spike = {
+        **mbl_proved,
+        # Purple remained below the MBL; a lower-band spike is not a new cross.
+        "hvb_prev_fast": 45.0,
+        "hvb_prev_centre": 50.0,
+        "hvb_fast": 35.0,
+        "hvb_centre": 49.0,
+    }
+    assert any("did not cross the moving centre band" in reason
+               for reason in sweep_chain_errors(same_side_spike))
+
 
 @pytest.mark.asyncio
 async def test_publication_boundary_refuses_an_hvb_and_break_without_a_sweep():
@@ -949,6 +970,12 @@ def test_hvb_is_required_and_counted():
     assert f.summary()["rejected"] == 1
 
 
+def test_score_mode_cannot_substitute_other_points_for_the_hvb():
+    f = Filters({"hvb": True, "confirm_mode": "score", "confirm_min_score": 0})
+    ok, reasons = f.apply(candidate(hvb=None))
+    assert not ok and any("price line did not cross" in reason for reason in reasons)
+
+
 def test_hvb_min_points_filter():
     f = Filters({"hvb": True, "hvb_min_points": 5})
     assert not f.apply(candidate(hvb_points=2.0))[0]
@@ -1007,7 +1034,8 @@ def test_filters_validation_ignores_junk_and_clamps(tmp_path):
     got = config_store.validate_filters(
         {"hvb": 0, "min_rr": -3, "trend": "sideways", "sides": ["long", "banana"], "nonsense": 1}
     )
-    assert got["hvb"] is False
+    assert got["hvb"] is True, "HVB cannot be disabled for sweep signals"
+    assert got["hvb_window"] == 0, "HVB must share the body-break candle"
     assert got["min_rr"] == 0.0
     assert got["trend"] == "off"
     assert got["sides"] == ["long"]
@@ -1089,14 +1117,21 @@ def make_engine(**filters):
 
 
 def market_rows():
-    """A monotone rise (no swing points at all, so the fixture is unambiguous)
-    followed by the pattern. Rows are 5 minutes apart, so each row IS one 5m
-    candle; a candle only closes when the next one opens, hence the last row."""
+    """A monotone rise followed by the structure fixture, but no final HVB."""
     rows = []
     for i in range(160):
         base = 90 + i * 0.06
         rows.append((base + 0.3, base - 0.3, base))
     return rows + SHORT_PATTERN + [(95, 93, 94)]
+
+
+def hvb_market_rows():
+    """The same setup with a genuine MBL cross on its body-break candle."""
+    prefix = []
+    for i in range(180):
+        close = 98 + (i % 10) * 0.15 - (i % 3) * 0.03
+        prefix.append((close + 0.3, close - 0.3, close))
+    return prefix + SHORT_PATTERN + [(95, 93, 94)]
 
 
 async def push_5m(engine, rows):
@@ -1106,16 +1141,22 @@ async def push_5m(engine, rows):
 
 @pytest.mark.asyncio
 async def test_engine_emits_a_signal_for_the_complete_setup():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
-    assert signals, "the sweep + opposite break is a complete setup"
+    assert signals, "the sweep + opposite break + same-candle MBL cross is complete"
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
-    assert alert["chain_version"] == 5
+    assert alert["chain_version"] == 6
     assert alert["approach_model"] == "direct_from_paired_endpoint_v1"
     assert alert["approach_pivot_count"] == 0
+    assert alert["hvb_model"] == "mbl_centre_cross_v1"
+    assert alert["hvb_prev_fast"] >= alert["hvb_prev_centre"]
+    assert alert["hvb_fast"] < alert["hvb_centre"]
     assert alert["setup"]["leg_model"] == "directional_outer_v1"
     assert alert["setup"]["stop"] == 107.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
@@ -1127,15 +1168,11 @@ async def test_production_tdigm_settings_confirm_the_break_on_the_same_candle():
     # A neutral, moving RSI baseline followed by the trader's sweep/body-break
     # fixture. The final drop crosses the MBL down with speed on exactly the
     # candle that closes below the opposite low.
-    prefix = []
-    for i in range(180):
-        close = 98 + (i % 10) * 0.15 - (i % 3) * 0.03
-        prefix.append((close + 0.3, close - 0.3, close))
     engine = make_engine(
         hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
         regime=False, structure_direction=False, block_liquidity_pool=False,
     )
-    await push_5m(engine, prefix + SHORT_PATTERN + [(95, 93, 94)])
+    await push_5m(engine, hvb_market_rows())
     signals = [row for row in engine.setup_payloads.values() if row["side"] == "SHORT"]
     assert signals
     signal = signals[-1]
@@ -1181,31 +1218,31 @@ async def test_adding_a_symbol_builds_its_cells():
 
 
 # ------------------------------------------------- the centre band of the HVB
-def test_hvb_centre_defaults_to_the_middle_of_the_bands():
+def test_hvb_centre_is_only_the_moving_middle_band():
     closes = [100 + (i % 11) * 0.4 for i in range(400)]
     points = tdi(closes, 50, 50, 1, 9, 1.6185)
     last = points[-1]
     assert last.mbl == pytest.approx((last.upper + last.lower) / 2)
-    assert centre_of(last, "mbl") == last.mbl
-    assert centre_of(last, "fifty") == 50.0
+    assert centre_of(last) == last.mbl
 
 
-def test_hvb_fifty_reference_crosses_the_50_line():
-    closes = [100 + (i % 7) * 1.5 for i in range(400)]  # swings well either side of 50
-    points = tdi(closes, 50, 50, 1, 9, 1.6185)
-    fifty = [i for i in range(1, len(points)) if hvb_signal(points, i, 0, "fifty")]
-    mbl = [i for i in range(1, len(points)) if hvb_signal(points, i, 0, "mbl")]
-    assert fifty, "the price line must cross 50 in this series"
-    for i in fifty:
-        assert (points[i - 1].fast - 50) * (points[i].fast - 50) <= 0
-    assert fifty != mbl, "different centre lines give different crosses"
+def test_crossing_the_fixed_fifty_axis_without_crossing_the_mbl_is_not_hvb():
+    from bot.indicators import TdiPoint
+
+    # Purple crosses RSI 50 here, but it stays above the moving black MBL on
+    # both candles. The removed fixed-axis mode must never call this an HVB.
+    points = [
+        TdiPoint(fast=49, slow=48, mbl=45, upper=55, lower=35),
+        TdiPoint(fast=51, slow=49, mbl=46, upper=56, lower=36),
+    ]
+    assert hvb_signal(points, 1) is None
 
 
 def test_the_aggressive_break_threshold_rejects_grazes():
     closes = [100 + (i % 13) * 0.2 for i in range(600)]
     points = tdi(closes, 50, 50, 1, 9, 1.6185)
-    loose = [i for i in range(1, len(points)) if hvb_signal(points, i, 0.0, "mbl")]
-    strict = [i for i in range(1, len(points)) if hvb_signal(points, i, 1.0, "mbl")]
+    loose = [i for i in range(1, len(points)) if hvb_signal(points, i, min_points=0.0)]
+    strict = [i for i in range(1, len(points)) if hvb_signal(points, i, min_points=1.0)]
     assert loose and strict
     assert set(strict) < set(loose), "a threshold can only remove events"
     for i in strict:
@@ -1214,12 +1251,15 @@ def test_the_aggressive_break_threshold_rejects_grazes():
 
 @pytest.mark.asyncio
 async def test_signal_carries_the_centre_band_and_a_chart_tail():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     alert = signals[-1]
-    assert alert["centre_reference"] in {"mbl", "fifty"}
+    assert alert["centre_reference"] == "mbl"
     assert alert["centre"] is not None
     assert len(alert["tdi_tail"]) >= 5
     assert all(len(pair) == 2 for pair in alert["tdi_tail"])
@@ -1276,12 +1316,12 @@ async def test_old_signal_chart_is_fetched_around_the_setup_not_around_today():
 
 
 @pytest.mark.asyncio
-async def test_switching_the_centre_reference_is_live():
+async def test_hvb_centre_cannot_be_switched_away_from_the_mbl():
     engine = make_engine(hvb=False)
     await push_5m(engine, market_rows())
-    assert engine.set_centre("fifty") == "fifty"
-    assert engine.centre_reference == "fifty"
-    assert engine.tdi_settings["hvb_reference"] == "fifty"
+    assert engine.set_centre("fifty") == "mbl"
+    assert engine.centre_reference == "mbl"
+    assert engine.tdi_settings["hvb_reference"] == "mbl"
     assert engine.set_centre("nonsense") == "mbl"
 
 
@@ -1356,12 +1396,15 @@ def test_hvb_never_fires_on_an_outer_band_touch():
     def point(fast, centre, mult=1.0):
         return TdiPoint(fast=fast, slow=fast, mbl=centre, upper=centre + mult, lower=centre - mult)
 
-    # price line leaves the upper band and comes back to it, never touching the centre
-    points = [point(62, 50), point(61.5, 50), point(61, 50), point(61.9, 50)]
-    assert [hvb_signal(points, i) for i in range(1, len(points))] == [None, None, None]
-    # and the centre cross still fires on the same shape
-    points = [point(48, 50), point(51, 50)]
+    # Exact shape in the supplied screenshot: purple is already above the black
+    # MBL, then spikes from inside to beyond the upper blue band. That outer-band
+    # cross is not an HVB because no centre crossing happened on this candle.
+    points = [point(55, 50, 10), point(64, 50, 10), point(56, 50, 10)]
+    assert [hvb_signal(points, i) for i in range(1, len(points))] == [None, None]
+    # and the actual centre cross still fires on the crossing candle only
+    points = [point(48, 50), point(51, 50), point(64, 50, 10)]
     assert hvb_signal(points, 1) == "up"
+    assert hvb_signal(points, 2) is None
 
 
 def test_hvb_needs_speed_when_the_speed_gate_is_on():
@@ -1372,15 +1415,18 @@ def test_hvb_needs_speed_when_the_speed_gate_is_on():
     points.append(TdiPoint(52.0, 50, 50, 54, 48))
     speed = line_speed(points, len(points) - 1)
     assert speed and speed > 5
-    assert hvb_signal(points, len(points) - 1, 0, "mbl", min_speed=2.0) == "up"
+    assert hvb_signal(points, len(points) - 1, min_points=0, min_speed=2.0) == "up"
     quiet = [TdiPoint(49.9, 50, 50, 52, 48), TdiPoint(50.05, 50, 50, 52, 48)]
-    assert hvb_signal(quiet, 1, 0, "mbl", min_speed=2.0) is None
+    assert hvb_signal(quiet, 1, min_points=0, min_speed=2.0) is None
 
 
 @pytest.mark.asyncio
 async def test_engine_publishes_regime_with_every_signal():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     for alert in signals:
@@ -1518,8 +1564,11 @@ def test_book_gates_reject_and_explain():
 
 @pytest.mark.asyncio
 async def test_every_signal_carries_the_book_labels():
-    engine = make_engine(hvb=False, filters={"structure_direction": False, "block_liquidity_pool": False})
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     book = signals[-1]["book"]

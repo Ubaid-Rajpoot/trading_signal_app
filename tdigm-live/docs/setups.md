@@ -89,13 +89,17 @@ Before lifecycle starts, structural validity is exact:
 5. after the valid sweep, price may move however it chooses while seeking the
    opposite break. Continuing beyond the selected sweep extreme is allowed, but
    taking a second independent/equal same-side level before release is not;
-6. the body break must occur later and through the exact paired endpoint.
+6. the body break must occur later and through the exact paired endpoint;
+7. on that same closed candle, the purple TDIGM price line must cross the moving
+   black MBL. Previous/current purple and MBL values must prove the transition.
+   A fixed-50, slow-line, or outer-blue-band crossing is not an HVB.
 
-Repeated equal highs/lows, a contracting range, or an oscillating approach into
-the sweep cannot be cherry-picked into a chain. `chain_version: 5` stores
-`swept_count: 1`, `leg_model: directional_outer_v1`, and
-`approach_model: direct_from_paired_endpoint_v1` with zero approach pivots. The
-publication/database boundary refuses a current-version row without all proofs.
+Repeated equal highs/lows, a contracting range, an oscillating sweep approach,
+or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 6`
+stores `swept_count: 1`, `leg_model: directional_outer_v1`,
+`approach_model: direct_from_paired_endpoint_v1` with zero approach pivots, and
+`hvb_model: mbl_centre_cross_v1` with all four crossing values. The publication/
+database boundary refuses a current-version row without every proof.
 
 A setup is not a moment. Each one becomes a record with a state:
 
@@ -147,7 +151,8 @@ not improve risk over the structural stop.
 
 The exit comes from the same displacement leg as confirmation, not a fixed R
 multiple. The leg starts on the selected sweep candle and includes the candle
-that both prints the directed HVB and body-closes through the paired endpoint.
+that both prints the directed moving-MBL-cross HVB and body-closes through the
+paired endpoint.
 For SHORT, its favorable extreme is the lowest low; for LONG, the highest high.
 Every fully closed candle while the setup remains pending may extend that extreme.
 
@@ -168,7 +173,8 @@ For the selected setup, on real candles:
 | mark | what it is |
 |---|---|
 | amber `BOS↑` / `BOS↓` | every 20-bar structure break in the window (not just the one in the setup) |
-| purple dot | every TDIGM HVB — the price line crossing the centre band — in the window |
+| blue `BODY BREAK + MBL CROSS HVB` outline | the selected body-break candle, labelled HVB only when stored previous/current values prove the moving-MBL cross |
+| red `HVB UNPROVEN` outline | legacy/non-current body-break row that lacks that mathematical proof |
 | blue box | order block, from the last opposite candle before displacement |
 | purple box | paired-endpoint breaker, only for an aggressive shift |
 | pale-blue `DIRECT SWEEP APPROACH` window | paired opposite endpoint to sweep; no intervening pivot is permitted |
@@ -176,9 +182,9 @@ For the selected setup, on real candles:
 | dashed white / red / green | mitigation entry, stop, and frozen confirmation-leg H/L target; entry/target begin at mitigation |
 | vertical line | the candle the setup confirmed on |
 
-The markers are computed with the same functions the live engine uses
-(`break_signal`, the TDI centre cross), so the chart cannot show a break the
-engine would not have seen (`Engine._markers`).
+The chart/API evidence is computed with the same functions the live engine uses
+(`break_signal`, `hvb_signal`), including the points and speed gates. The selected
+candle is never labelled HVB from a stored side string alone (`Engine._markers`).
 
 Every instrument/timeframe cell in the matrix is clickable and opens its chart,
 so a cell that says `range` or `sweep high` can be checked against the candles
@@ -232,6 +238,6 @@ python -m pytest tests -q           # deterministic offline suite
 
 The current structural-context rules are documented in
 [`trend-rules.md`](trend-rules.md). Its old measurements are explicitly labelled
-legacy; no production-universe lifecycle-v6 win rate is claimed without replaying compatible real data.
+legacy; no production-universe lifecycle-v7 win rate is claimed without replaying compatible real data.
 The page shows the evidence and rejection reason instead of asking you to trust a
 silent decision.

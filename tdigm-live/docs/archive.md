@@ -50,9 +50,11 @@ selected structural sweep and breaker-local post-fill stops; v4 added
 degree-aware clean outer legs plus full remembered trend consistency. Lifecycle
 v5 replaces fixed R with the favorable H/L of the sweep→same-candle HVB/BOS leg,
 extended only by fully closed pre-mitigation candles and frozen before the
-mitigation candle. Lifecycle v6 / chain v5 additionally requires a direct move
+mitigation candle. Lifecycle v6 / chain v5 additionally required a direct move
 from the paired opposite endpoint into the sweep, with no intervening pivot;
-only the post-sweep path may oscillate. Rows graded under any older rule must be
+only the post-sweep path may oscillate. Lifecycle v7 / chain v6 removes alternate
+HVB triggers and stores mathematical proof that the purple line crossed the
+moving MBL on the body-break candle. Rows graded under any older rule must be
 replayed rather than contaminating the current win rate.
 
 ## Reading it back
@@ -79,7 +81,7 @@ aggressive-breaker touch freezes entry, risk, and the last extreme before that
 mitigation candle. The mitigation candle itself is excluded. A pre-mitigation
 stop is `invalidated`, carries no realised R and is excluded. Legacy fixed-R
 studies remain below as labelled historical experiments, but they are not mixed
-into lifecycle-v6 / chain-v5 results.
+into lifecycle-v7 / chain-v6 results.
 
 ## Filling it from history
 
@@ -95,15 +97,15 @@ python tools/backfill_archive.py data/btc --symbol BTCUSDT --dry-run  # writes n
 
 An older BTCUSDT 2023-01-01 → 2025-06-30 report produced **107 setups, 43 won,
 54 stopped, 10 never filled under legacy 2R scoring**. It is retained only as a
-historical audit; the backfill command now applies lifecycle v6 / chain v5 and
+historical audit; the backfill command now applies lifecycle v7 / chain v6 and
 is not expected to reproduce those counts. A compatible real dataset is not
 present in this checkout, so that legacy archive cannot provide a current
 confirmation-leg-target rate. A separately fetched, hash-pinned BTCUSDT sample
-was replayed under lifecycle v6 / chain v5 as a deterministic regression; its
+was replayed under lifecycle v7 / chain v6 as a deterministic regression; its
 26.98% win rate and −0.310R/trade were statistically **not proven** and must not
 be extrapolated to the production universe. All 64 retained rows had zero pivots
-between paired endpoint and sweep. See
-[`lifecycle-v6-regression-2026-11-04.md`](lifecycle-v6-regression-2026-11-04.md).
+between paired endpoint and sweep and valid four-value moving-MBL cross proof.
+See [`lifecycle-v7-regression-2026-11-04.md`](lifecycle-v7-regression-2026-11-04.md).
 
 ## Thirty instruments at a time
 
@@ -145,7 +147,7 @@ confirmation-leg-target policy:
 
 Those numbers do not override the shipped rules: `hvb_window: 0` requires the
 same candle, and current trend/structure gates remain configured in
-`config.json`. New lifecycle-v6 / chain-v5 results are reported separately only
+`config.json`. New lifecycle-v7 / chain-v6 results are reported separately only
 after a fresh deep replay.
 
 ### A caveat about the grades

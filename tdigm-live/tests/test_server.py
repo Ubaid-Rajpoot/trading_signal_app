@@ -100,7 +100,7 @@ def test_live_chart_returns_the_forming_candle_and_mark_to_market_rr(client):
         "state": "active", "valid": True, "mitigated": True,
         "entry": 100.0, "stop": 104.0, "stop0": 104.0, "risk0": 4.0,
         "target": 90.0, "leg_target": 90.0, "touched_ms": 1_735_690_500_000,
-        "target_model": "hvb_bos_leg_extreme_v1", "lifecycle_version": 6,
+        "target_model": "hvb_bos_leg_extreme_v1", "lifecycle_version": 7,
     }
     client.engine.setup_payloads[key] = payload  # type: ignore[attr-defined]
     cell = client.engine.cells[("BTCUSDT", "5m")]  # type: ignore[attr-defined]
@@ -150,7 +150,8 @@ def test_page_has_bounded_signal_scrolling_and_smc_style_chart_controls(client):
     ))
     assert "min-height: 0" in css and "overscroll-behavior: contain" in css
     assert "tdigm.ui.preferences.v2" in script and "savePreferences" in script
-    assert "BODY BREAK + HVB" in script and "HIGH SWEEP" in script
+    assert "BODY BREAK + MBL CROSS HVB" in script and "HVB UNPROVEN" in script
+    assert "HIGH SWEEP" in script and "mbl_centre_cross_v1" in script
     assert "DIRECT SWEEP APPROACH" in script and "PAIRED LOW" in script
     assert "refreshLiveChart, 1000" in script and 'mode === "live" ? "&live=1"' in script
 
@@ -183,13 +184,15 @@ def test_removing_a_symbol_writes_the_config_file(client):
 def test_filters_are_validated_applied_and_saved(client):
     response = client.post("/api/filters", json={"hvb": False, "min_rr": 2, "sides": ["short"], "junk": 1})
     body = response.json()
-    assert body["filters"]["hvb"] is False
+    assert body["filters"]["hvb"] is True
+    assert body["filters"]["hvb_window"] == 0
     assert body["filters"]["min_rr"] == 2.0
     assert body["filters"]["sides"] == ["short"]
     saved = json.loads(Path(client.config_path).read_text())  # type: ignore[attr-defined]
     assert saved["filters"]["min_rr"] == 2.0
     assert "junk" not in saved["filters"]
-    assert client.get("/api/state").json()["filters"]["config"]["hvb"] is False
+    assert saved["filters"]["hvb"] is True and saved["filters"]["hvb_window"] == 0
+    assert client.get("/api/state").json()["filters"]["config"]["hvb"] is True
 
 
 def test_structure_settings_are_saved(client):
@@ -350,13 +353,14 @@ def test_replay_never_overwrites_the_saved_instrument_list(client):
     assert after == before
 
 
-def test_centre_band_choice_is_applied_and_saved(client):
+def test_fixed_fifty_axis_cannot_replace_the_moving_centre_band(client):
     body = client.post("/api/tdi", json={"hvb_reference": "fifty"}).json()
-    assert body["hvb_reference"] == "fifty"
-    assert "50" in body["label"]
+    assert body["hvb_reference"] == "mbl"
+    assert "moving middle band" in body["label"]
+    assert "removed" in body["warning"]
     saved = json.loads(Path(client.config_path).read_text())  # type: ignore[attr-defined]
-    assert saved["tdi"]["hvb_reference"] == "fifty"
-    assert client.get("/api/state").json()["centre_reference"] == "fifty"
+    assert saved["tdi"]["hvb_reference"] == "mbl"
+    assert client.get("/api/state").json()["centre_reference"] == "mbl"
 
 
 # ------------------------------------------------------------ notifications

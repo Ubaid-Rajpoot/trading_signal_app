@@ -308,21 +308,18 @@ def test_the_score_adds_up_only_the_evidence_that_is_there():
     assert weak[1]["trend"] is True, "the trend still agrees - only the other three are missing"
 
 
-def test_score_mode_replaces_the_hard_hvb_gate_with_a_threshold():
-    """The point of combining: a very strong setup does not need every single box."""
-    # hvb missing but everything else present -> 75, passes a 60 threshold
-    strong = candidate(hvb=None)
+def test_score_mode_never_replaces_the_mandatory_hvb():
+    """Other confluences may rank a setup, but cannot fabricate its trigger."""
+    missing = candidate(hvb=None)
+    for threshold in (0, 60, 80):
+        ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=threshold).apply(
+            json.loads(json.dumps(missing)))
+        assert not ok and any("no HVB" in reason for reason in reasons), reasons
+
+    complete = candidate(hvb="up")
     ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=60).apply(
-        json.loads(json.dumps(strong)))
+        json.loads(json.dumps(complete)))
     assert ok, reasons
-    # ... and the same candidate fails if the trader asks for 80
-    ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=80).apply(
-        json.loads(json.dumps(strong)))
-    assert not ok
-    assert any("confluence score" in r for r in reasons), reasons
-    # in "all" mode the same candidate fails because the HVB is missing
-    ok, reasons = gates(hvb=True, confirm_mode="all").apply(json.loads(json.dumps(strong)))
-    assert not ok and any("no HVB" in r for r in reasons), reasons
 
 
 # ---------------------------------------------------------- in the engine

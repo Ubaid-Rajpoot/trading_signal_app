@@ -134,19 +134,53 @@ def crossed_below(prev_a, prev_b, a, b) -> bool:
     return prev_a >= prev_b and a < b
 
 
-CENTRE_REFERENCES = {"mbl": "middle of the volatility bands", "fifty": "50 midline"}
+HVB_MODEL = "mbl_centre_cross_v1"
 
 
-def centre_of(point: TdiPoint, reference: str = "mbl") -> float | None:
-    """The centre band the price line has to cross.
+def centre_of(point: TdiPoint) -> float | None:
+    """Return the one and only HVB centre: TDIGM's moving middle band.
 
-    ``mbl``   = the middle of the volatility bands (the TDIGM ``mid``), i.e.
-                ``(upper + lower) / 2`` = ``SMA(RSI, bandLength)``.
-    ``fifty`` = the TDI's central axis, the 50 level.
+    This is the black centre band in the supplied chart and is mathematically
+    ``(upper + lower) / 2 == SMA(RSI, band_period)``.  The fixed RSI-50 axis,
+    slow line, and outer blue bands are deliberately not alternate triggers.
     """
-    if reference == "fifty":
-        return 50.0 if point.fast is not None else None
     return point.mbl
+
+
+def centre_cross_evidence(
+    points: list[TdiPoint], index: int, speed_window: int = 50,
+) -> dict[str, float | str] | None:
+    """Prove that the purple price line crosses the moving centre on this bar.
+
+    Returning the four endpoint values makes an HVB independently auditable:
+    an outer-band spike while the line was already on the same side of the
+    centre cannot be relabelled as a centre cross later.
+    """
+    if index < 1 or index >= len(points):
+        return None
+    prev, now = points[index - 1], points[index]
+    prev_centre, centre = centre_of(prev), centre_of(now)
+    if prev.fast is None or now.fast is None or prev_centre is None or centre is None:
+        return None
+    side = None
+    if crossed_above(prev.fast, prev_centre, now.fast, centre):
+        side = "up"
+    elif crossed_below(prev.fast, prev_centre, now.fast, centre):
+        side = "down"
+    if side is None:
+        return None
+    points_beyond = (now.fast - centre) if side == "up" else (centre - now.fast)
+    speed = line_speed(points, index, speed_window)
+    return {
+        "model": HVB_MODEL,
+        "side": side,
+        "prev_fast": float(prev.fast),
+        "prev_centre": float(prev_centre),
+        "fast": float(now.fast),
+        "centre": float(centre),
+        "points": float(points_beyond),
+        "speed": float(speed) if speed is not None else 0.0,
+    }
 
 
 def line_speed(points: list[TdiPoint], index: int, window: int = 50) -> float | None:
@@ -180,41 +214,25 @@ def hvb_signal(
     points: list[TdiPoint],
     index: int,
     min_points: float = 0.0,
-    reference: str = "mbl",
     min_speed: float = 0.0,
     speed_window: int = 50,
 ) -> str | None:
-    """``"up"`` / ``"down"`` when the price line breaks the CENTRE band here.
+    """Return an HVB only for a qualified moving-centre-band cross.
 
-    Three gates, all needed by the trader's definition:
-
-    1. **the centre band only.** ``centre_of`` is ``(upper + lower) / 2`` (the
-       yellow market base line) or the 50 axis. The upper/lower bands take no
-       part in the rule - touching them is not an HVB, and the line does not
-       have to reach them either.
-    2. **crossed on this candle**: previous candle on the other side, this
-       candle strictly beyond.
-    3. **with speed.** ``min_points`` = how far beyond the centre the line
-       closed, ``min_speed`` = how big this candle's step was compared with the
-       line's average step. A drift back through the band is not an HVB.
+    The purple line must be on/on the other side of the black MBL on the prior
+    closed candle and strictly beyond the current MBL on this closed candle.
+    Crossing the fixed 50 axis, slow line, upper band, or lower band is never an
+    HVB. ``min_points`` and ``min_speed`` may reject a genuine but weak cross;
+    they can never create one.
     """
-    if index < 1 or index >= len(points):
+    evidence = centre_cross_evidence(points, index, speed_window)
+    if evidence is None:
         return None
-    prev, now = points[index - 1], points[index]
-    prev_centre = centre_of(prev, reference)
-    centre = centre_of(now, reference)
-    if prev.fast is None or now.fast is None or prev_centre is None or centre is None:
+    if float(evidence["points"]) < min_points:
         return None
-
-    speed = line_speed(points, index, speed_window) if min_speed > 0 else None
-    if min_speed > 0 and (speed is None or speed < min_speed):
+    if min_speed > 0 and float(evidence["speed"]) < min_speed:
         return None
-
-    if crossed_above(prev.fast, prev_centre, now.fast, centre) and (now.fast - centre) >= min_points:
-        return "up"
-    if crossed_below(prev.fast, prev_centre, now.fast, centre) and (centre - now.fast) >= min_points:
-        return "down"
-    return None
+    return str(evidence["side"])
 
 
 def break_signal(candles: list[dict], index: int, lookback: int = 20) -> str | None:

@@ -27,8 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot.engine import Engine  # noqa: E402
 from bot.setups import SetupRecord, breaker_block, order_block  # noqa: E402
 
-# 160 quiet bars, then the sweep -> break pattern from tests/test_bot.py
-RISE = [(90 + i * 0.06 + 0.3, 90 + i * 0.06 - 0.3, 90 + i * 0.06) for i in range(160)]
+# A neutral moving RSI baseline, then the sweep -> break pattern. The final
+# bearish body-break candle also crosses the moving MBL with speed; setup tests
+# must use a real HVB rather than disabling a mandatory strategy invariant.
+RISE = []
+for i in range(180):
+    _close = 98 + (i % 10) * 0.15 - (i % 3) * 0.03
+    RISE.append((_close + 0.3, _close - 0.3, _close))
 SHORT = [
     (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
     (105, 100, 101), (101, 96, 97), (98, 95, 96),
@@ -90,7 +95,10 @@ def engine_for(*timeframes: str, **filters) -> Engine:
         tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185},
         filters={
             "structure": True,
-            "hvb": False,
+            "hvb": True,
+            "hvb_window": 0,
+            "hvb_min_points": 1.0,
+            "hvb_min_speed": 1.5,
             "break": False,
             "trend_context": False,
             "require_bos": False,
