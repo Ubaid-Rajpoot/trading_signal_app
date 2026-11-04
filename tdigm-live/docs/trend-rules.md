@@ -15,9 +15,10 @@ makes each of them a switch:
 This page is the honest record: what each rule computes, what it rejects, and
 where old measurements are too weak or too stale to support a claim.
 
-> **Current-policy boundary (lifecycle v5).** The historical tables below predate
-> exactly-one-sweep structure, breaker-local stops, mitigation-first activation,
-> and the variable confirmation-leg H/L exit. They are retained as labelled
+> **Current-policy boundary (lifecycle v6 / chain v5).** The historical tables
+> below predate exactly-one-sweep structure, the direct paired-endpoint-to-sweep
+> approach, breaker-local stops, mitigation-first activation, and the variable
+> confirmation-leg H/L exit. They are retained as labelled
 > research, not presented as current results. The live
 > policy now requires repeated major/macro progression (at least two high and two
 > low steps, with 100% remembered recent-step consistency) plus a clear local leg

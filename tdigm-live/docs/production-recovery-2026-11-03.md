@@ -46,7 +46,7 @@ After the narrow correction, the identical generated candles produced:
 - the same 1,056 paired body breaks;
 - 9 signals.
 
-Nothing was loosened for ordinary range candles. The exception requires a body close beyond the full remembered major/macro range edge, in the trade direction, within `fresh_shift_max_bars`. Internal BOS, EMA direction, HVB alone, and momentum candles cannot invoke it. Same-candle directed HVB, exact same-leg pairing, exactly-one-sweep proof, depth, structure direction, mitigation-first activation, and breaker-local stops remain mandatory. Lifecycle v5 subsequently replaced the then-current fixed 4R exit with the frozen pre-mitigation confirmation-leg H/L target described in `docs/setups.md`.
+Nothing was loosened for ordinary range candles. The exception requires a body close beyond the full remembered major/macro range edge, in the trade direction, within `fresh_shift_max_bars`. Internal BOS, EMA direction, HVB alone, and momentum candles cannot invoke it. Same-candle directed HVB, exact same-leg pairing, exactly-one-sweep proof, depth, structure direction, mitigation-first activation, and breaker-local stops remain mandatory. Lifecycle v5 subsequently replaced the then-current fixed 4R exit with the frozen pre-mitigation confirmation-leg H/L target. Lifecycle v6 / chain v5 now also requires the paired endpoint→sweep approach to be direct, with no intervening pivot; see `docs/setups.md`.
 
 The live funnel now reports:
 

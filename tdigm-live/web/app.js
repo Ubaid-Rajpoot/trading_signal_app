@@ -150,6 +150,14 @@
       leg_target_ms: Number(raw.leg_target_ms || 0),
       leg_start_ms: Number(raw.leg_start_ms || 0),
       leg_break_ms: Number(raw.leg_break_ms || 0),
+      chain_version: Number(raw.chain_version || 1),
+      approach_model: raw.approach_model || (raw.setup || {}).approach_model || "",
+      approach_start_ms: Number(raw.approach_start_ms || (raw.setup || {}).approach_start_time || 0),
+      approach_end_ms: Number(raw.approach_end_ms || (raw.setup || {}).approach_end_time || 0),
+      approach_bars: Number(raw.approach_bars || (raw.setup || {}).approach_bars || 0),
+      approach_pivot_count: Number(
+        raw.approach_pivot_count ?? (raw.setup || {}).approach_pivot_count ?? -1
+      ),
       lifecycle_version: Number(raw.lifecycle_version || 1),
       mitigated: !!raw.mitigated,
       swept_level: raw.swept_level,
@@ -457,8 +465,12 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
-    if (row.lifecycle_version < 5) {
-      bits.push('<div class="chain-invalid"><b>LEGACY LIFECYCLE</b> · excluded from the confirmation-leg target win rate until deep replay regrades it</div>');
+    if (row.lifecycle_version !== 6 || row.chain_version !== 5 || row.target_model !== "hvb_bos_leg_extreme_v1") {
+      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current direct-sweep lifecycle statistics until deep replay regrades it</div>');
+    }
+    if (row.approach_model === "direct_from_paired_endpoint_v1" && row.approach_pivot_count === 0) {
+      bits.push('<div class="nums"><span>approach <b>direct paired endpoint → sweep</b> · '
+        + escapeHtml(String(row.approach_bars || "—")) + ' bars · no intervening pivot</span></div>');
     }
     var stateLabel = stateOf(row).toUpperCase();
     var stateWhy = row.state_reason || (row.state === "pending"
@@ -805,8 +817,12 @@
     var rawSetup = selected && selected.setup || {};
     var sweepTime = selected ? Number(selected.sweep_ms || rawSetup.sweep_time || 0) : 0;
     var breakTime = selected ? Number(selected.created_ms || rawSetup.break_time || 0) : 0;
+    var approachTime = selected ? Number(
+      selected.approach_start_ms || rawSetup.approach_start_time || rawSetup.broke_level_time || 0
+    ) : 0;
     var sweepIndex = barAtTime(candles, sweepTime);
     var breakIndex = barAtTime(candles, breakTime);
+    var approachIndex = barAtTime(candles, approachTime);
 
     var lo = Infinity, hi = -Infinity;
     for (var i = i0; i <= i1; i++) { lo = Math.min(lo, Number(candles[i].l)); hi = Math.max(hi, Number(candles[i].h)); }
@@ -853,6 +869,20 @@
         + d.toLocaleString("en-US", { month: "short", timeZone: "UTC" }) + " "
         + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
       ctx.fillStyle = "#6d7b93"; ctx.fillText(label, tx, h - padB + 7);
+    }
+
+    // The paired endpoint must travel straight into the sweep. Highlight that
+    // approach separately from the post-sweep path, which may oscillate.
+    if (selected && approachIndex >= 0 && sweepIndex >= 0) {
+      var ax = x(approachIndex), approachSweepX = x(sweepIndex);
+      ctx.fillStyle = "rgba(103,169,255,.055)";
+      ctx.fillRect(Math.min(ax, approachSweepX) - bodyW, padT,
+        Math.max(bodyW * 2, Math.abs(approachSweepX - ax) + bodyW * 2), plotH);
+      ctx.strokeStyle = "rgba(103,169,255,.38)"; ctx.setLineDash([2, 4]);
+      ctx.strokeRect(Math.min(ax, approachSweepX) - bodyW, padT,
+        Math.max(bodyW * 2, Math.abs(approachSweepX - ax) + bodyW * 2), plotH);
+      ctx.setLineDash([]); ctx.fillStyle = "#67a9ff"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      ctx.fillText("DIRECT SWEEP APPROACH", Math.min(ax, approachSweepX) + 4, padT + 16);
     }
 
     // The exact setup window is unmistakable: amber sweep candle/level, a
@@ -933,6 +963,10 @@
       ctx.fillText(label, x(index), above ? top - 7 : bottom + 7);
     }
     if (selected) {
+      outlineCandle(
+        approachIndex, "#67a9ff",
+        selected.swept_side === "low" ? "PAIRED HIGH" : "PAIRED LOW", false
+      );
       outlineCandle(sweepIndex, "#ffb347", selected.swept_side === "low" ? "LOW SWEEP" : "HIGH SWEEP", true);
       outlineCandle(breakIndex, "#67a9ff", "BODY BREAK + HVB", false);
     }
@@ -1015,7 +1049,7 @@
           + (data.history_error ? " · " + data.history_error : "");
       } else {
         audit.className = "chart-audit ok";
-        audit.textContent = "✓ paired-leg H/L sweep → same-leg opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
+        audit.textContent = "✓ paired endpoint → direct sweep (no intervening pivot) → opposite body break + same-candle " + String(selected.hvb_side || "HVB").toUpperCase();
       }
     } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
     $("chart-tf").textContent = candles.length + (liveEnabled ? " market bars" : " historical bars")

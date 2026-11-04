@@ -54,12 +54,13 @@ from .setups import (
     order_block,
 )
 from .store import SignalStore
-from .structure import LEG_MODEL, Structure
+from .structure import APPROACH_MODEL, LEG_MODEL, Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
-CURRENT_CHAIN_VERSION = 4
+CURRENT_CHAIN_VERSION = 5
 CURRENT_LEG_MODEL = LEG_MODEL
+CURRENT_APPROACH_MODEL = APPROACH_MODEL
 
 
 def sweep_chain_errors(
@@ -140,6 +141,40 @@ def sweep_chain_errors(
     if swept_level_ms or broke_level_ms:
         if not (0 < swept_level_ms < broke_level_ms < sweep_ms < break_ms):
             errors.append("swept and broken levels are not endpoints of the same completed leg")
+    if chain_version >= 5:
+        approach_model = str(setup.get("approach_model") or payload.get("approach_model") or "")
+        approach_start_ms = as_int(
+            setup.get("approach_start_time") or payload.get("approach_start_ms")
+        )
+        approach_end_ms = as_int(
+            setup.get("approach_end_time") or payload.get("approach_end_ms")
+        )
+        pivot_proof_present = (
+            "approach_pivot_count" in setup or "approach_pivot_count" in payload
+        )
+        raw_approach_pivots = (
+            setup["approach_pivot_count"]
+            if "approach_pivot_count" in setup
+            else payload.get("approach_pivot_count")
+        )
+        try:
+            approach_pivots = int(raw_approach_pivots)
+            pivot_proof_valid = not isinstance(raw_approach_pivots, bool)
+        except (TypeError, ValueError, OverflowError):
+            approach_pivots, pivot_proof_valid = 0, False
+        approach_bars = as_int(setup.get("approach_bars") or payload.get("approach_bars"))
+        if (
+            approach_model != CURRENT_APPROACH_MODEL
+            or not pivot_proof_present
+            or not pivot_proof_valid
+        ):
+            errors.append("direct paired-endpoint-to-sweep approach proof is missing")
+        if approach_start_ms != broke_level_ms or approach_end_ms != sweep_ms:
+            errors.append("direct sweep approach must run from the paired endpoint to the sweep")
+        if pivot_proof_valid and approach_pivots != 0:
+            errors.append("price oscillated between the paired endpoint and the sweep")
+        if approach_bars <= 0:
+            errors.append("direct sweep approach bar count is missing")
     try:
         body_level = float(broke_level)
     except (TypeError, ValueError):
@@ -597,11 +632,14 @@ class Engine:
             )
             try:
                 lifecycle_version = int(row.get("lifecycle_version") or 1)
+                chain_version = int(row.get("chain_version") or 1)
             except (TypeError, ValueError, OverflowError):
-                lifecycle_version = 1
-            if tradeable and lifecycle_version < LIFECYCLE_VERSION:
+                lifecycle_version, chain_version = 1, 1
+            if tradeable and (
+                lifecycle_version != LIFECYCLE_VERSION or chain_version != CURRENT_CHAIN_VERSION
+            ):
                 errors.append(
-                    "tradeable row predates the current structure/lifecycle policy; deep replay required"
+                    "tradeable row does not match the current structure/lifecycle policy; deep replay required"
                 )
             audited[key] = errors
             self.integrity_checked += 1
@@ -633,11 +671,14 @@ class Engine:
                 )
                 try:
                     lifecycle_version = int(row.get("lifecycle_version") or 1)
+                    chain_version = int(row.get("chain_version") or 1)
                 except (TypeError, ValueError, OverflowError):
-                    lifecycle_version = 1
-                if tradeable and lifecycle_version < LIFECYCLE_VERSION:
+                    lifecycle_version, chain_version = 1, 1
+                if tradeable and (
+                    lifecycle_version != LIFECYCLE_VERSION or chain_version != CURRENT_CHAIN_VERSION
+                ):
                     errors.append(
-                        "tradeable row predates the current structure/lifecycle policy; deep replay required"
+                        "tradeable row does not match the current structure/lifecycle policy; deep replay required"
                     )
             row.update({"chain_valid": not errors, "chain_errors": errors})
             self.setup_payloads[key] = row
@@ -1794,6 +1835,10 @@ class Engine:
                 f"aggressive {breaker['body_atr']:.2f} ATR shift armed a "
                 f"{breaker['kind'].replace('_', ' ')}"
             )
+        record.reasons.append(
+            "price moved directly from the paired opposite endpoint into the sweep "
+            "with no intervening structural turn"
+        )
         target_side = "low" if side == "SHORT" else "high"
         record.reasons.append(
             f"target is the {target_side} of the sweep-to-HVB/BOS confirmation leg; "
@@ -1811,6 +1856,11 @@ class Engine:
         payload["kind"] = "signal"
         payload["strategy"] = "sweep"
         payload["chain_version"] = CURRENT_CHAIN_VERSION
+        payload["approach_model"] = setup.get("approach_model")
+        payload["approach_start_ms"] = setup.get("approach_start_time")
+        payload["approach_end_ms"] = setup.get("approach_end_time")
+        payload["approach_bars"] = setup.get("approach_bars")
+        payload["approach_pivot_count"] = setup.get("approach_pivot_count")
         payload["key"] = key
         payload["setup"] = setup
         payload["chain_valid"] = True

@@ -100,7 +100,7 @@ def test_live_chart_returns_the_forming_candle_and_mark_to_market_rr(client):
         "state": "active", "valid": True, "mitigated": True,
         "entry": 100.0, "stop": 104.0, "stop0": 104.0, "risk0": 4.0,
         "target": 90.0, "leg_target": 90.0, "touched_ms": 1_735_690_500_000,
-        "target_model": "hvb_bos_leg_extreme_v1", "lifecycle_version": 5,
+        "target_model": "hvb_bos_leg_extreme_v1", "lifecycle_version": 6,
     }
     client.engine.setup_payloads[key] = payload  # type: ignore[attr-defined]
     cell = client.engine.cells[("BTCUSDT", "5m")]  # type: ignore[attr-defined]
@@ -151,6 +151,7 @@ def test_page_has_bounded_signal_scrolling_and_smc_style_chart_controls(client):
     assert "min-height: 0" in css and "overscroll-behavior: contain" in css
     assert "tdigm.ui.preferences.v2" in script and "savePreferences" in script
     assert "BODY BREAK + HVB" in script and "HIGH SWEEP" in script
+    assert "DIRECT SWEEP APPROACH" in script and "PAIRED LOW" in script
     assert "refreshLiveChart, 1000" in script and 'mode === "live" ? "&live=1"' in script
 
 

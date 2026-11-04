@@ -33,12 +33,15 @@ Definitions used by the alerts (all exact, no hidden magic):
                         two endpoints of that same completed leg
     sweep lifetime      the stop follows the run's furthest extreme; the paired
                         candidate expires after ``sweep_max_wait`` bars
+    sweep approach      after the paired opposite endpoint forms, price must
+                        travel directly to the sweep with no intervening pivot;
+                        only after the sweep may it oscillate before release
     opposite break      close through the paired endpoint of that exact leg,
                         within ``sweep_max_wait`` bars of the sweep
     stop                the sweep extreme (just beyond the swept high/low)
-    target              "next": the next resting liquidity beyond the entry, or
-                        "range": the far extreme of the pre-sweep range (the
-                        dashed line / arrow in the drawing)
+    target              favorable H/L of the sweep→HVB/body-break displacement
+                        leg; the lifecycle may extend it on closed pending bars
+                        and freezes it immediately before mitigation
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ DEFAULTS: dict[str, Any] = {
 
 SIDES = ("high", "low")
 LEG_MODEL = "directional_outer_v1"
+APPROACH_MODEL = "direct_from_paired_endpoint_v1"
 TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
@@ -104,6 +108,8 @@ class Sweep:
     high: float | None = None
     low: float | None = None
     close: float | None = None
+    approach_bars: int = 0
+    approach_turns: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -117,6 +123,9 @@ class Sweep:
             "close": self.close,
             "boundary": self.boundary.as_dict() if self.boundary else None,
             "opposite": self.opposite.as_dict() if self.opposite else None,
+            "approach_model": APPROACH_MODEL,
+            "approach_bars": self.approach_bars,
+            "approach_pivot_count": self.approach_turns,
         }
 
 
@@ -152,6 +161,11 @@ class Setup:
             "swept_count": 1,
             "swept_levels": [self.sweep.boundary.as_dict()] if self.sweep.boundary else [],
             "leg_model": LEG_MODEL,
+            "approach_model": APPROACH_MODEL,
+            "approach_start_time": self.broke.time,
+            "approach_end_time": self.sweep.time,
+            "approach_bars": self.sweep.approach_bars,
+            "approach_pivot_count": self.sweep.approach_turns,
             "sweep_time": self.sweep.time,
             "sweep_extreme": self.sweep.extreme,
             "sweep_open": self.sweep.open,
@@ -202,6 +216,10 @@ class Structure:
         # their paired endpoints breaks. Keep every candidate; ``sweeps`` is the
         # latest-per-side compatibility view used by the page.
         self._candidates: dict[str, list[Sweep]] = {"high": [], "low": []}
+        # An invalid sweep run stays blocked until its paired opposite endpoint
+        # releases or the normal wait expires. Otherwise a second high/low could
+        # be relabelled as a fresh one-level sweep before the first run resolves.
+        self._blocked: dict[str, dict[str, Any] | None] = {"high": None, "low": None}
         self.sweeps: dict[str, Sweep | None] = {"high": None, "low": None}
         self.last_setup: Setup | None = None
         self.sweep_count = 0
@@ -329,8 +347,20 @@ class Structure:
                 continue
             self.sweep_count += 1
 
+            blocked = self._blocked[side]
+            if blocked is not None and index <= int(blocked["until"]):
+                for level in taken_levels:
+                    level.swept = True
+                self._candidates[side] = []
+                self.invalidated += 1
+                events["invalidated"] = True
+                events["invalid_reason"] = (
+                    f"another {side} was swept before the invalid liquidity run released"
+                )
+                continue
+
             active = list(self._candidates[side])
-            dominant = self._dominant_leg(side, taken_levels, active, index)
+            dominant, indirect_pair = self._dominant_leg(side, taken_levels, active, index)
             for level in taken_levels:
                 level.swept = True
 
@@ -338,7 +368,46 @@ class Structure:
                 # One unpaired pivot is merely spent liquidity. Two independent
                 # pivots—or any new pivot reached during an active run—are the X
                 # drawings unless one clear outer directional leg contains them.
-                if active or len(taken_levels) > 1:
+                if indirect_pair is not None:
+                    boundary, opposite = indirect_pair
+                    turns = self._approach_turns(opposite.index, index)
+                    rejected = Sweep(
+                        side=side,
+                        level=boundary.price,
+                        index=index,
+                        time=int(self.times[-1]),
+                        extreme=high if side == "high" else low,
+                        opposite=opposite,
+                        boundary=boundary,
+                        open=float(bar["open"]),
+                        high=high,
+                        low=low,
+                        close=price,
+                        approach_bars=index - opposite.index,
+                        approach_turns=len(turns),
+                    )
+                    events["sweeps"].append(rejected)
+                    events["sweep"] = rejected
+                    self._blocked[side] = {
+                        "until": index + self.sweep_max_wait,
+                        "opposite": opposite,
+                    }
+                    self._candidates[side] = []
+                    self.invalidated += 1
+                    events["invalidated"] = True
+                    events["invalid_reason"] = (
+                        "price oscillated after the paired opposite endpoint; "
+                        "the move into the sweep was not direct"
+                    )
+                elif active or len(taken_levels) > 1:
+                    endpoint = next(
+                        (row.opposite for row in active if row.opposite is not None),
+                        None,
+                    )
+                    self._blocked[side] = (
+                        {"until": index + self.sweep_max_wait, "opposite": endpoint}
+                        if endpoint is not None else None
+                    )
                     self._candidates[side] = []
                     self.invalidated += 1
                     events["invalidated"] = True
@@ -365,6 +434,8 @@ class Structure:
                 high=high,
                 low=low,
                 close=price,
+                approach_bars=index - opposite.index,
+                approach_turns=0,
             )
             self._candidates[side].append(sweep)
             events["sweeps"].append(sweep)
@@ -415,6 +486,7 @@ class Structure:
                         "SHORT" if side == "high" else "LONG", bar, index, chosen
                     )
 
+        self._release_blocked_runs(index, previous_close, price)
         self._sync_sweeps()
         self._expire(index)
         self.events = events
@@ -441,13 +513,49 @@ class Structure:
             )
         ]
 
+    def _approach_turns(self, endpoint_index: int, sweep_index: int) -> list[dict[str, Any]]:
+        """Visible turns between the paired endpoint and the sweep.
+
+        The user's valid drawing has one uninterrupted endpoint→sweep stroke.
+        We inspect the closed candles already available on the sweep bar and use
+        the configured pivot width where possible (shortening only at the two
+        boundaries). This is causal—no future candle is consulted—and catches a
+        pullback/oscillation even when that small turn has not yet been added to
+        ``levels`` by the full symmetric pivot delay.
+        """
+        first_index = self.count - len(self.highs)
+        endpoint = endpoint_index - first_index
+        sweep = sweep_index - first_index
+        if endpoint < 0 or sweep >= len(self.highs) or sweep - endpoint <= 1:
+            return []
+        highs, lows, times = list(self.highs), list(self.lows), list(self.times)
+        turns: list[dict[str, Any]] = []
+        for position in range(endpoint + 1, sweep):
+            left = max(endpoint, position - self.pivot_len)
+            right = min(sweep, position + self.pivot_len)
+            if left == position or right == position:
+                continue
+            high_window = highs[left : right + 1]
+            low_window = lows[left : right + 1]
+            if highs[position] >= max(high_window):
+                turns.append({
+                    "side": "high", "price": highs[position],
+                    "index": first_index + position, "time": times[position],
+                })
+            if lows[position] <= min(low_window):
+                turns.append({
+                    "side": "low", "price": lows[position],
+                    "index": first_index + position, "time": times[position],
+                })
+        return turns
+
     def _dominant_leg(
         self,
         side: str,
         taken: list[Level],
         active: list[Sweep],
         index: int,
-    ) -> tuple[Level, Level] | None:
+    ) -> tuple[tuple[Level, Level] | None, tuple[Level, Level] | None]:
         """Select one outer leg only when it genuinely contains the internals.
 
         A clean H1→L1→LH→LL sequence is one bearish leg at the outer degree. A
@@ -455,7 +563,9 @@ class Structure:
         the multiple-range-high X drawing. The outer pair must contain every
         crossed/active boundary and every active candidate must share its exact
         endpoint. Contracting, equal, or independently newer pivots cannot be
-        absorbed this way and therefore remain a multi-sweep invalidation.
+        absorbed this way and therefore remain a multi-sweep invalidation. Even
+        a valid completed leg is rejected when candles turn between its paired
+        endpoint and the sweep; oscillation is allowed only after the sweep.
         """
         boundaries = [
             *taken,
@@ -463,6 +573,7 @@ class Structure:
         ]
         active_endpoints = [row.opposite for row in active if row.opposite is not None]
         candidates: list[tuple[Level, Level]] = []
+        indirect: list[tuple[Level, Level]] = []
         for boundary, endpoint in self._completed_legs(side, index):
             # An upgrade has to reach this outer boundary now; an already active
             # outer sweep cannot absorb a structural pivot printed afterwards.
@@ -472,11 +583,15 @@ class Structure:
                 continue
             if active_endpoints and not all(level is endpoint for level in active_endpoints):
                 continue
+            if self._approach_turns(endpoint.index, index):
+                indirect.append((boundary, endpoint))
+                continue
             candidates.append((boundary, endpoint))
         if not candidates:
-            return None
+            rejected = min(indirect, key=lambda pair: pair[0].index) if indirect else None
+            return None, rejected
         # Only the earliest containing boundary can enclose every nested one.
-        return min(candidates, key=lambda pair: pair[0].index)
+        return min(candidates, key=lambda pair: pair[0].index), None
 
     @staticmethod
     def _directional_leg(segment: list[Level], side: str) -> bool:
@@ -536,6 +651,24 @@ class Structure:
             if endpoint is not None:
                 pairs.append((boundary, endpoint))
         return pairs
+
+    def _release_blocked_runs(self, index: int, previous_close: float, price: float) -> None:
+        """A rejected run cannot be recycled into a second sweep before release."""
+        for side in SIDES:
+            blocked = self._blocked[side]
+            if blocked is None:
+                continue
+            endpoint = blocked.get("opposite")
+            expired = index > int(blocked["until"])
+            released = bool(
+                endpoint is not None
+                and (
+                    (side == "high" and previous_close >= endpoint.price and price < endpoint.price)
+                    or (side == "low" and previous_close <= endpoint.price and price > endpoint.price)
+                )
+            )
+            if expired or released:
+                self._blocked[side] = None
 
     def _sync_sweeps(self) -> None:
         """Expose the latest active paired candidate on each side to the UI."""

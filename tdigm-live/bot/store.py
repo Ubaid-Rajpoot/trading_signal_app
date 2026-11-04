@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS signals (
     state_since  INTEGER,
     touched_ms   INTEGER,
     closed_ms    INTEGER,
+    chain_version INTEGER NOT NULL DEFAULT 1,
     lifecycle_version INTEGER NOT NULL DEFAULT 1,
     mitigation_kind TEXT,
     state_reason TEXT,
@@ -107,6 +108,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("leg_target_ms", "ALTER TABLE signals ADD COLUMN leg_target_ms INTEGER"),
     ("leg_start_ms", "ALTER TABLE signals ADD COLUMN leg_start_ms INTEGER"),
     ("leg_break_ms", "ALTER TABLE signals ADD COLUMN leg_break_ms INTEGER"),
+    ("chain_version", "ALTER TABLE signals ADD COLUMN chain_version INTEGER NOT NULL DEFAULT 1"),
     ("lifecycle_version", "ALTER TABLE signals ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1"),
     ("mitigation_kind", "ALTER TABLE signals ADD COLUMN mitigation_kind TEXT"),
     ("state_reason", "ALTER TABLE signals ADD COLUMN state_reason TEXT"),
@@ -114,7 +116,9 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_LIFECYCLE_VERSION = 5
+CURRENT_CHAIN_VERSION = 5
+CURRENT_LIFECYCLE_VERSION = 6
+CURRENT_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
 def _num(value: Any) -> float | None:
@@ -178,6 +182,7 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "state_since": _int(payload.get("state_since")),
         "touched_ms": _int(payload.get("touched_ms")),
         "closed_ms": _int(payload.get("closed_ms")),
+        "chain_version": _int(payload.get("chain_version")) or 1,
         "lifecycle_version": _int(payload.get("lifecycle_version")) or 1,
         "mitigation_kind": payload.get("mitigation_kind"),
         "state_reason": payload.get("state_reason"),
@@ -484,8 +489,9 @@ class SignalStore:
                     "SELECT COUNT(*) FROM signals WHERE valid = 1 AND mitigated = 0"
                 ).fetchone()[0]
                 current_version = self._db.execute(
-                    "SELECT COUNT(*) FROM signals WHERE lifecycle_version >= ?",
-                    (CURRENT_LIFECYCLE_VERSION,),
+                    "SELECT COUNT(*) FROM signals WHERE lifecycle_version = ? "
+                    "AND chain_version = ? AND target_model = ?",
+                    (CURRENT_LIFECYCLE_VERSION, CURRENT_CHAIN_VERSION, CURRENT_TARGET_MODEL),
                 ).fetchone()[0]
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
@@ -513,9 +519,9 @@ class SignalStore:
             try:
                 rows = self._db.execute(
                     "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target, "
-                    "target_rr, target_model, mitigated, lifecycle_version FROM signals "
-                    "WHERE lifecycle_version = ? AND target_model = ?",
-                    (CURRENT_LIFECYCLE_VERSION, "hvb_bos_leg_extreme_v1"),
+                    "target_rr, target_model, mitigated, chain_version, lifecycle_version FROM signals "
+                    "WHERE lifecycle_version = ? AND chain_version = ? AND target_model = ?",
+                    (CURRENT_LIFECYCLE_VERSION, CURRENT_CHAIN_VERSION, CURRENT_TARGET_MODEL),
                 ).fetchall()
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
@@ -524,7 +530,7 @@ class SignalStore:
         def r_of(row: sqlite3.Row) -> float:
             """Risk units won or lost from the trade's actual frozen prices.
 
-            Lifecycle-v5 wins resolve at their own confirmation-leg H/L, so R is
+            Current-policy wins resolve at their own confirmation-leg H/L, so R is
             variable. Unfilled invalidations never enter the sample. ``r_now`` is
             authoritative; the price calculation is only for migrated v5 rows.
             """
@@ -597,8 +603,9 @@ class SignalStore:
                 "HVB/BOS confirmation-leg H/L frozen immediately before mitigation; "
                 "invalidated/unfilled setups excluded"
             ),
+            "chain_version": CURRENT_CHAIN_VERSION,
             "lifecycle_version": CURRENT_LIFECYCLE_VERSION,
-            "target_model": "hvb_bos_leg_extreme_v1",
+            "target_model": CURRENT_TARGET_MODEL,
             "target_rr": None,
         }
         # every dimension the page filters on is also a dimension the scanner is

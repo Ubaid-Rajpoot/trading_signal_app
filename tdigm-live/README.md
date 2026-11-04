@@ -242,16 +242,19 @@ into the live state machine, so later candles can mitigate or invalidate it. An
 outcome is write-once within one lifecycle version. Lifecycle v2 introduced
 mitigation-first fixed 4R; v3 added breaker-local stops and one selected
 structural sweep; v4 added the tick/cross degree-aware outer-leg model and full
-remembered trend consistency. **Lifecycle v5 replaces the fixed exit** with the
+remembered trend consistency. **Lifecycle v5 replaced the fixed exit** with the
 favorable H/L of the displacement leg that starts at the sweep and contains the
 same-candle HVB/body break. Fully closed pending candles may extend that extreme;
 the mitigation candle is excluded and the previous extreme freezes on fill.
-Deep replay intentionally replaces outcomes graded under any older rule set. The
+**Lifecycle v6 / chain v5 adds the direct-approach rule:** after the paired
+opposite endpoint forms, price must travel into the sweep without an intervening
+pivot. It may take any path only after that sweep while seeking the opposite body
+break. Deep replay intentionally replaces outcomes graded under any older rule set. The
 board computes win rate and R/trade from current-version mitigated rows, not
 memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
-`exactly one paired-leg H/L sweep → later body close through that same leg's opposite endpoint → correctly directed same-candle HVB`.
+`paired opposite endpoint → direct move with no intervening pivot → exactly one H/L sweep → later body close through that paired endpoint → correctly directed same-candle HVB`.
 Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
@@ -267,14 +270,15 @@ there is no universal fixed break-even percentage.
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
 
-A deterministic lifecycle-v5 regression over 1,317,520 BTCUSDT one-minute bars
-(2022-07-01 through 2024-12-31), rolled into all nine configured timeframes,
-retained 109 setups: 24 target wins, 84 stops, and one still-pending unmitigated
-setup. That sample's win rate was 22.22%, mean result −0.256R/trade, and 95%
-interval −0.701R to +0.189R (**not proven**). It is a single-symbol regression,
-not a claim about the live MEXC universe. Input hash, exact command, per-timeframe
-counts, and limitations are in
-[`docs/lifecycle-v5-regression-2026-11-03.md`](docs/lifecycle-v5-regression-2026-11-03.md).
+A deterministic lifecycle-v6 / chain-v5 regression over 1,317,520 BTCUSDT
+one-minute bars (2022-07-01 through 2024-12-31), rolled into all nine configured
+timeframes, retained 64 setups: 17 target wins, 46 stops, and one still-pending
+unmitigated setup. That sample's win rate was 26.98%, mean result −0.310R/trade,
+and 95% interval −0.713R to +0.094R (**not proven**). It is a single-symbol
+regression, not a claim about the live MEXC universe. All 64 rows carried zero
+approach pivots. Input hash, exact command, per-timeframe counts, comparison with
+the superseded broader policy, and limitations are in
+[`docs/lifecycle-v6-regression-2026-11-04.md`](docs/lifecycle-v6-regression-2026-11-04.md).
 
 ### Concurrent history and live scanning
 
@@ -298,6 +302,10 @@ sparser than accepting near misses:
 * exactly one structural same-side level may be swept at the selected degree;
   simultaneous/sequential independent or equal range highs/lows invalidate it,
   while directional internals contained by one clean outer leg do not;
+* after that leg's paired opposite endpoint forms, the approach to the sweep must
+  be direct: any intervening pivot/oscillation is the X drawing and invalidates
+  the run. Once the sweep is complete, price may move however it chooses before
+  the later opposite body break;
 * `trend_context: true`, `clear_structure: true`, two outer structural steps with
   100% remembered-step consistency, plus ADX ≥ 22 / ER ≥ 0.30 — a directional flicker inside
   a visible range cannot certify a trend;
@@ -465,15 +473,15 @@ mkdir -p data/btc && cp ../backend/data/cache/datasets/BTCUSDT-1m-*.csv data/btc
 Every rejection is counted and shown ("no HVB on this candle 623"), so a quiet
 screen is explained instead of looking broken.
 
-### Legacy regime experiment (not current v5 results)
+### Legacy regime experiment (not current v6 results)
 
 The tables below are retained as an audit of an earlier detector and its
 range-extreme/2R research scoring. They predate exactly-one-sweep validation,
 strict left-context structure, breaker-local stops, mitigation-first activation,
-the confirmation-leg H/L exit, and the current ADX 22 / ER 0.30 policy. They
-**must not** be quoted as the current win rate. No compatible local candle set is
-present in this checkout and MEXC is unreachable from the development sandbox,
-so there is no honest lifecycle-v5 historical result to report yet.
+the confirmation-leg H/L exit, the direct paired-endpoint-to-sweep rule, and the
+current ADX 22 / ER 0.30 policy. They **must not** be quoted as the current win
+rate. MEXC is unreachable from the development sandbox, so there is no honest
+production-universe lifecycle-v6 result to report yet.
 
 The earlier experiment used two years of BTCUSDT 1-minute candles. One year was
 the exploratory sample and the other was held out.
@@ -519,8 +527,8 @@ with and without that trend gate:
 | 2023-07 → 2024-06 | −0.03 | −0.09 |
 
 Read that honestly: the legacy trend gate was a discipline rule, not proven
-alpha. Current lifecycle-v5 results must instead count only setups that meet the
-new structure rules, are actually mitigated, and then reach either their
+alpha. Current lifecycle-v6 results must instead count only setups that meet the
+new direct-approach structure rules, are actually mitigated, and then reach either their
 post-fill stop or their frozen confirmation-leg H/L target.
 
 Re-run the current policy on a compatible local dataset (the counts will not

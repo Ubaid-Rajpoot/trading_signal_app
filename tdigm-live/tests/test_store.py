@@ -134,13 +134,13 @@ def test_a_new_lifecycle_version_can_regrade_an_old_final_outcome(tmp_path):
     store.record({**PAYLOAD, "state": "win", "valid": False, "r_now": 2.0})
     upgraded = {
         **PAYLOAD,
-        "lifecycle_version": 5,
+        "lifecycle_version": 6,
         "state": "pending", "valid": True, "mitigated": False,
         "target": None, "rr": None, "r_now": None,
     }
     store.record(upgraded)
     row = store.get(PAYLOAD["key"])
-    assert row["lifecycle_version"] == 5
+    assert row["lifecycle_version"] == 6
     assert row["state"] == "pending" and row["target"] is None
 
 
@@ -161,6 +161,7 @@ def test_an_existing_database_is_migrated_for_confirmation_leg_evidence(tmp_path
     path = tmp_path / "legacy.sqlite3"
     new_columns = {
         "target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms",
+        "chain_version",
     }
     legacy_schema = "\n".join(
         line for line in SCHEMA.splitlines()
@@ -171,7 +172,7 @@ def test_an_existing_database_is_migrated_for_confirmation_leg_evidence(tmp_path
         database.executescript(legacy_schema)
 
     store = SignalStore(path)
-    assert store.enabled and store.record({**PAYLOAD, "lifecycle_version": 5})
+    assert store.enabled and store.record({**PAYLOAD, "lifecycle_version": 6})
     columns = {row[1] for row in store._db.execute("PRAGMA table_info(signals)").fetchall()}
     assert new_columns <= columns
     restored = store.get(PAYLOAD["key"])
@@ -193,7 +194,8 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     store = SignalStore(tmp_path / "sig.sqlite3")
     current = {
         **PAYLOAD,
-        "lifecycle_version": 5,
+        "chain_version": 5,
+        "lifecycle_version": 6,
         "target_model": "hvb_bos_leg_extreme_v1",
         "mitigated": True,
     }
@@ -206,15 +208,18 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     store.record({**PAYLOAD, "key": "legacy", "state": "win", "valid": False})
     store.record({**current, "key": "book", "state": "win", "valid": False,
                   "target_model": "book_plan", "r_now": 9.0})
+    store.record({**current, "key": "wrong-chain", "state": "win", "valid": False,
+                  "chain_version": 4, "r_now": 9.0})
     store.record({**current, "key": "future", "state": "win", "valid": False,
-                  "lifecycle_version": 6, "r_now": 9.0})
+                  "lifecycle_version": 7, "r_now": 9.0})
     results = store.results()["all"]
     assert results["wins"] == 1 and results["losses"] == 1
     assert results["mitigated"] == 2
     assert results["win_rate"] == 0.5
     assert results["r_per_trade"] == 0.625, "(+2.25R - 1R) / 2 decided mitigated trades"
     full = store.results()
-    assert full["target_rr"] is None and full["lifecycle_version"] == 5
+    assert full["target_rr"] is None and full["lifecycle_version"] == 6
+    assert full["chain_version"] == 5
     assert full["target_model"] == "hvb_bos_leg_extreme_v1"
     assert "confirmation-leg H/L" in full["r_basis"]
 
@@ -242,11 +247,16 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     engine.market = "futures"
     current = {
         **PAYLOAD,
-        "chain_version": 4,
-        "lifecycle_version": 5,
+        "chain_version": 5,
+        "lifecycle_version": 6,
         "setup": {
             **PAYLOAD["setup"],
             "leg_model": "directional_outer_v1",
+            "approach_model": "direct_from_paired_endpoint_v1",
+            "approach_start_time": PAYLOAD["setup"]["sweep_time"] - 1,
+            "approach_end_time": PAYLOAD["setup"]["sweep_time"],
+            "approach_bars": 1,
+            "approach_pivot_count": 0,
             "swept_count": 1,
             "swept_levels": [{"side": "high", "price": 104.0}],
             "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
@@ -398,18 +408,52 @@ def test_startup_requires_deep_replay_for_a_tradeable_v3_row(tmp_path):
     assert old_current["key"] not in engine.registry
 
 
-def test_startup_quarantines_v5_without_confirmation_leg_target_proof(tmp_path):
+def test_startup_quarantines_v6_without_direct_sweep_approach_proof(tmp_path):
+    store = SignalStore(tmp_path / "sig.sqlite3")
+    versioned = {
+        **PAYLOAD,
+        "chain_version": 5,
+        "lifecycle_version": 6,
+        "setup": {
+            **PAYLOAD["setup"],
+            "leg_model": "directional_outer_v1",
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 104.0}],
+            "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
+            "broke_level_time": PAYLOAD["setup"]["sweep_time"] - 1,
+        },
+    }
+    store.record(versioned)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": True}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    engine.attach_store(store)
+    engine.load_stored()
+    row = store.get(versioned["key"])
+    assert row["state"] == "invalidated"
+    assert any("direct paired-endpoint-to-sweep" in reason for reason in row["chain_errors"])
+    assert versioned["key"] not in engine.registry
+
+
+def test_startup_quarantines_v6_without_confirmation_leg_target_proof(tmp_path):
     store = SignalStore(tmp_path / "sig.sqlite3")
     versioned = {
         key: value for key, value in PAYLOAD.items()
         if key not in {"target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms"}
     }
     versioned.update({
-        "chain_version": 4,
-        "lifecycle_version": 5,
+        "chain_version": 5,
+        "lifecycle_version": 6,
         "setup": {
             **PAYLOAD["setup"],
             "leg_model": "directional_outer_v1",
+            "approach_model": "direct_from_paired_endpoint_v1",
+            "approach_start_time": PAYLOAD["setup"]["sweep_time"] - 1,
+            "approach_end_time": PAYLOAD["setup"]["sweep_time"],
+            "approach_bars": 1,
+            "approach_pivot_count": 0,
             "swept_count": 1,
             "swept_levels": [{"side": "high", "price": 104.0}],
             "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
@@ -467,7 +511,8 @@ def test_the_record_carries_an_honest_error_bar(tmp_path):
             key=f"BTCUSDT|1h|{1_700_000_000_000 + i}",
             state="win",
             mitigated=True,
-            lifecycle_version=5,
+            chain_version=5,
+            lifecycle_version=6,
             r_now=1.5 if i % 2 else -1.0,
         )
         store.record(row)

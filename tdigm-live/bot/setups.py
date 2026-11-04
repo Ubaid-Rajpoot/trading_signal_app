@@ -38,7 +38,7 @@ from typing import Any
 
 VALID = {"pending", "active"}
 DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
-LIFECYCLE_VERSION = 5
+LIFECYCLE_VERSION = 6
 # Retained for book-plan compatibility only. Sweep setups use the frozen H/L of
 # their own HVB/BOS confirmation leg and derive the achieved R from that price.
 DEFAULT_TARGET_RR = 4.0

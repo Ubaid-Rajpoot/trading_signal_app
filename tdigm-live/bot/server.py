@@ -526,6 +526,8 @@ def create_app(
         fields = ["created_ms", "symbol", "market", "timeframe", "side", "grade", "state",
                   "valid", "mitigated", "entry", "stop", "target", "target_rr", "target_rr_price", "rr",
                   "target_model", "leg_target", "leg_target_ms", "leg_start_ms", "leg_break_ms",
+                  "approach_model", "approach_start_ms", "approach_end_ms", "approach_bars",
+                  "approach_pivot_count",
                   "score", "r_now", "zone_low", "zone_high", "mitigation_kind", "state_reason",
                   "lifecycle_version", "swept_level", "bos_level",
                   "break_kind", "hvb_side", "hvb_lag", "volume_ratio", "trend_dir",

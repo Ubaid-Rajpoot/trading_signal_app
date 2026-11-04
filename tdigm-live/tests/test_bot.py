@@ -431,6 +431,41 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
                           if k not in {"swept_level_time", "broke_level_time"}}}
     assert any("endpoint proof" in reason for reason in sweep_chain_errors(unproved))
 
+    direct = {
+        **valid,
+        "chain_version": 5,
+        "setup": {
+            **valid["setup"],
+            "leg_model": "directional_outer_v1",
+            "approach_model": "direct_from_paired_endpoint_v1",
+            "approach_start_time": 8_000,
+            "approach_end_time": 10_000,
+            "approach_bars": 1,
+            "approach_pivot_count": 0,
+        },
+    }
+    assert sweep_chain_errors(direct) == []
+    missing_direct_count = {
+        **direct,
+        "setup": {
+            key: value for key, value in direct["setup"].items()
+            if key != "approach_pivot_count"
+        },
+    }
+    assert any("approach proof is missing" in reason
+               for reason in sweep_chain_errors(missing_direct_count))
+    null_direct_count = {
+        **direct,
+        "setup": {**direct["setup"], "approach_pivot_count": None},
+    }
+    assert any("approach proof is missing" in reason
+               for reason in sweep_chain_errors(null_direct_count))
+    oscillated = {
+        **direct,
+        "setup": {**direct["setup"], "approach_pivot_count": 1},
+    }
+    assert any("oscillated" in reason for reason in sweep_chain_errors(oscillated))
+
 
 @pytest.mark.asyncio
 async def test_publication_boundary_refuses_an_hvb_and_break_without_a_sweep():
@@ -529,6 +564,160 @@ def test_sequential_second_high_invalidates_the_active_liquidity_run():
     assert "multiple highs" in second["invalid_reason"]
     broken = st.add(bar(360_000, 95.0, high=129.0, low=94.0))
     assert broken["setup"] is None
+
+
+def _seed_paired_short_leg_for_approach_test():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    seed = [(110, 108, 109), (120, 110, 118), (115, 105, 107), (108, 100, 102)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("high", 120.0, 1, 119_999),
+        Level("low", 100.0, 3, 239_999),
+    ])
+    return st
+
+
+def test_cross_drawing_rejects_an_oscillating_approach_before_the_sweep():
+    st = _seed_paired_short_leg_for_approach_test()
+    # After the paired 100 low, price rises, pulls back to a visible 105 pivot,
+    # then resumes into the 120 sweep. That is the newly supplied X drawing:
+    # the approach was not one direct endpoint-to-sweep stroke.
+    rows = [
+        (105, 102, 104), (110, 106, 109), (114, 109, 113),
+        (111, 105, 107), (115, 108, 114), (118, 112, 117),
+        (121, 114, 120), (118, 95, 96),
+    ]
+    setup = None
+    rejected = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        setup = events["setup"] or setup
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None and rejected["sweep"] is not None
+    assert rejected["sweep"].approach_turns == 1
+    assert setup is None, "a later opposite break cannot rescue an indirect sweep approach"
+
+
+def test_an_indirect_run_cannot_relabel_a_later_high_as_a_fresh_sweep():
+    from bot.structure import Level
+
+    st = _seed_paired_short_leg_for_approach_test()
+    indirect = [
+        (105, 102, 104), (110, 106, 109), (114, 109, 113),
+        (111, 105, 107), (115, 108, 114), (118, 112, 117),
+        (121, 114, 120),
+    ]
+    rejected = None
+    for i, (high, low, close) in enumerate(indirect, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None
+
+    # A second high before the paired low releases is still part of that rejected
+    # run. It cannot be renamed as a clean one-level sweep and later confirmed.
+    st.levels.append(Level("high", 130.0, st.count - 1, st.times[-1]))
+    second = st.add(bar(st.count * 60_000, 129.0, high=131.0, low=118.0))
+    assert second["setup"] is None and second["invalidated"] is True
+    assert "invalid liquidity run" in second["invalid_reason"]
+    broken = st.add(bar(st.count * 60_000, 96.0, high=120.0, low=95.0))
+    assert broken["setup"] is None
+
+
+def test_tick_drawing_allows_any_path_after_a_direct_sweep_before_the_break():
+    st = _seed_paired_short_leg_for_approach_test()
+    # The paired low-to-high-sweep approach is direct. Only after sweeping 120
+    # does price oscillate; the user's middle tick explicitly permits that.
+    rows = [
+        (108, 102, 107), (115, 106, 114), (121, 112, 120),
+        (118, 108, 110), (116, 105, 114), (119, 107, 108),
+        (112, 95, 96),
+    ]
+    sweep = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["sweep"] is not None and events["sweep"].side == "high":
+            sweep = events["sweep"]
+        setup = events["setup"] or setup
+    assert sweep is not None and sweep.level == 120.0 and sweep.approach_turns == 0
+    assert setup is not None and setup.side == "SHORT"
+    proof = setup.as_dict()
+    assert proof["approach_model"] == "direct_from_paired_endpoint_v1"
+    assert proof["approach_start_time"] == proof["broke_level_time"]
+    assert proof["approach_end_time"] == proof["sweep_time"]
+    assert proof["approach_pivot_count"] == 0
+
+
+def test_direct_sweep_approach_rule_is_symmetric_for_longs():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    seed = [(92, 90, 91), (90, 80, 82), (95, 85, 93), (100, 92, 98)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("low", 80.0, 1, 119_999),
+        Level("high", 100.0, 3, 239_999),
+    ])
+    # Mirror of the invalid short approach: a visible high turn occurs before
+    # price finally sweeps the paired 80 low.
+    rows = [
+        (98, 95, 96), (94, 90, 91), (91, 86, 87),
+        (95, 89, 93), (92, 85, 86), (88, 82, 83),
+        (86, 79, 80), (105, 82, 104),
+    ]
+    rejected = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        setup = events["setup"] or setup
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None and rejected["sweep"].side == "low"
+    assert rejected["sweep"].approach_turns >= 1
+    assert setup is None
+
+
+def test_direct_sweep_and_arbitrary_post_sweep_path_are_symmetric_for_longs():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100})
+    seed = [(92, 90, 91), (90, 80, 82), (95, 85, 93), (100, 92, 98)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("low", 80.0, 1, 119_999),
+        Level("high", 100.0, 3, 239_999),
+    ])
+    rows = [
+        (98, 92, 93), (92, 85, 86), (86, 79, 80),
+        (91, 82, 89), (88, 83, 84), (96, 85, 94),
+        (105, 92, 104),
+    ]
+    sweep = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["sweep"] is not None and events["sweep"].side == "low":
+            sweep = events["sweep"]
+        setup = events["setup"] or setup
+    assert sweep is not None and sweep.level == 80.0 and sweep.approach_turns == 0
+    assert setup is not None and setup.side == "LONG"
+    assert setup.as_dict()["approach_pivot_count"] == 0
 
 
 def test_tick_drawing_allows_one_outer_leg_with_directional_internal_structure():
@@ -924,7 +1113,9 @@ async def test_engine_emits_a_signal_for_the_complete_setup():
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
-    assert alert["chain_version"] == 4
+    assert alert["chain_version"] == 5
+    assert alert["approach_model"] == "direct_from_paired_endpoint_v1"
+    assert alert["approach_pivot_count"] == 0
     assert alert["setup"]["leg_model"] == "directional_outer_v1"
     assert alert["setup"]["stop"] == 107.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
