@@ -197,6 +197,7 @@ table.signals tbody tr.sel { background: #16202c; box-shadow: inset 2px 0 0 var(
 .grade.A { color: var(--amber); font-weight: 700; }
 .state { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; }
 .state.open, .state.active { color: var(--green); }
+.state.mitigated { color: var(--amber); }
 .state.pending { color: var(--amber); }
 .state.win { color: var(--green); }
 .state.stopped { color: var(--red); }

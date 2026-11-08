@@ -86,19 +86,25 @@ Before lifecycle starts, structural validity is exact:
 4. once that paired endpoint forms, price must move **directly** to sweep the
    other endpoint. Any intervening pivot or back-and-forth before the sweep is
    the X drawing and invalidates the run;
-5. after the valid sweep, price may move however it chooses while seeking the
+5. the sweep candle itself must displace in the direction of the liquidity take:
+   its real body must be at least `structure.displacement_body_atr` (default
+   **1.0**) times ATR calculated only from prior closed candles;
+6. after the valid sweep, price may move however it chooses while seeking the
    opposite break. Continuing beyond the selected sweep extreme is allowed, but
    taking a second independent/equal same-side level before release is not;
-6. the body break must occur later and through the exact paired endpoint;
-7. on that same closed candle, the purple TDIGM price line must cross the moving
-   black MBL. Previous/current purple and MBL values must prove the transition.
-   A fixed-50, slow-line, or outer-blue-band crossing is not an HVB.
+7. the body break must occur later and through the exact paired endpoint, and
+   that break candle must independently meet the same prior-ATR displacement
+   threshold in the trade direction;
+8. on that same closed break candle, the purple TDIGM price line must cross the
+   moving black MBL. Previous/current purple and MBL values must prove the
+   transition. A fixed-50, slow-line, or outer-blue-band crossing is not an HVB.
 
 Repeated equal highs/lows, a contracting range, an oscillating sweep approach,
-or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 6`
+or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 7`
 stores `swept_count: 1`, `leg_model: directional_outer_v1`,
-`approach_model: direct_from_paired_endpoint_v1` with zero approach pivots, and
-`hvb_model: mbl_centre_cross_v1` with all four crossing values. The publication/
+`approach_model: direct_from_paired_endpoint_v1` with zero approach pivots,
+`hvb_model: mbl_centre_cross_v1` with all four crossing values, and immutable
+OHLC/prior-ATR/body-ratio proofs for both displacement events. The publication/
 database boundary refuses a current-version row without every proof.
 
 A setup is not a moment. Each one becomes a record with a state:
@@ -112,8 +118,11 @@ A setup is not a moment. Each one becomes a record with a state:
 | expired | optional positive `setup_max_bars` limit elapsed (disabled by default) | no |
 | invalidated | stop was reached while still unmitigated; no trade was filled | no |
 
-`valid` = pending or active. `unmitigated` specifically means pending. Every row
-stores `state_reason`, so “invalidated” is never an unexplained label: an integrity
+`valid` = pending or active. `unmitigated` specifically means pending. These are
+internal lifecycle names; the board deliberately displays an unmitigated
+`pending` row as **ACTIVE** and a filled unresolved `active` row as **MITIGATED**,
+so a zone that has already traded is never presented as an untouched active
+signal. Every row stores `state_reason`, so “invalidated” is never an unexplained label: an integrity
 quarantine names the broken proof, while a lifecycle invalidation says that the
 stop preceded every eligible zone. Unfilled invalidations do not enter the win
 rate. Nothing is deleted when a setup dies.

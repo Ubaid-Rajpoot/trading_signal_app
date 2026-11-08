@@ -1,8 +1,8 @@
 # Lifecycle-v5 deterministic regression — 2026-11-03 (superseded)
 
-> Historical only. Current lifecycle v7 / chain v6 adds the stricter direct
-> paired-endpoint-to-sweep approach plus mathematical moving-MBL HVB proof and
-> excludes these rows from current statistics. Do not quote the result below as
+> Historical only. Current lifecycle v7 / chain v7 adds the stricter direct
+> paired-endpoint-to-sweep approach, mathematical moving-MBL HVB proof, and
+> mandatory sweep/break displacement proof, and excludes these rows from current statistics. Do not quote the result below as
 > the current policy result.
 
 This is a reproducibility and lifecycle check, **not a profitability claim for

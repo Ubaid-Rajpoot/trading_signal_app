@@ -20,6 +20,7 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var NF = window.TdigmNotify;
+  var SF = window.TdigmState;
   var quiet = localStorage.getItem("tdigm.quiet") !== "0";
   var PREFS_KEY = "tdigm.ui.preferences.v2";
 
@@ -115,9 +116,12 @@
 
   function sideOf(row) { return String(row.side || "").toUpperCase() === "SHORT" ? "short" : "long"; }
 
+  function lifecycleStateOf(row) {
+    return SF.lifecycleStateOf(row || {});
+  }
+
   function stateOf(row) {
-    if (row.state) return String(row.state).toLowerCase();
-    return row.valid === false ? "expired" : "open";
+    return SF.displayStateOf(row || {});
   }
 
   function normaliseRow(raw) {
@@ -127,7 +131,9 @@
       timeframe: raw.timeframe || "",
       side: String(raw.side || "").toUpperCase(),
       grade: raw.grade || "",
+      lifecycle_state: lifecycleStateOf(raw),
       state: stateOf(raw),
+      display_state: raw.display_state || "",
       valid: raw.valid !== false,
       entry: raw.entry,
       stop: raw.stop,
@@ -158,6 +164,9 @@
       approach_pivot_count: Number(
         raw.approach_pivot_count ?? (raw.setup || {}).approach_pivot_count ?? -1
       ),
+      displacement_model: raw.displacement_model || (raw.setup || {}).displacement_model || "",
+      sweep_displacement: raw.sweep_displacement || (raw.setup || {}).sweep_displacement || null,
+      break_displacement: raw.break_displacement || (raw.setup || {}).break_displacement || null,
       lifecycle_version: Number(raw.lifecycle_version || 1),
       mitigated: !!raw.mitigated,
       swept_level: raw.swept_level,
@@ -470,8 +479,8 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
-    if (row.lifecycle_version !== 7 || row.chain_version !== 6 || row.target_model !== "hvb_bos_leg_extreme_v1") {
-      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current MBL-cross/direct-sweep lifecycle statistics until deep replay regrades it</div>');
+    if (row.lifecycle_version !== 7 || row.chain_version !== 7 || row.target_model !== "hvb_bos_leg_extreme_v1") {
+      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current displacement/MBL-cross/direct-sweep lifecycle statistics until deep replay regrades it</div>');
     }
     if (row.hvb_model === "mbl_centre_cross_v1") {
       var beforeSign = row.hvb_side === "up" ? " ≤ " : " ≥ ";
@@ -484,10 +493,18 @@
       bits.push('<div class="nums"><span>approach <b>direct paired endpoint → sweep</b> · '
         + escapeHtml(String(row.approach_bars || "—")) + ' bars · no intervening pivot</span></div>');
     }
+    if (row.displacement_model === "directed_body_over_prior_atr_v1"
+        && row.sweep_displacement && row.break_displacement) {
+      bits.push('<div class="nums"><span>displacement <b>qualified on both events</b> · sweep '
+        + escapeHtml(num(row.sweep_displacement.body_atr, 2)) + ' ATR · paired break '
+        + escapeHtml(num(row.break_displacement.body_atr, 2)) + ' ATR</span></div>');
+    }
     var stateLabel = stateOf(row).toUpperCase();
-    var stateWhy = row.state_reason || (row.state === "pending"
-      ? "waiting for order-block or eligible aggressive-breaker mitigation; the leg H/L is tracked but no trade target is armed yet"
-      : "no lifecycle reason was stored for this legacy row");
+    var stateWhy = row.state_reason || (row.lifecycle_state === "pending"
+      ? "active signal awaiting order-block or eligible aggressive-breaker mitigation; the leg H/L is tracked but no trade target is armed yet"
+      : row.lifecycle_state === "active"
+        ? "the zone has been mitigated and the filled trade is awaiting its target or stop"
+        : "no lifecycle reason was stored for this legacy row");
     bits.push('<div class="nums"><span>state <b>' + escapeHtml(stateLabel) + "</b> · "
       + escapeHtml(stateWhy) + "</span></div>");
     var nums = [];

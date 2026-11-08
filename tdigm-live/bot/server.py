@@ -337,6 +337,10 @@ def create_app(
     async def notify_js() -> FileResponse:
         return FileResponse(WEB_DIR / "notify.js", media_type="text/javascript")
 
+    @app.get("/state.js")
+    async def state_js() -> FileResponse:
+        return FileResponse(WEB_DIR / "state.js", media_type="text/javascript")
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         store_counts = store.counts()

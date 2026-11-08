@@ -15,9 +15,10 @@ makes each of them a switch:
 This page is the honest record: what each rule computes, what it rejects, and
 where old measurements are too weak or too stale to support a claim.
 
-> **Current-policy boundary (lifecycle v7 / chain v6).** The historical tables
+> **Current-policy boundary (lifecycle v7 / chain v7).** The historical tables
 > below predate exactly-one-sweep structure, the direct paired-endpoint-to-sweep
-> approach, four-value moving-MBL HVB proof, breaker-local stops, mitigation-first
+> approach, four-value moving-MBL HVB proof, mandatory prior-ATR displacement on
+> both sweep and paired-break candles, breaker-local stops, mitigation-first
 > activation, and the variable confirmation-leg H/L exit. They are retained as labelled
 > research, not presented as current results. The live
 > policy now requires repeated major/macro progression (at least two high and two

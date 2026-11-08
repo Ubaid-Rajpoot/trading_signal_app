@@ -116,7 +116,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
-CURRENT_CHAIN_VERSION = 6
+CURRENT_CHAIN_VERSION = 7
 CURRENT_LIFECYCLE_VERSION = 7
 CURRENT_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
@@ -276,7 +276,7 @@ class SignalStore:
                         except json.JSONDecodeError:
                             old_payload, new_payload = {}, {}
                         for key in (
-                            "state", "valid", "mitigated", "closed_ms", "state_since",
+                            "state", "display_state", "valid", "mitigated", "closed_ms", "state_since",
                             "touched_ms", "bars", "r_now", "last_price", "be_ms",
                             "entry", "stop", "stop0", "risk0", "target", "target_2r",
                             "target_rr", "target_rr_price", "target_model", "leg_target",

@@ -120,6 +120,7 @@ async function main() {
   };
 
   window.eval(read("notify.js"));
+  window.eval(read("state.js"));
   window.eval(read("app.js"));
 
   await waitFor(() => doc.querySelectorAll("#rows tr").length > 0
@@ -132,7 +133,7 @@ async function main() {
     throw new Error("the selected signal does not display its four-value MBL-cross proof: " + story.slice(0, 300));
   }
   if (story.includes("NON-CURRENT POLICY")) {
-    throw new Error("the chain-v6/lifecycle-v7 archive was incorrectly labelled non-current");
+    throw new Error("the chain-v7/lifecycle-v7 archive was incorrectly labelled non-current");
   }
   if (doc.getElementById("sort-select").value !== "symbol") {
     throw new Error("saved page settings were reset during reload");

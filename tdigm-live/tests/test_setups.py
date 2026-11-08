@@ -53,7 +53,7 @@ def rows_to_candles(rows, step_ms: int = 300_000) -> list[dict]:
                 "symbol": "BTCUSDT",
                 "open_time": open_time,
                 "close_time": open_time + step_ms - 1,
-                "open": rows[i - 1][2] if i else close,
+                "open": max(low, min(high, rows[i - 1][2] if i else close)),
                 "high": high,
                 "low": low,
                 "close": close,
@@ -229,8 +229,10 @@ def test_a_setup_is_pending_until_price_comes_back_into_the_zone():
     assert setup.valid and setup.state == "pending"
     assert setup.advance(bar_at(97.5, 95.0, 96.0)) is False, "price moving away is not an event"
     assert setup.state == "pending", "still valid: the zone has not been mitigated"
+    assert setup.as_dict()["display_state"] == "active"
     assert setup.advance(bar_at(100.5, 99.2, 100.0)) is True
     assert setup.state == "active" and setup.touched_ms == 2_000
+    assert setup.as_dict()["display_state"] == "mitigated"
     assert setup.stop == 104.0, "order-block mitigation retains the structural sweep stop"
     assert setup.target == 90.0 and setup.rr == 1.8
     assert "confirmation-leg low target armed" in setup.state_reason

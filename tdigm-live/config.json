@@ -83,7 +83,9 @@
     "sweep_max_wait": 60,
     "level_max_age": 180,
     "max_levels": 40,
-    "target_mode": "range"
+    "target_mode": "range",
+    "displacement_atr_period": 14,
+    "displacement_body_atr": 1.0
   },
   "strategy": "sweep",
   "book": {

@@ -1,8 +1,9 @@
 # Lifecycle-v6 / chain-v5 deterministic regression — 2026-11-04
 
-> **Superseded historical evidence.** Lifecycle v7 / chain v6 makes the moving
-> MBL crossing mathematically auditable and removes the alternate fixed-50/score
-> bypasses. Current-policy evidence is in
+> **Superseded historical evidence.** Lifecycle v7 / chain v6 made the moving
+> MBL crossing mathematically auditable and removed the alternate fixed-50/score
+> bypasses; current chain v7 additionally requires displacement proof on both
+> structural events. The linked chain-v6 report is itself now historical:
 > [`lifecycle-v7-regression-2026-11-04.md`](lifecycle-v7-regression-2026-11-04.md).
 
 This is a reproducibility and policy-regression check, **not a profitability

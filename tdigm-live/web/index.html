@@ -72,9 +72,9 @@
       <div class="group-head">state</div>
       <select id="state-select">
         <option value="all">every state</option>
-        <option value="open">open only (pending + active)</option>
-        <option value="pending">pending mitigation</option>
-        <option value="active">active after mitigation</option>
+        <option value="open">open only (active + mitigated)</option>
+        <option value="active">active / awaiting mitigation</option>
+        <option value="mitigated">mitigated / trade open</option>
         <option value="win">won at confirmation-leg target</option>
         <option value="stopped">closed at the stop</option>
         <option value="breakeven">scratched at break-even</option>
@@ -214,6 +214,7 @@
 </div>
 
 <script src="/notify.js"></script>
+<script src="/state.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

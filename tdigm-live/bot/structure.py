@@ -28,6 +28,9 @@ Definitions used by the alerts (all exact, no hidden magic):
                         external trend / the dealing range of p.42
     break_kind          "SHIFT" or "MS", recorded on every setup
     sweep               bar.high > level (high level) / bar.low < level (low level)
+    displacement        the sweep candle and the later paired break candle must
+                        each have a correctly directed real body at least
+                        ``displacement_body_atr`` times prior ATR
     paired leg          SHORT uses a HIGH -> later LOW leg; LONG uses a LOW ->
                         later HIGH leg. The swept and broken levels must be the
                         two endpoints of that same completed leg
@@ -58,12 +61,15 @@ DEFAULTS: dict[str, Any] = {
     "level_max_age": 180,
     "max_levels": 40,
     "target_mode": "next",
+    "displacement_atr_period": 14,
+    "displacement_body_atr": 1.0,
 }
 
 SIDES = ("high", "low")
 LEG_MODEL = "directional_outer_v1"
 APPROACH_MODEL = "direct_from_paired_endpoint_v1"
 TARGET_MODEL = "hvb_bos_leg_extreme_v1"
+DISPLACEMENT_MODEL = "directed_body_over_prior_atr_v1"
 
 
 @dataclass
@@ -110,6 +116,7 @@ class Sweep:
     close: float | None = None
     approach_bars: int = 0
     approach_turns: int = 0
+    displacement: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -126,6 +133,7 @@ class Sweep:
             "approach_model": APPROACH_MODEL,
             "approach_bars": self.approach_bars,
             "approach_pivot_count": self.approach_turns,
+            "displacement": self.displacement,
         }
 
 
@@ -143,6 +151,7 @@ class Setup:
     time: int
     broke: Level
     confirmation_leg: dict[str, Any]
+    break_displacement: dict[str, Any]
     break_kind: str = "SHIFT"  # "SHIFT" (minor) or "MS" (major, p.53)
 
     def as_dict(self) -> dict[str, Any]:
@@ -172,6 +181,8 @@ class Setup:
             "sweep_high": self.sweep.high,
             "sweep_low": self.sweep.low,
             "sweep_close": self.sweep.close,
+            "displacement_model": DISPLACEMENT_MODEL,
+            "sweep_displacement": self.sweep.displacement,
             # The structural endpoints prove both events belong to one leg:
             # SHORT = high -> low, LONG = low -> high.
             "swept_level_time": self.sweep.boundary.time if self.sweep.boundary else None,
@@ -180,6 +191,11 @@ class Setup:
             # event.  ``break_time`` is the body-close/HVB candle itself.
             "broke_level_time": self.broke.time,
             "break_time": self.time,
+            "break_open": self.break_displacement.get("open"),
+            "break_high": self.break_displacement.get("high"),
+            "break_low": self.break_displacement.get("low"),
+            "break_close": self.break_displacement.get("close"),
+            "break_displacement": self.break_displacement,
             "break_kind": self.break_kind,
             "bars_since_sweep": self.index - self.sweep.index,
         }
@@ -200,6 +216,8 @@ class Structure:
         self.level_max_age = max(self.pivot_len * 2, int(cfg["level_max_age"]))
         self.max_levels = max(4, int(cfg["max_levels"]))
         self.target_mode = str(cfg.get("target_mode") or "next")
+        self.displacement_atr_period = max(2, int(cfg.get("displacement_atr_period") or 14))
+        self.displacement_body_atr = max(0.0, float(cfg.get("displacement_body_atr", 1.0)))
 
         keep = self.level_max_age + self.pivot_len + 5
         self.highs: deque[float] = deque(maxlen=keep)
@@ -247,6 +265,10 @@ class Structure:
     # ----------------------------------------------------------------- add
     def add(self, bar: dict) -> dict[str, Any]:
         """Feed one CLOSED candle; return the raw events it produced."""
+        # Both event qualifications use ATR from bars that were already closed.
+        # The event candle therefore cannot make its own threshold easier by
+        # inflating the denominator, and a stored proof can be recomputed later.
+        prior_atr = self._prior_atr()
         self.highs.append(float(bar["high"]))
         self.lows.append(float(bar["low"]))
         self.closes.append(float(bar["close"]))
@@ -347,6 +369,22 @@ class Structure:
                 continue
             self.sweep_count += 1
 
+            sweep_displacement = self._displacement_proof(
+                bar, prior_atr, "up" if side == "high" else "down"
+            )
+            if not sweep_displacement["passes"]:
+                # Liquidity was spent, but not by the displacement event the
+                # strategy requires. It cannot be recycled into a later signal.
+                for level in taken_levels:
+                    level.swept = True
+                self._candidates[side] = []
+                self.invalidated += 1
+                events["invalidated"] = True
+                events["invalid_reason"] = (
+                    f"{side} liquidity was taken without directed sweep displacement"
+                )
+                continue
+
             blocked = self._blocked[side]
             if blocked is not None and index <= int(blocked["until"]):
                 for level in taken_levels:
@@ -385,6 +423,7 @@ class Structure:
                         close=price,
                         approach_bars=index - opposite.index,
                         approach_turns=len(turns),
+                        displacement=sweep_displacement,
                     )
                     events["sweeps"].append(rejected)
                     events["sweep"] = rejected
@@ -436,6 +475,7 @@ class Structure:
                 close=price,
                 approach_bars=index - opposite.index,
                 approach_turns=0,
+                displacement=sweep_displacement,
             )
             self._candidates[side].append(sweep)
             events["sweeps"].append(sweep)
@@ -481,9 +521,19 @@ class Structure:
                 for row in broken:
                     if row.opposite is not None:
                         row.opposite.swept = True
-                if events["setup"] is None:
+                break_displacement = self._displacement_proof(
+                    bar, prior_atr, "down" if side == "high" else "up"
+                )
+                if not break_displacement["passes"]:
+                    self.invalidated += 1
+                    events["invalidated"] = True
+                    events["invalid_reason"] = (
+                        "the paired opposite-side body close had no directed break displacement"
+                    )
+                elif events["setup"] is None:
                     events["setup"] = self._make_setup(
-                        "SHORT" if side == "high" else "LONG", bar, index, chosen
+                        "SHORT" if side == "high" else "LONG", bar, index, chosen,
+                        break_displacement,
                     )
 
         self._release_blocked_runs(index, previous_close, price)
@@ -491,6 +541,59 @@ class Structure:
         self._expire(index)
         self.events = events
         return events
+
+    def _prior_atr(self) -> float | None:
+        """Simple true-range average ending on the bar before the event."""
+        highs, lows, closes = list(self.highs), list(self.lows), list(self.closes)
+        if len(highs) < 2 or len(highs) != len(lows) or len(highs) != len(closes):
+            return None
+        start = max(0, len(highs) - self.displacement_atr_period)
+        ranges: list[float] = []
+        for position in range(start, len(highs)):
+            previous = closes[position - 1] if position > 0 else closes[position]
+            value = max(
+                highs[position] - lows[position],
+                abs(highs[position] - previous),
+                abs(lows[position] - previous),
+            )
+            if math.isfinite(value) and value > 0:
+                ranges.append(value)
+        return sum(ranges) / len(ranges) if ranges else None
+
+    def _displacement_proof(
+        self, bar: dict, prior_atr: float | None, expected_direction: str
+    ) -> dict[str, Any]:
+        """Immutable, publication-auditable evidence for one event candle."""
+        opened, closed = float(bar["open"]), float(bar["close"])
+        high, low = float(bar["high"]), float(bar["low"])
+        body = abs(closed - opened)
+        direction = "up" if closed > opened else "down" if closed < opened else "flat"
+        ratio = body / prior_atr if prior_atr is not None and prior_atr > 0 else None
+        # A zero threshold is retained only as an explicit detector-level escape
+        # hatch for legacy structural unit fixtures. Saved user settings clamp
+        # the production invariant above zero.
+        passes = (
+            True
+            if self.displacement_body_atr <= 0
+            else direction == expected_direction
+            and ratio is not None
+            and ratio >= self.displacement_body_atr
+        )
+        return {
+            "model": DISPLACEMENT_MODEL,
+            "event_time": int(bar.get("close_time") or bar.get("open_time") or 0),
+            "expected_direction": expected_direction,
+            "direction": direction,
+            "open": opened,
+            "high": high,
+            "low": low,
+            "close": closed,
+            "body": body,
+            "prior_atr": prior_atr,
+            "body_atr": ratio,
+            "min_body_atr": self.displacement_body_atr,
+            "passes": passes,
+        }
 
     def _taken_levels(
         self, side: str, high: float, low: float, index: int
@@ -707,7 +810,10 @@ class Structure:
             return None
         return max(above, key=lambda l: l.price) if self.target_mode == "range" else min(above, key=lambda l: l.price)
 
-    def _make_setup(self, side: str, bar: dict, index: int, sweep: Sweep) -> Setup:
+    def _make_setup(
+        self, side: str, bar: dict, index: int, sweep: Sweep,
+        break_displacement: dict[str, Any],
+    ) -> Setup:
         entry = float(bar["close"])
         stop = sweep.extreme
 
@@ -752,6 +858,7 @@ class Structure:
             time=int(self.times[-1]),
             broke=sweep.opposite,  # type: ignore[arg-type]
             confirmation_leg=confirmation_leg,
+            break_displacement=break_displacement,
             break_kind="MS" if getattr(sweep.opposite, "kind", "minor") == "major" else "SHIFT",
         )
         self.last_setup = setup

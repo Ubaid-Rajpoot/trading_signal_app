@@ -115,8 +115,11 @@ genuine breaks.
 
 The HVB must happen **on the confirming candle** — same candle, not "recently".
 It cannot be disabled by saved filters, and score mode cannot replace it with
-other confluence points. Current chain-v6 rows store previous/current purple-line
-and MBL values so the crossing is auditable rather than merely labelled `HVB`.
+other confluence points. Current chain-v7 rows store previous/current purple-line
+and MBL values plus immutable OHLC, prior ATR and body/ATR evidence for both the
+liquidity-sweep candle and the paired opposite-break candle. Both event bodies
+must displace in their required direction by at least 1.0 prior ATR, so neither
+event is accepted from a label alone.
 
 **Setups only form in a trending market.**
 
@@ -241,7 +244,10 @@ exact definitions of the order block and of valid/invalid, are in
 The page used to be a window on the process: a setup that printed at 03:10 was
 gone from the app after a restart. Everything is now written to SQLite
 (`data/tdigm.sqlite3`, WAL) the moment it is found, and updated through its whole
-life - `pending → active → win | stopped | expired`. A restart shows the archive
+life - `pending → active → win | stopped | expired`. Those are internal trade
+states; the board labels untouched `pending` signals **ACTIVE** and filled
+unresolved `active` trades **MITIGATED**, so a used zone is never presented as
+an untouched active signal. A restart shows the archive
 **before a single candle arrives** and rehydrates every valid current-policy row
 into the live state machine, so later candles can mitigate or invalidate it. An
 outcome is write-once within one lifecycle version. Lifecycle v2 introduced
@@ -256,13 +262,16 @@ opposite endpoint forms, price must travel into the sweep without an intervening
 pivot. It may take any path only after that sweep while seeking the opposite body
 break. **Lifecycle v7 / chain v6 makes the HVB exact:** only a same-candle cross
 of the moving MBL counts, and every row stores the four crossing values under
-`mbl_centre_cross_v1`. Fixed-50, outer-band, slow-line, filter-disable, and score
-substitution paths cannot publish a sweep signal. Deep replay intentionally
+`mbl_centre_cross_v1`. **Chain v7 adds mandatory displacement at both structural
+events:** the liquidity-take body and the later paired-break body must each be
+correctly directed and at least 1.0 prior ATR. Fixed-50, outer-band, slow-line,
+filter-disable, score substitution, or unproved displacement paths cannot
+publish a sweep signal. Deep replay intentionally
 replaces outcomes graded under any older rule set. The board computes win rate
 and R/trade from current-version mitigated rows, not memory.
 
 At startup the complete archive is integrity-checked for the mandatory chain
-`paired opposite endpoint → direct move with no intervening pivot → exactly one H/L sweep → later body close through that paired endpoint + mathematically proven same-candle moving-MBL cross`.
+`paired opposite endpoint → direct move with no intervening pivot → exactly one H/L sweep with directed prior-ATR displacement → later directed-displacement body close through that paired endpoint + mathematically proven same-candle moving-MBL cross`.
 Malformed legacy rows are retained for audit but changed to `invalidated` and
 never rehydrated as tradeable. New signals also pass this check before they can
 reach SQLite. `/api/integrity` reports the checked and quarantined totals:
@@ -278,7 +287,7 @@ there is no universal fixed break-even percentage.
 setup forward to decide its outcome. Why it is built this way, and what it
 guarantees, is in [`docs/archive.md`](docs/archive.md).
 
-A deterministic lifecycle-v7 / chain-v6 regression over 1,317,520 BTCUSDT
+The historical pre-displacement lifecycle-v7 / chain-v6 regression over 1,317,520 BTCUSDT
 one-minute bars (2022-07-01 through 2024-12-31), rolled into all nine configured
 timeframes, retained 64 setups: 17 target wins, 46 stops, and one still-pending
 unmitigated setup. That sample's win rate was 26.98%, mean result −0.310R/trade,

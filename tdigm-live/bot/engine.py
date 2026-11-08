@@ -64,11 +64,11 @@ from .setups import (
     order_block,
 )
 from .store import SignalStore
-from .structure import APPROACH_MODEL, LEG_MODEL, Structure
+from .structure import APPROACH_MODEL, DISPLACEMENT_MODEL, LEG_MODEL, Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
-CURRENT_CHAIN_VERSION = 6
+CURRENT_CHAIN_VERSION = 7
 CURRENT_LEG_MODEL = LEG_MODEL
 CURRENT_APPROACH_MODEL = APPROACH_MODEL
 CURRENT_HVB_MODEL = HVB_MODEL
@@ -224,6 +224,75 @@ def sweep_chain_errors(
             and proof["hvb_fast"] < proof["hvb_centre"]
         ):
             errors.append("bearish HVB did not cross the moving centre band on this candle")
+
+    if chain_version >= 7:
+        if setup.get("displacement_model") != DISPLACEMENT_MODEL:
+            errors.append("current sweep/break displacement model is missing")
+
+        def validate_displacement(
+            name: str, raw: Any, expected_direction: str, event_ms: int,
+        ) -> None:
+            if not isinstance(raw, dict) or raw.get("model") != DISPLACEMENT_MODEL:
+                errors.append(f"{name} displacement proof is missing")
+                return
+            try:
+                opened = float(raw["open"])
+                high_value = float(raw["high"])
+                low_value = float(raw["low"])
+                closed = float(raw["close"])
+                body = float(raw["body"])
+                prior_atr = float(raw["prior_atr"])
+                body_atr = float(raw["body_atr"])
+                minimum = float(raw["min_body_atr"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                errors.append(f"{name} displacement numbers are missing")
+                return
+            values = (opened, high_value, low_value, closed, body, prior_atr, body_atr, minimum)
+            if not all(math.isfinite(value) for value in values):
+                errors.append(f"{name} displacement numbers are not finite")
+                return
+            direction = "up" if closed > opened else "down" if closed < opened else "flat"
+            if (
+                raw.get("expected_direction") != expected_direction
+                or raw.get("direction") != direction
+                or direction != expected_direction
+            ):
+                errors.append(f"{name} displacement is not directed {expected_direction}")
+            if as_int(raw.get("event_time")) != event_ms:
+                errors.append(f"{name} displacement is attached to the wrong candle")
+            if high_value < max(opened, closed) or low_value > min(opened, closed) or high_value <= low_value:
+                errors.append(f"{name} displacement OHLC is inconsistent")
+            calculated_body = abs(closed - opened)
+            calculated_ratio = calculated_body / prior_atr if prior_atr > 0 else 0.0
+            if (
+                prior_atr <= 0
+                or minimum <= 0
+                or not math.isclose(body, calculated_body, rel_tol=1e-9, abs_tol=1e-12)
+                or not math.isclose(body_atr, calculated_ratio, rel_tol=1e-9, abs_tol=1e-12)
+                or calculated_ratio < minimum
+                or raw.get("passes") is not True
+            ):
+                errors.append(f"{name} candle did not meet its prior-ATR displacement threshold")
+            for field, value in (("open", opened), ("high", high_value), ("low", low_value), ("close", closed)):
+                recorded = setup.get(f"{name}_{field}")
+                try:
+                    matches = recorded is not None and math.isclose(
+                        float(recorded), value, rel_tol=1e-9, abs_tol=1e-12
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    matches = False
+                if not matches:
+                    errors.append(f"{name} displacement does not match stored candle OHLC")
+                    break
+
+        validate_displacement(
+            "sweep", setup.get("sweep_displacement"),
+            "up" if swept_side == "high" else "down", sweep_ms,
+        )
+        validate_displacement(
+            "break", setup.get("break_displacement"),
+            "up" if side == "LONG" else "down", break_ms,
+        )
 
     lifecycle_version = as_int(payload.get("lifecycle_version"))
     target_model = str(payload.get("target_model") or setup.get("target_model") or "")
@@ -1890,6 +1959,14 @@ class Engine:
             "price moved directly from the paired opposite endpoint into the sweep "
             "with no intervening structural turn"
         )
+        sweep_displacement = setup.get("sweep_displacement") or {}
+        break_displacement = setup.get("break_displacement") or {}
+        if sweep_displacement and break_displacement:
+            record.reasons.append(
+                "directed displacement qualified both events: "
+                f"sweep {float(sweep_displacement.get('body_atr') or 0):.2f} ATR and "
+                f"paired break {float(break_displacement.get('body_atr') or 0):.2f} ATR"
+            )
         target_side = "low" if side == "SHORT" else "high"
         record.reasons.append(
             f"target is the {target_side} of the sweep-to-HVB/BOS confirmation leg; "
@@ -1912,6 +1989,9 @@ class Engine:
         payload["approach_end_ms"] = setup.get("approach_end_time")
         payload["approach_bars"] = setup.get("approach_bars")
         payload["approach_pivot_count"] = setup.get("approach_pivot_count")
+        payload["displacement_model"] = setup.get("displacement_model")
+        payload["sweep_displacement"] = setup.get("sweep_displacement")
+        payload["break_displacement"] = setup.get("break_displacement")
         payload["key"] = key
         payload["setup"] = setup
         payload["chain_valid"] = True

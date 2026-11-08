@@ -69,6 +69,59 @@ PAYLOAD = {
 }
 
 
+def current_payload(**updates):
+    """A complete chain-v7 archive row, including both displacement proofs."""
+    sweep_time = PAYLOAD["setup"]["sweep_time"]
+    break_time = PAYLOAD["setup"]["break_time"]
+    sweep_displacement = {
+        "model": "directed_body_over_prior_atr_v1", "event_time": sweep_time,
+        "expected_direction": "up", "direction": "up",
+        "open": 100.0, "high": 105.0, "low": 99.0, "close": 104.5,
+        "body": 4.5, "prior_atr": 3.0, "body_atr": 1.5,
+        "min_body_atr": 1.0, "passes": True,
+    }
+    break_displacement = {
+        "model": "directed_body_over_prior_atr_v1", "event_time": break_time,
+        "expected_direction": "down", "direction": "down",
+        "open": 100.0, "high": 101.0, "low": 96.0, "close": 97.0,
+        "body": 3.0, "prior_atr": 2.0, "body_atr": 1.5,
+        "min_body_atr": 1.0, "passes": True,
+    }
+    setup = {
+        **PAYLOAD["setup"],
+        "leg_model": "directional_outer_v1",
+        "approach_model": "direct_from_paired_endpoint_v1",
+        "approach_start_time": sweep_time - 1,
+        "approach_end_time": sweep_time,
+        "approach_bars": 1,
+        "approach_pivot_count": 0,
+        "swept_count": 1,
+        "swept_levels": [{"side": "high", "price": 104.0}],
+        "swept_level_time": sweep_time - 2,
+        "broke_level_time": sweep_time - 1,
+        "displacement_model": "directed_body_over_prior_atr_v1",
+        "sweep_open": 100.0, "sweep_high": 105.0, "sweep_low": 99.0, "sweep_close": 104.5,
+        "break_open": 100.0, "break_high": 101.0, "break_low": 96.0, "break_close": 97.0,
+        "sweep_displacement": sweep_displacement,
+        "break_displacement": break_displacement,
+    }
+    payload = {
+        **PAYLOAD,
+        "chain_version": 7,
+        "lifecycle_version": 7,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 55.0,
+        "hvb_prev_centre": 50.0,
+        "hvb_fast": 45.0,
+        "hvb_centre": 49.0,
+        "displacement_model": "directed_body_over_prior_atr_v1",
+        "sweep_displacement": sweep_displacement,
+        "break_displacement": break_displacement,
+        "setup": setup,
+    }
+    return {**payload, **updates}
+
+
 def test_a_row_carries_everything_a_trader_filters_on():
     row = row_of(PAYLOAD)
     assert row["symbol"] == "BTCUSDT" and row["timeframe"] == "1h"
@@ -111,10 +164,13 @@ def test_a_decided_outcome_is_final(tmp_path):
     """A re-scan replays history: it must never rewrite a win back to pending."""
     store = SignalStore(tmp_path / "sig.sqlite3")
     store.record(PAYLOAD)
-    store.record({**PAYLOAD, "state": "win", "valid": False, "closed_ms": 1_700_000_500_000})
+    store.record({
+        **PAYLOAD, "state": "win", "display_state": "win",
+        "valid": False, "closed_ms": 1_700_000_500_000,
+    })
     corrected = {
         **PAYLOAD,
-        "state": "pending", "valid": True, "closed_ms": None,
+        "state": "pending", "display_state": "active", "valid": True, "closed_ms": None,
         "entry": 99.0, "stop": 106.0, "target": 88.0,
         "swept_level": 103.0,
         "setup": {**PAYLOAD["setup"], "swept_level": 103.0, "sweep_high": 105.0},
@@ -122,6 +178,7 @@ def test_a_decided_outcome_is_final(tmp_path):
     store.record(corrected)
     row = store.list()[0]
     assert row["state"] == "win", "a decided result is never overwritten"
+    assert row["display_state"] == "win", "a replay cannot relabel a decided row active"
     assert row["closed_ms"] == 1_700_000_500_000
     assert (row["entry"], row["stop"], row["target"]) == (100.0, 104.0, 92.0)
     assert row["swept_level"] == 103.0 and row["setup"]["swept_level"] == 103.0, (
@@ -194,7 +251,7 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     store = SignalStore(tmp_path / "sig.sqlite3")
     current = {
         **PAYLOAD,
-        "chain_version": 6,
+        "chain_version": 7,
         "lifecycle_version": 7,
         "target_model": "hvb_bos_leg_extreme_v1",
         "mitigated": True,
@@ -219,7 +276,7 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     assert results["r_per_trade"] == 0.625, "(+2.25R - 1R) / 2 decided mitigated trades"
     full = store.results()
     assert full["target_rr"] is None and full["lifecycle_version"] == 7
-    assert full["chain_version"] == 6
+    assert full["chain_version"] == 7
     assert full["target_model"] == "hvb_bos_leg_extreme_v1"
     assert "confirmation-leg H/L" in full["r_basis"]
 
@@ -245,29 +302,7 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     )
     engine.attach_store(store)
     engine.market = "futures"
-    current = {
-        **PAYLOAD,
-        "chain_version": 6,
-        "lifecycle_version": 7,
-        "hvb_model": "mbl_centre_cross_v1",
-        "hvb_prev_fast": 55.0,
-        "hvb_prev_centre": 50.0,
-        "hvb_fast": 45.0,
-        "hvb_centre": 49.0,
-        "setup": {
-            **PAYLOAD["setup"],
-            "leg_model": "directional_outer_v1",
-            "approach_model": "direct_from_paired_endpoint_v1",
-            "approach_start_time": PAYLOAD["setup"]["sweep_time"] - 1,
-            "approach_end_time": PAYLOAD["setup"]["sweep_time"],
-            "approach_bars": 1,
-            "approach_pivot_count": 0,
-            "swept_count": 1,
-            "swept_levels": [{"side": "high", "price": 104.0}],
-            "swept_level_time": PAYLOAD["setup"]["sweep_time"] - 2,
-            "broke_level_time": PAYLOAD["setup"]["sweep_time"] - 1,
-        },
-    }
+    current = current_payload()
     engine._remember(current)  # the same call the current publish path makes
 
     # a restart: a brand new engine, the same database
@@ -292,6 +327,40 @@ def test_the_engine_writes_through_and_reads_back_on_boot(tmp_path):
     fresh._track_setups(cell, {"open": 103, "high": 105, "low": 102, "close": 104,
                                "close_time": PAYLOAD["created_ms"] + 3_600_000})
     assert fresh.setup_payloads[PAYLOAD["key"]]["state"] == "invalidated"
+
+
+def test_restart_keeps_mitigation_visible_and_persists_the_later_resolution(tmp_path):
+    path = tmp_path / "sig.sqlite3"
+    active = current_payload(
+        state="active", display_state="mitigated", valid=True, mitigated=True,
+        touched_ms=PAYLOAD["created_ms"] + 60_000,
+        state_since=PAYLOAD["created_ms"] + 60_000,
+        risk0=4.0, stop0=104.0, target=92.0, rr=2.0,
+    )
+    first = SignalStore(path)
+    assert first.record(active)
+    first.close()
+
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={}, structure={"pivot_len": 2}, strategy="sweep",
+    )
+    store = SignalStore(path)
+    engine.attach_store(store)
+    assert engine.load_stored() == 1
+    restored = engine.setup_payloads[PAYLOAD["key"]]
+    assert restored["state"] == "active" and restored["display_state"] == "mitigated"
+    assert PAYLOAD["key"] in engine.registry
+
+    cell = engine.cells[("BTCUSDT", "1h")]
+    engine._track_setups(cell, {
+        "open": 99.0, "high": 100.0, "low": 91.0, "close": 92.0,
+        "close_time": PAYLOAD["created_ms"] + 7_200_000,
+    })
+    resolved = store.get(PAYLOAD["key"])
+    assert resolved["state"] == "win" and resolved["display_state"] == "win"
+    assert resolved["mitigated"] is True and resolved["closed_ms"] is not None
 
 
 def test_startup_audits_and_quarantines_a_legacy_signal_without_a_sweep(tmp_path):
@@ -551,7 +620,7 @@ def test_the_record_carries_an_honest_error_bar(tmp_path):
             key=f"BTCUSDT|1h|{1_700_000_000_000 + i}",
             state="win",
             mitigated=True,
-            chain_version=6,
+            chain_version=7,
             lifecycle_version=7,
             r_now=1.5 if i % 2 else -1.0,
         )

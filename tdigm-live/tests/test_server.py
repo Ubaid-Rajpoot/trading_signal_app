@@ -196,10 +196,16 @@ def test_filters_are_validated_applied_and_saved(client):
 
 
 def test_structure_settings_are_saved(client):
-    body = client.post("/api/structure", json={"pivot_len": 3, "target_mode": "range"}).json()
+    body = client.post("/api/structure", json={
+        "pivot_len": 3, "target_mode": "range",
+        "displacement_atr_period": 20, "displacement_body_atr": 0,
+    }).json()
     assert body["structure"]["pivot_len"] == 3
+    assert body["structure"]["displacement_atr_period"] == 20
+    assert body["structure"]["displacement_body_atr"] == 0.1
     saved = json.loads(Path(client.config_path).read_text())  # type: ignore[attr-defined]
     assert saved["structure"]["pivot_len"] == 3
+    assert saved["structure"]["displacement_body_atr"] == 0.1
 
 
 def test_universe_says_why_it_is_empty_in_replay(client):
@@ -368,10 +374,10 @@ def test_the_page_is_served_with_its_own_assets(client):
     """One HTML file, one stylesheet, one script - and the queue they share."""
     page = client.get("/")
     assert page.status_code == 200
-    assert "/app.js" in page.text and "/notify.js" in page.text
+    assert all(asset in page.text for asset in ("/app.js", "/notify.js", "/state.js"))
     assert page.text.count('class="toast"') == 1, "there is exactly one toast slot"
     assert 'id="toasts"' not in page.text, "the old stack is gone"
-    for asset in ("/app.js", "/app.css", "/notify.js"):
+    for asset in ("/app.js", "/app.css", "/notify.js", "/state.js"):
         assert client.get(asset).status_code == 200
 
 

@@ -28,6 +28,8 @@ DEFAULT_STRUCTURE: dict[str, Any] = {
     "sweep_max_wait": 60,
     "level_max_age": 180,
     "max_levels": 40,
+    "displacement_atr_period": 14,
+    "displacement_body_atr": 1.0,
 }
 
 # keys added after the first release: the file on disk may not have them yet
@@ -91,7 +93,7 @@ def validate_structure(payload: dict[str, Any]) -> dict[str, Any]:
     """Only known keys, clamped to sane ranges - this writes a user-facing file."""
     merged = dict(DEFAULT_STRUCTURE)
     for key in ("pivot_len", "sweep_max_wait", "level_max_age", "max_levels",
-                "major_len", "macro_len"):
+                "major_len", "macro_len", "displacement_atr_period"):
         if key not in payload:
             continue
         try:
@@ -101,6 +103,15 @@ def validate_structure(payload: dict[str, Any]) -> dict[str, Any]:
     if "hh_tolerance_atr" in payload:
         try:
             merged["hh_tolerance_atr"] = max(0.0, float(payload["hh_tolerance_atr"]))
+        except (TypeError, ValueError):
+            pass
+    merged["displacement_atr_period"] = max(2, int(merged["displacement_atr_period"]))
+    if "displacement_body_atr" in payload:
+        try:
+            # Displacement is a strategy invariant, not an optional confluence.
+            merged["displacement_body_atr"] = max(
+                0.1, float(payload["displacement_body_atr"])
+            )
         except (TypeError, ValueError):
             pass
     if "target_mode" in payload:

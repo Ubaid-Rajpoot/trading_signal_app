@@ -328,7 +328,15 @@ class SetupRecord:
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "side": self.side,
+            # Internal lifecycle terms stay stable for persistence and P/L.
+            # The screen uses trader-facing setup terms: an untouched valid
+            # signal is active, while a filled-but-unresolved one is mitigated.
             "state": self.state,
+            "display_state": (
+                "active" if self.state == "pending" and not self.mitigated
+                else "mitigated" if self.state == "active" and self.mitigated
+                else self.state
+            ),
             "valid": self.valid,
             "mitigated": self.mitigated,
             "created_ms": self.created_ms,
