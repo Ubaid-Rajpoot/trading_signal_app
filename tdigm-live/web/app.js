@@ -479,7 +479,7 @@
     if (row.chain_valid === false) {
       bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
     }
-    if (row.lifecycle_version !== 7 || row.chain_version !== 7 || row.target_model !== "hvb_bos_leg_extreme_v1") {
+    if (row.lifecycle_version !== 7 || row.chain_version !== 8 || row.target_model !== "hvb_bos_leg_extreme_v1") {
       bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current displacement/MBL-cross/direct-sweep lifecycle statistics until deep replay regrades it</div>');
     }
     if (row.hvb_model === "mbl_centre_cross_v1") {

@@ -54,8 +54,9 @@ mitigation candle. Lifecycle v6 / chain v5 additionally required a direct move
 from the paired opposite endpoint into the sweep, with no intervening pivot;
 only the post-sweep path may oscillate. Lifecycle v7 / chain v6 removes alternate
 HVB triggers and stores mathematical proof that the purple line crossed the
-moving MBL on the body-break candle. Chain v7 additionally stores and validates
-prior-ATR displacement proof on both the sweep and paired-break candles. Rows
+moving MBL on the body-break candle. Chain v8 additionally stores and validates
+prior-ATR rejection displacement proof on both the sweep and paired-break
+candles. Rows
 graded under any older rule must be replayed rather than contaminating the
 current win rate.
 
@@ -83,7 +84,7 @@ aggressive-breaker touch freezes entry, risk, and the last extreme before that
 mitigation candle. The mitigation candle itself is excluded. A pre-mitigation
 stop is `invalidated`, carries no realised R and is excluded. Legacy fixed-R
 studies remain below as labelled historical experiments, but they are not mixed
-into lifecycle-v7 / chain-v7 results.
+into lifecycle-v7 / chain-v8 results.
 
 ## Filling it from history
 
@@ -99,7 +100,7 @@ python tools/backfill_archive.py data/btc --symbol BTCUSDT --dry-run  # writes n
 
 An older BTCUSDT 2023-01-01 → 2025-06-30 report produced **107 setups, 43 won,
 54 stopped, 10 never filled under legacy 2R scoring**. It is retained only as a
-historical audit; the backfill command now applies lifecycle v7 / chain v7 and
+historical audit; the backfill command now applies lifecycle v7 / chain v8 and
 is not expected to reproduce those counts. A compatible real dataset is not
 present in this checkout, so that legacy archive cannot provide a current
 confirmation-leg-target rate. A separately fetched, hash-pinned BTCUSDT sample
@@ -150,7 +151,7 @@ confirmation-leg-target policy:
 
 Those numbers do not override the shipped rules: `hvb_window: 0` requires the
 same candle, and current trend/structure gates remain configured in
-`config.json`. New lifecycle-v7 / chain-v7 results are reported separately only
+`config.json`. New lifecycle-v7 / chain-v8 results are reported separately only
 after a fresh deep replay with both event-displacement proofs.
 
 ### A caveat about the grades

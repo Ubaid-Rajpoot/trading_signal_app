@@ -48,12 +48,16 @@ def rows_to_candles(rows, step_ms: int = 300_000) -> list[dict]:
     out = []
     for i, (high, low, close) in enumerate(rows):
         open_time = START + i * step_ms
+        opened = max(low, min(high, rows[i - 1][2] if i else close))
+        if (high, low, close) == (107, 101, 106):
+            opened = 112.0  # default-threshold high-sweep rejection displaces down
+            high = 113.0
         out.append(
             {
                 "symbol": "BTCUSDT",
                 "open_time": open_time,
                 "close_time": open_time + step_ms - 1,
-                "open": max(low, min(high, rows[i - 1][2] if i else close)),
+                "open": opened,
                 "high": high,
                 "low": low,
                 "close": close,

@@ -314,7 +314,11 @@ def series(rows, symbol="BTCUSDT"):
 
 
 def run_structure(rows, settings=None):
-    st = Structure(settings or {"pivot_len": 2, "sweep_max_wait": 30})
+    # Most tests below isolate pairing/approach/lifecycle behavior that predates
+    # chain-v8 rejection displacement. Tests of the live displacement invariant pass an
+    # explicit positive threshold and use the worked rejection fixture.
+    defaults = {"pivot_len": 2, "sweep_max_wait": 30, "displacement_body_atr": 0}
+    st = Structure({**defaults, **(settings or {})})
     pivots, sweeps, setups, invalid = [], [], [], []
     for i, item in enumerate(series(rows)):
         events = st.add(item)
@@ -344,6 +348,23 @@ SHORT_PATTERN = [
 # same 95 low, then takes 107 too. That is one run through multiple highs, not a
 # single clean sweep-and-release leg.
 LONG_PATTERN = [(200 - low, 200 - high, 200 - close) for high, low, close in SHORT_PATTERN]
+
+# The user's worked chart: price first forms the paired structural leg, then a
+# rejection candle wicks through liquidity while its body displaces back in the
+# eventual trade direction. A second displacement closes through the paired
+# endpoint. The long mirror is the exact screenshot geometry (low-sweep candle
+# rejects upward, then the paired high breaks upward).
+REJECTION_SHORT_PATTERN = [
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),
+    (100, 96, 99), (105.5, 98, 105),
+    (107, 99, 100),                    # wick high, bearish displacement away
+    (104, 90, 91),                     # bearish displacement through paired low
+]
+WORKED_EXAMPLE_LONG_PATTERN = [
+    (200 - low, 200 - high, 200 - close)
+    for high, low, close in REJECTION_SHORT_PATTERN
+]
 
 
 OSCILLATING_MULTI_SWEEP_PATTERN = [
@@ -378,11 +399,6 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     assert proof["sweep_low"] == 101.0
     assert proof["swept_level"] == 106.0
     assert proof["swept_level_time"] < proof["broke_level_time"] < proof["sweep_time"]
-    assert proof["displacement_model"] == "directed_body_over_prior_atr_v1"
-    assert proof["sweep_displacement"]["direction"] == "up"
-    assert proof["break_displacement"]["direction"] == "down"
-    assert proof["sweep_displacement"]["body_atr"] >= 1.0
-    assert proof["break_displacement"]["body_atr"] >= 1.0
 
 
 def test_sweep_then_opposite_break_makes_a_long_with_its_leg_high_target():
@@ -393,31 +409,68 @@ def test_sweep_then_opposite_break_makes_a_long_with_its_leg_high_target():
     proof = setup.as_dict()
     assert proof["confirmation_leg"]["high"] == proof["leg_target"] == 110.0
     assert proof["confirmation_leg"]["target_side"] == "high"
-    assert proof["sweep_displacement"]["direction"] == "down"
+
+
+def test_users_worked_long_example_rejects_from_the_low_then_breaks_up():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(
+        WORKED_EXAMPLE_LONG_PATTERN, {"displacement_body_atr": 1.0}
+    )
+    assert sweeps and setups, "the supplied worked example must be signal-capable"
+    setup = setups[0][1]
+    assert setup.side == "LONG"
+    proof = setup.as_dict()
+    assert proof["swept_side"] == "low"
+    assert proof["sweep_low"] < proof["swept_level"]
+    assert proof["sweep_close"] > proof["swept_level"], "the sweep rejected back above liquidity"
+    assert proof["sweep_displacement"]["direction"] == "up"
     assert proof["break_displacement"]["direction"] == "up"
     assert proof["sweep_displacement"]["body_atr"] >= 1.0
     assert proof["break_displacement"]["body_atr"] >= 1.0
+    publication = {
+        "kind": "signal", "chain_version": 8, "side": "LONG",
+        "time": proof["break_time"], "hvb": "up", "hvb_lag": 0,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 45.0, "hvb_prev_centre": 50.0,
+        "hvb_fast": 55.0, "hvb_centre": 51.0,
+        "setup": proof,
+    }
+    assert sweep_chain_errors(publication) == [], (
+        "the worked low-sweep rejection must pass the publication boundary"
+    )
+
+
+def test_worked_example_rule_is_mirrored_for_a_short():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(
+        REJECTION_SHORT_PATTERN, {"displacement_body_atr": 1.0}
+    )
+    assert sweeps and setups
+    proof = setups[0][1].as_dict()
+    assert proof["swept_side"] == "high"
+    assert proof["sweep_close"] < proof["swept_level"]
+    assert proof["sweep_displacement"]["direction"] == "down"
+    assert proof["break_displacement"]["direction"] == "down"
 
 
 def _mirror(rows):
     return [(200 - low, 200 - high, 200 - close) for high, low, close in rows]
 
 
-@pytest.mark.parametrize("rows", [SHORT_PATTERN, _mirror(SHORT_PATTERN)])
-def test_mirrored_setups_reject_a_liquidity_take_without_sweep_displacement(rows):
+@pytest.mark.parametrize(
+    ("rows", "weak_close"),
+    [(REJECTION_SHORT_PATTERN, 104.8), (WORKED_EXAMPLE_LONG_PATTERN, 95.2)],
+)
+def test_mirrored_setups_reject_a_liquidity_take_without_sweep_displacement(rows, weak_close):
     weak = list(rows)
-    # Keep the wick through the level but leave only a tiny event body.
-    if rows[-2][2] < rows[0][2]:  # mirrored LONG pattern
-        high, low, _close = weak[-2]
-        weak[-2] = (high, low, 97.8)
-    else:
-        high, low, _close = weak[-2]
-        weak[-2] = (high, low, 102.2)
-    _st, _pivots, _sweeps, setups, invalid = run_structure(weak)
+    # Keep the wick through the level but leave only a tiny rejection body.
+    high, low, _close = weak[-2]
+    weak[-2] = (high, low, weak_close)
+    _st, _pivots, _sweeps, setups, invalid = run_structure(
+        weak, {"displacement_body_atr": 1.0}
+    )
     assert not setups and invalid
 
 
-@pytest.mark.parametrize("rows", [SHORT_PATTERN, _mirror(SHORT_PATTERN)])
+@pytest.mark.parametrize("rows", [REJECTION_SHORT_PATTERN, WORKED_EXAMPLE_LONG_PATTERN])
 def test_mirrored_setups_reject_a_paired_close_without_break_displacement(rows):
     weak = list(rows)
     # Gap across the endpoint with a flat body. It is a close-through event, but
@@ -427,7 +480,9 @@ def test_mirrored_setups_reject_a_paired_close_without_break_displacement(rows):
         if rows[-1][2] < rows[-2][2]
         else (110.0, 106.0, 106.0)
     )
-    _st, _pivots, sweeps, setups, invalid = run_structure(weak)
+    _st, _pivots, sweeps, setups, invalid = run_structure(
+        weak, {"displacement_body_atr": 1.0}
+    )
     assert sweeps and not setups and invalid
     assert "no directed break displacement" in (_st.events.get("invalid_reason") or "")
 
@@ -534,11 +589,13 @@ def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
                for reason in sweep_chain_errors(same_side_spike))
 
 
-def test_chain_v7_audits_both_immutable_displacement_events():
-    _st, _pivots, _sweeps, setups, _invalid = run_structure(SHORT_PATTERN)
+def test_chain_v8_audits_both_immutable_displacement_events():
+    _st, _pivots, _sweeps, setups, _invalid = run_structure(
+        REJECTION_SHORT_PATTERN, {"displacement_body_atr": 1.0}
+    )
     setup = setups[0][1].as_dict()
     current = {
-        "kind": "signal", "chain_version": 7, "side": "SHORT",
+        "kind": "signal", "chain_version": 8, "side": "SHORT",
         "time": setup["break_time"], "hvb": "down", "hvb_lag": 0,
         "hvb_model": "mbl_centre_cross_v1",
         "hvb_prev_fast": 55.0, "hvb_prev_centre": 50.0,
@@ -1221,6 +1278,11 @@ async def push_5m(engine, rows):
         candle = bar(1_735_689_600_000 + i * 300_000, close, high=high, low=low)
         previous = rows[i - 1][2] if i else close
         candle["open"] = max(float(low), min(float(high), float(previous)))
+        if (high, low, close) == (107, 101, 106):
+            # Keep the close sequence that makes the same-candle MBL cross, but
+            # give the sweep a real default-threshold bearish rejection body.
+            candle["open"] = 112.0
+            candle["high"] = 113.0
         await engine.on_candle(candle)
 
 
@@ -1236,14 +1298,14 @@ async def test_engine_emits_a_signal_for_the_complete_setup():
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
-    assert alert["chain_version"] == 7
+    assert alert["chain_version"] == 8
     assert alert["approach_model"] == "direct_from_paired_endpoint_v1"
     assert alert["approach_pivot_count"] == 0
     assert alert["hvb_model"] == "mbl_centre_cross_v1"
     assert alert["hvb_prev_fast"] >= alert["hvb_prev_centre"]
     assert alert["hvb_fast"] < alert["hvb_centre"]
     assert alert["setup"]["leg_model"] == "directional_outer_v1"
-    assert alert["setup"]["stop"] == 107.0, "the stop sits just beyond the swept high"
+    assert alert["setup"]["stop"] == 113.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
     assert alert["filtered"] == []
 

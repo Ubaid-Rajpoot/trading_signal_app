@@ -68,7 +68,7 @@ from .structure import APPROACH_MODEL, DISPLACEMENT_MODEL, LEG_MODEL, Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
-CURRENT_CHAIN_VERSION = 7
+CURRENT_CHAIN_VERSION = 8
 CURRENT_LEG_MODEL = LEG_MODEL
 CURRENT_APPROACH_MODEL = APPROACH_MODEL
 CURRENT_HVB_MODEL = HVB_MODEL
@@ -287,7 +287,17 @@ def sweep_chain_errors(
 
         validate_displacement(
             "sweep", setup.get("sweep_displacement"),
-            "up" if swept_side == "high" else "down", sweep_ms,
+            # Chain 8 corrects the event semantics to the user's worked chart:
+            # the wick takes liquidity and the body rejects in the trade
+            # direction (low sweep up / high sweep down). Chain 7 remains
+            # auditable under its historical into-liquidity direction but is
+            # excluded from current-policy statistics.
+            (
+                ("up" if swept_side == "low" else "down")
+                if chain_version >= 8
+                else ("up" if swept_side == "high" else "down")
+            ),
+            sweep_ms,
         )
         validate_displacement(
             "break", setup.get("break_displacement"),

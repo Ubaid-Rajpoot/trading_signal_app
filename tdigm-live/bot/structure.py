@@ -369,8 +369,11 @@ class Structure:
                 continue
             self.sweep_count += 1
 
+            # A sweep is a rejection, not momentum continuing through the
+            # liquidity. Its displacement must point in the eventual trade
+            # direction: a high sweep rejects down; a low sweep rejects up.
             sweep_displacement = self._displacement_proof(
-                bar, prior_atr, "up" if side == "high" else "down"
+                bar, prior_atr, "down" if side == "high" else "up"
             )
             if not sweep_displacement["passes"]:
                 # Liquidity was spent, but not by the displacement event the
@@ -381,7 +384,7 @@ class Structure:
                 self.invalidated += 1
                 events["invalidated"] = True
                 events["invalid_reason"] = (
-                    f"{side} liquidity was taken without directed sweep displacement"
+                    f"{side} liquidity was taken without trade-direction rejection displacement"
                 )
                 continue
 

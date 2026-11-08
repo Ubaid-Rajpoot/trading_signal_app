@@ -1,6 +1,6 @@
 # Lifecycle-v7 / chain-v6 deterministic regression — 2026-11-04
 
-> **Historical pre-displacement evidence.** Current chain v7 keeps these trend,
+> **Historical pre-displacement evidence.** Current chain v8 keeps these trend,
 > structure, MBL and lifecycle rules but additionally requires auditable
 > prior-ATR displacement on both the sweep and paired-break candles. These
 > chain-v6 results are not mixed into current statistics.

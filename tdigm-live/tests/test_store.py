@@ -70,13 +70,13 @@ PAYLOAD = {
 
 
 def current_payload(**updates):
-    """A complete chain-v7 archive row, including both displacement proofs."""
+    """A complete chain-v8 archive row, including both displacement proofs."""
     sweep_time = PAYLOAD["setup"]["sweep_time"]
     break_time = PAYLOAD["setup"]["break_time"]
     sweep_displacement = {
         "model": "directed_body_over_prior_atr_v1", "event_time": sweep_time,
-        "expected_direction": "up", "direction": "up",
-        "open": 100.0, "high": 105.0, "low": 99.0, "close": 104.5,
+        "expected_direction": "down", "direction": "down",
+        "open": 104.5, "high": 105.0, "low": 99.0, "close": 100.0,
         "body": 4.5, "prior_atr": 3.0, "body_atr": 1.5,
         "min_body_atr": 1.0, "passes": True,
     }
@@ -100,14 +100,14 @@ def current_payload(**updates):
         "swept_level_time": sweep_time - 2,
         "broke_level_time": sweep_time - 1,
         "displacement_model": "directed_body_over_prior_atr_v1",
-        "sweep_open": 100.0, "sweep_high": 105.0, "sweep_low": 99.0, "sweep_close": 104.5,
+        "sweep_open": 104.5, "sweep_high": 105.0, "sweep_low": 99.0, "sweep_close": 100.0,
         "break_open": 100.0, "break_high": 101.0, "break_low": 96.0, "break_close": 97.0,
         "sweep_displacement": sweep_displacement,
         "break_displacement": break_displacement,
     }
     payload = {
         **PAYLOAD,
-        "chain_version": 7,
+        "chain_version": 8,
         "lifecycle_version": 7,
         "hvb_model": "mbl_centre_cross_v1",
         "hvb_prev_fast": 55.0,
@@ -251,7 +251,7 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     store = SignalStore(tmp_path / "sig.sqlite3")
     current = {
         **PAYLOAD,
-        "chain_version": 7,
+        "chain_version": 8,
         "lifecycle_version": 7,
         "target_model": "hvb_bos_leg_extreme_v1",
         "mitigated": True,
@@ -276,7 +276,7 @@ def test_results_use_variable_leg_target_r_and_exclude_legacy_or_unfilled_rows(t
     assert results["r_per_trade"] == 0.625, "(+2.25R - 1R) / 2 decided mitigated trades"
     full = store.results()
     assert full["target_rr"] is None and full["lifecycle_version"] == 7
-    assert full["chain_version"] == 7
+    assert full["chain_version"] == 8
     assert full["target_model"] == "hvb_bos_leg_extreme_v1"
     assert "confirmation-leg H/L" in full["r_basis"]
 
@@ -620,7 +620,7 @@ def test_the_record_carries_an_honest_error_bar(tmp_path):
             key=f"BTCUSDT|1h|{1_700_000_000_000 + i}",
             state="win",
             mitigated=True,
-            chain_version=7,
+            chain_version=8,
             lifecycle_version=7,
             r_now=1.5 if i % 2 else -1.0,
         )

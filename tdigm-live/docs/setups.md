@@ -86,9 +86,11 @@ Before lifecycle starts, structural validity is exact:
 4. once that paired endpoint forms, price must move **directly** to sweep the
    other endpoint. Any intervening pivot or back-and-forth before the sweep is
    the X drawing and invalidates the run;
-5. the sweep candle itself must displace in the direction of the liquidity take:
-   its real body must be at least `structure.displacement_body_atr` (default
-   **1.0**) times ATR calculated only from prior closed candles;
+5. the sweep is a rejection candle: its wick takes the liquidity, but its real
+   body must displace back in the eventual trade direction (high sweep down for
+   a short; low sweep up for a long) by at least
+   `structure.displacement_body_atr` (default **1.0**) times ATR calculated only
+   from prior closed candles;
 6. after the valid sweep, price may move however it chooses while seeking the
    opposite break. Continuing beyond the selected sweep extreme is allowed, but
    taking a second independent/equal same-side level before release is not;
@@ -99,8 +101,14 @@ Before lifecycle starts, structural validity is exact:
    moving black MBL. Previous/current purple and MBL values must prove the
    transition. A fixed-50, slow-line, or outer-blue-band crossing is not an HVB.
 
+The supplied worked chart is the canonical regression for point 5: the long's
+sweep candle wicks below the marked low, closes with an upward displacement body,
+and the following upward displacement closes through the paired high. Treating
+the first body as needing to point *down into* the low was the reason that valid
+setup never reached the remaining v4.1 gates.
+
 Repeated equal highs/lows, a contracting range, an oscillating sweep approach,
-or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 7`
+or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 8`
 stores `swept_count: 1`, `leg_model: directional_outer_v1`,
 `approach_model: direct_from_paired_endpoint_v1` with zero approach pivots,
 `hvb_model: mbl_centre_cross_v1` with all four crossing values, and immutable

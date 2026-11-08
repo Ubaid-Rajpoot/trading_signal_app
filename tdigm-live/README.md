@@ -115,7 +115,7 @@ genuine breaks.
 
 The HVB must happen **on the confirming candle** — same candle, not "recently".
 It cannot be disabled by saved filters, and score mode cannot replace it with
-other confluence points. Current chain-v7 rows store previous/current purple-line
+other confluence points. Current chain-v8 rows store previous/current purple-line
 and MBL values plus immutable OHLC, prior ATR and body/ATR evidence for both the
 liquidity-sweep candle and the paired opposite-break candle. Both event bodies
 must displace in their required direction by at least 1.0 prior ATR, so neither
@@ -262,9 +262,10 @@ opposite endpoint forms, price must travel into the sweep without an intervening
 pivot. It may take any path only after that sweep while seeking the opposite body
 break. **Lifecycle v7 / chain v6 makes the HVB exact:** only a same-candle cross
 of the moving MBL counts, and every row stores the four crossing values under
-`mbl_centre_cross_v1`. **Chain v7 adds mandatory displacement at both structural
-events:** the liquidity-take body and the later paired-break body must each be
-correctly directed and at least 1.0 prior ATR. Fixed-50, outer-band, slow-line,
+`mbl_centre_cross_v1`. **Chain v8 adds mandatory rejection displacement at both
+structural events:** the liquidity-sweep candle must reject back in the trade direction
+(high sweep down / low sweep up), and the later paired-break body must continue
+in that same direction; each body must be at least 1.0 prior ATR. Fixed-50, outer-band, slow-line,
 filter-disable, score substitution, or unproved displacement paths cannot
 publish a sweep signal. Deep replay intentionally
 replaces outcomes graded under any older rule set. The board computes win rate
