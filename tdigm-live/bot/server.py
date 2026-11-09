@@ -132,7 +132,6 @@ def create_app(
         # The narrative engine owns one separate deep 1m replay; running it in
         # both phases would duplicate the same expensive work.
         startup_history_bars = engine.history_bars
-    history_days = float(config.get("history_days", 0) or 0)
     rescan_state: dict[str, Any] = {"running": False, "result": None}
     chart_cache: dict[tuple[str, str, int, int], tuple[float, list[dict]]] = {}
     warm_pending: set[str] = set()
@@ -374,6 +373,7 @@ def create_app(
             "stored": store_counts.get("total", 0),
             "store": store.enabled,
             "workers": workers,
+            "history": {"bars": engine.history_bars, "days": engine.history_days},
             "rescanning": bool(rescan_state.get("running")),
             "setups_valid": store_counts.get(
                 "valid", len(engine.open_setups(valid_only=True, limit=10_000))
@@ -472,7 +472,12 @@ def create_app(
                 "hvb_aligned": decisions["hvb_aligned"],
                 "filtered": decisions["filtered"],
                 "plans": decisions["passed"],
-                "drops": dict(engine.filters.rejections),
+                # One first blocker per rejected setup. ``rejection_hits`` is
+                # also exposed for overlap analysis but must not be labelled as
+                # a setup count in the UI.
+                "drops": decisions["first_rejections"],
+                "rejection_hits": decisions["rejection_hits"],
+                "by_timeframe": decisions["by_timeframe"],
             }
         return {
             "watching": rows,
@@ -655,6 +660,8 @@ def create_app(
             "structure": engine.structure_settings,
             "tdi": engine.tdi_settings,
             "break_lookback": engine.break_lookback,
+            "history_bars": engine.history_bars,
+            "history_days": engine.history_days,
             "max_symbols": max_symbols,
             "config_path": str(config_path) if config_path else None,
         }

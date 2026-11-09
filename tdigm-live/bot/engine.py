@@ -40,7 +40,7 @@ from .confluence import (
     position_in_range,
     zone_of,
 )
-from .filters import Filters
+from .filters import Filters, rejection_key
 from .indicators import (
     HVB_MODEL,
     TdiPoint,
@@ -389,6 +389,12 @@ class Cell:
     hvb_aligned_setups: int = 0
     filtered_setups: int = 0
     passed_setups: int = 0
+    # A rejection can fail several enabled gates. Keep both the first decisive
+    # blocker (one count per setup) and every overlapping blocker (diagnostic
+    # hits) instead of presenting the latter as if it were a setup count.
+    first_rejections: dict[str, int] = field(default_factory=dict)
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
+    rejection_combinations: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.tracker = TdiTracker(
@@ -513,6 +519,7 @@ class Engine:
         strategy: str = "sweep",
         book: dict[str, Any] | None = None,
         history_bars: int = 5000,
+        history_days: float = 0,
     ) -> None:
         self.symbols = list(dict.fromkeys(s.upper() for s in symbols))
         self.timeframes = [tf for tf in timeframes if tf in TIMEFRAMES]
@@ -533,6 +540,7 @@ class Engine:
         self.hvb_min_points = float(self.filters.config.get("hvb_min_points", hvb_min_points) or 0)
         self.hvb_min_speed = float(self.filters.config.get("hvb_min_speed", 0) or 0)
         self.history_bars = max(120, min(50_000, int(history_bars)))
+        self.history_days = max(0.0, min(3650.0, float(history_days or 0)))
         self.preview_max_symbols = int(preview_max_symbols)
         self.exchange = "binance"
 
@@ -886,6 +894,23 @@ class Engine:
             pass
 
     # -------------------------------------------------------------- warmup
+    def _history_depth(self, timeframe: str, base_depth: int, *, calendar: bool) -> int:
+        """Bars needed for both the configured floor and calendar lookback.
+
+        A single ``history_bars`` value represents radically different periods:
+        5,000 bars is 3.5 days on 1m, 10.4 days on 3m, and nearly 14 years on
+        1d.  The selective v4.1 chain can therefore exist in recent history but
+        sit just outside the lower-timeframe replay.  Deep passes use the larger
+        of the bar floor and ``history_days``; the fast startup pass deliberately
+        remains shallow so every contract becomes live before deep work begins.
+        """
+        depth = max(120, min(50_000, int(base_depth)))
+        if not calendar or self.history_days <= 0:
+            return depth
+        step = int(TIMEFRAMES.get(timeframe, 60_000))
+        calendar_bars = math.ceil(self.history_days * 86_400_000 / max(1, step))
+        return max(depth, min(50_000, calendar_bars))
+
     def seed(self, symbol: str, timeframe: str, candles: list[dict]) -> None:
         """Prime a cell with historical closed candles."""
         cell = self.cells.get((symbol.upper(), timeframe))
@@ -965,9 +990,12 @@ class Engine:
           can ever show you are the ones that happen while it is open.
         """
         symbol = symbol.upper()
-        depth = self.history_bars if history_bars is None else max(
-            120, min(self.history_bars, int(history_bars))
+        base_depth = self.history_bars if history_bars is None else max(
+            120, min(50_000, int(history_bars))
         )
+        # Explicitly smaller depths are the breadth-first startup pass. The
+        # configured/full depth is the deep pass and must also honor days.
+        calendar_window = history_bars is None or base_depth >= self.history_bars
         empty = 0
         book_mode = self.strategy == "book" and self.book is not None
         # 3m and 2h are derived on MEXC. Share their deeper 1m/1h source
@@ -975,6 +1003,7 @@ class Engine:
         # rows twice for every contract.
         history_cache: dict[str, list[dict]] = {}
         for tf in self.timeframes:
+            depth = self._history_depth(tf, base_depth, calendar=calendar_window)
             cell = self.cells.get((symbol, tf))
             if cell is None or (len(cell.candles) >= 120 and not force):
                 continue
@@ -995,13 +1024,19 @@ class Engine:
                             and "3m" in self.timeframes
                             and feed.exchange_interval("3m") is None
                         ):
-                            request_bars = min(50_000, (depth + 3) * 3)
+                            derived = self._history_depth(
+                                "3m", base_depth, calendar=calendar_window
+                            )
+                            request_bars = min(50_000, max(depth, (derived + 3) * 3))
                         elif (
                             tf == "1h"
                             and "2h" in self.timeframes
                             and feed.exchange_interval("2h") is None
                         ):
-                            request_bars = min(50_000, (depth + 3) * 2)
+                            derived = self._history_depth(
+                                "2h", base_depth, calendar=calendar_window
+                            )
+                            request_bars = min(50_000, max(depth, (derived + 3) * 2))
                         cached = history_cache.get(interval) or []
                         candles = cached if len(cached) >= request_bars - 3 else await feed.history(
                             symbol, interval, request_bars
@@ -1201,14 +1236,63 @@ class Engine:
             "symbols_active_warmup": len(self._warming_symbols),
         }
 
-    def decision_funnel(self) -> dict[str, int]:
-        """Current replay/live window: structure -> aligned HVB -> filters."""
-        return {
-            "setups": sum(cell.raw_setups for cell in self.cells.values()),
-            "hvb_aligned": sum(cell.hvb_aligned_setups for cell in self.cells.values()),
-            "filtered": sum(cell.filtered_setups for cell in self.cells.values()),
-            "passed": sum(cell.passed_setups for cell in self.cells.values()),
+    def decision_funnel(self) -> dict[str, Any]:
+        """Exact current-window funnel, first blockers, and overlapping gates.
+
+        ``filtered`` counts setups. ``rejection_hits`` deliberately counts every
+        failed gate and can therefore be larger. Earlier reporting labelled the
+        latter as "filtered out", making 42 rejected setups look like 160 and
+        obscuring the fact that every one first failed the same trend-context
+        gate. Per-timeframe evidence makes production silence auditable.
+        """
+
+        def blank() -> dict[str, Any]:
+            return {
+                "setups": 0,
+                "hvb_aligned": 0,
+                "filtered": 0,
+                "passed": 0,
+                "first_rejections": {},
+                "rejection_hits": {},
+                "rejection_combinations": {},
+            }
+
+        def merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+            for key, value in source.items():
+                target[key] = target.get(key, 0) + int(value)
+
+        def ranked(values: dict[str, int], limit: int = 12) -> dict[str, int]:
+            return dict(sorted(values.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+        total = blank()
+        by_timeframe: dict[str, dict[str, Any]] = {
+            timeframe: blank() for timeframe in self.timeframes
         }
+        for cell in self.cells.values():
+            bucket = by_timeframe.setdefault(cell.timeframe, blank())
+            for name, value in (
+                ("setups", cell.raw_setups),
+                ("hvb_aligned", cell.hvb_aligned_setups),
+                ("filtered", cell.filtered_setups),
+                ("passed", cell.passed_setups),
+            ):
+                bucket[name] += value
+                total[name] += value
+            for target, source in (
+                (bucket["first_rejections"], cell.first_rejections),
+                (bucket["rejection_hits"], cell.rejection_reasons),
+                (bucket["rejection_combinations"], cell.rejection_combinations),
+                (total["first_rejections"], cell.first_rejections),
+                (total["rejection_hits"], cell.rejection_reasons),
+                (total["rejection_combinations"], cell.rejection_combinations),
+            ):
+                merge_counts(target, source)
+
+        for bucket in [total, *by_timeframe.values()]:
+            bucket["first_rejections"] = ranked(bucket["first_rejections"])
+            bucket["rejection_hits"] = ranked(bucket["rejection_hits"])
+            bucket["rejection_combinations"] = ranked(bucket["rejection_combinations"])
+        return {**total, "by_timeframe": by_timeframe}
 
     async def warmup(
         self, feed, concurrency: int = 30, history_bars: int | None = None
@@ -1344,7 +1428,7 @@ class Engine:
         target_ms = TIMEFRAMES[tf]
         ratio = max(1, target_ms // source_ms)
         depth = self.history_bars if history_bars is None else max(
-            120, min(self.history_bars, int(history_bars))
+            120, min(50_000, int(history_bars))
         )
         need = min(50_000, (depth + 3) * ratio)
         cache = history_cache if history_cache is not None else {}
@@ -1568,6 +1652,16 @@ class Engine:
                 await self._publish(cell, candidate, bar)
             else:
                 cell.filtered_setups += 1
+                keys = list(dict.fromkeys(rejection_key(reason) for reason in reasons))
+                if keys:
+                    first = keys[0]
+                    cell.first_rejections[first] = cell.first_rejections.get(first, 0) + 1
+                    for key in keys:
+                        cell.rejection_reasons[key] = cell.rejection_reasons.get(key, 0) + 1
+                    combination = " + ".join(keys)
+                    cell.rejection_combinations[combination] = (
+                        cell.rejection_combinations.get(combination, 0) + 1
+                    )
                 await self._emit(
                     {
                         "type": "filtered",
@@ -2506,6 +2600,7 @@ class Engine:
             "hvb_min_points": self.hvb_min_points,
             "hvb_min_speed": self.hvb_min_speed,
             "history_bars": self.history_bars,
+            "history_days": self.history_days,
             "structure_settings": self.structure_settings,
             "filters": self.filters.summary(),
             "kinds": dict(self.kinds),

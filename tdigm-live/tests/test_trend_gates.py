@@ -23,7 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot.engine import Engine  # noqa: E402
-from bot.filters import SCORE_WEIGHTS, Filters  # noqa: E402
+from bot.filters import SCORE_WEIGHTS, Filters, rejection_key  # noqa: E402
+
+
+def test_rejection_counter_groups_live_values_but_keeps_the_20_bar_rule():
+    assert rejection_key("ranging market: ADX 20.9 < 22") == "ranging market: ADX N < N"
+    assert rejection_key("no 20-bar high/low break on this candle").startswith("no 20-bar")
 
 
 # --------------------------------------------------------------- fixtures

@@ -170,5 +170,6 @@
     "port": 8700
   },
   "preview_max_symbols": 300,
-  "history_bars": 5000
+  "history_bars": 5000,
+  "history_days": 30
 }

@@ -103,6 +103,64 @@ async def test_fast_startup_depth_does_not_replace_the_configured_deep_depth():
     assert feed.limits[-1] == 5000
 
 
+def test_deep_history_uses_calendar_coverage_without_slowing_the_fast_pass():
+    engine = Engine(
+        symbols=["BTCUSDT"],
+        timeframes=["1m", "3m", "5m", "15m"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1,
+                      "slow_period": 9, "band_mult": 1.6185},
+        history_bars=5000,
+        history_days=30,
+    )
+
+    assert engine._history_depth("1m", 5000, calendar=True) == 43_200
+    assert engine._history_depth("3m", 5000, calendar=True) == 14_400
+    assert engine._history_depth("5m", 5000, calendar=True) == 8_640
+    assert engine._history_depth("15m", 5000, calendar=True) == 5000
+    assert engine._history_depth("1m", 1000, calendar=False) == 1000
+
+
+@pytest.mark.asyncio
+async def test_calendar_depth_is_used_by_deep_rescan_but_not_startup():
+    feed = TimedFeed(delay=0)
+    engine = Engine(
+        symbols=["BTCUSDT"],
+        timeframes=["5m"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1,
+                      "slow_period": 9, "band_mult": 1.6185},
+        filters={"structure": True, "hvb": True},
+        history_bars=5000,
+        history_days=30,
+    )
+
+    await engine.warmup(feed, concurrency=1, history_bars=1000)
+    assert feed.limits == [1000]
+    await engine.rescan(feed, concurrency=1)
+    assert feed.limits[-1] == 8640
+
+
+def test_decision_funnel_separates_setups_from_overlapping_rejection_hits():
+    engine = engine_over(["BTCUSDT"], ["3m"])
+    cell = engine.cells[("BTCUSDT", "3m")]
+    cell.raw_setups = 3
+    cell.hvb_aligned_setups = 2
+    cell.filtered_setups = 2
+    cell.passed_setups = 1
+    cell.first_rejections = {"unclear structure": 2}
+    cell.rejection_reasons = {"unclear structure": 2, "no HVB": 1, "low ADX": 1}
+    cell.rejection_combinations = {
+        "unclear structure + no HVB": 1,
+        "unclear structure + low ADX": 1,
+    }
+
+    funnel = engine.decision_funnel()
+    assert funnel["setups"] == 3
+    assert funnel["filtered"] == 2 and funnel["passed"] == 1
+    assert sum(funnel["first_rejections"].values()) == funnel["filtered"]
+    assert sum(funnel["rejection_hits"].values()) == 4
+    assert funnel["by_timeframe"]["3m"]["first_rejections"] == {"unclear structure": 2}
+
+
 @pytest.mark.asyncio
 async def test_one_broken_instrument_does_not_hold_the_queue():
     symbols = ["BADUSDT"] + [f"COIN{i}USDT" for i in range(29)]

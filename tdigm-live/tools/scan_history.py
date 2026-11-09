@@ -65,6 +65,10 @@ async def main() -> int:
     ap.add_argument("--timeframes", default="5m,15m,30m,1h")
     ap.add_argument("--pivot-len", type=int, default=5)
     ap.add_argument("--sweep-max-wait", type=int, default=60)
+    ap.add_argument("--displacement-atr-period", type=int, default=14,
+                    help="prior closed bars used by both displacement proofs")
+    ap.add_argument("--displacement-body-atr", type=float, default=1.0,
+                    help="minimum directed real body / prior ATR on both events")
     ap.add_argument("--min-rr", type=float, default=0.0)
     ap.add_argument("--max-bars", type=int, default=0)
     ap.add_argument("--trend", default="off")
@@ -191,7 +195,9 @@ async def main() -> int:
         },
         structure={"pivot_len": args.pivot_len, "major_len": args.major_len,
                    "macro_len": args.macro_len,
-                   "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target},
+                   "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target,
+                   "displacement_atr_period": args.displacement_atr_period,
+                   "displacement_body_atr": args.displacement_body_atr},
     )
 
     signals: dict[str, list[dict]] = defaultdict(list)
@@ -203,9 +209,12 @@ async def main() -> int:
         signals[alert["timeframe"]].append(alert)
 
     days = (candles[-1]["close_time"] - candles[0]["open_time"]) / 86_400_000
-    print(f"{args.symbol}: {len(candles)} 1m bars, {days:.0f} days, timeframes {list(signals)}")
+    print(f"{args.symbol}: {len(candles)} 1m bars, {days:.0f} days, timeframes {engine.timeframes}")
     print(f"filters: {engine.filters.config}")
-    print(f"structure: pivot_len={args.pivot_len} sweep_max_wait={args.sweep_max_wait}")
+    print(
+        f"structure: pivot_len={args.pivot_len} sweep_max_wait={args.sweep_max_wait} "
+        f"displacement={args.displacement_body_atr:g} prior-ATR/{args.displacement_atr_period}"
+    )
     print()
     total = 0
     for tf in engine.timeframes:
@@ -230,8 +239,23 @@ async def main() -> int:
               f"long {sides.get('LONG', 0)} short {sides.get('SHORT', 0)}  "
               f"hvb {hvb}  median RR {sorted(rrs)[len(rrs) // 2] if rrs else '-'}")
     print(f"\ntotal {total} signals over {days:.0f} days = {total / max(days, 1):.2f}/day")
-    summary = engine.filters.summary()
-    print(f"filtered out: {summary['rejected']}  ({summary['reasons']})")
+    funnel = engine.decision_funnel()
+    print(
+        "decision funnel: "
+        f"{funnel['setups']} completed setups -> {funnel['hvb_aligned']} same-candle HVBs -> "
+        f"{funnel['filtered']} filtered + {funnel['passed']} passed"
+    )
+    print(f"first decisive blockers (one/setup): {funnel['first_rejections']}")
+    print(f"overlapping rejection hits: {funnel['rejection_hits']}")
+    for timeframe, row in funnel["by_timeframe"].items():
+        if not row["setups"]:
+            continue
+        print(
+            f"  {timeframe}: {row['setups']} setups, {row['hvb_aligned']} HVB-aligned, "
+            f"{row['filtered']} filtered, {row['passed']} passed; "
+            f"first blockers {row['first_rejections']}"
+        )
+    print(f"top blocker combinations: {funnel['rejection_combinations']}")
     print(f"other events: {engine.kinds}")
 
     if args.json:

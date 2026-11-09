@@ -395,7 +395,7 @@ class Filters:
 
         if reasons:
             for reason in reasons:
-                key = _short(reason)
+                key = rejection_key(reason)
                 self.rejections[key] = self.rejections.get(key, 0) + 1
             return False, reasons
 
@@ -495,11 +495,13 @@ class Filters:
         }
 
 
-def _short(reason: str) -> str:
-    """Stable key for the counters - drop the numbers so they group."""
+def rejection_key(reason: str) -> str:
+    """Stable key for decision-funnel counters; drop per-candle numbers."""
     head = reason.split("(")[0].strip()
     out = []
     for token in head.split():
-        # the numbers differ every bar; "N" keeps one counter per kind of reason
-        out.append("N" if any(ch.isdigit() for ch in token) and not token.startswith("20") else token)
+        # The numbers differ every bar; "N" keeps one counter per kind. Preserve
+        # only the strategy phrase "20-bar", not live values such as ADX 20.9.
+        has_number = any(ch.isdigit() for ch in token)
+        out.append("N" if has_number and not token.startswith("20-bar") else token)
     return " ".join(out)[:48]

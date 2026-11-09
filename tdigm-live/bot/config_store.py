@@ -58,6 +58,11 @@ def read(path: str | Path) -> dict[str, Any]:
     data.setdefault("structure", dict(DEFAULT_STRUCTURE))
     data.setdefault("exchange", "binance")
     data.setdefault("max_symbols", 2000)
+    # A uniform bar count only covered ten days on the derived 3m cell, even
+    # though the exact v4.1 + chain-v8 setup is intentionally selective. Keep a
+    # calendar window as well as the per-timeframe bar floor so recent valid
+    # setups are actually replayed after a restart.
+    data.setdefault("history_days", 30)
     return data
 
 

@@ -298,6 +298,15 @@ approach pivots and valid four-value moving-MBL crossing proof. Input hash, exac
 command, per-timeframe counts, proof audit, and limitations are in
 [`docs/lifecycle-v7-regression-2026-11-04.md`](docs/lifecycle-v7-regression-2026-11-04.md).
 
+The current chain-v8 replay corrects an earlier diagnostic error: 757 was the
+number of overlapping failed-gate **hits**, not completed setups. The exact funnel
+is 205 completed setups → 36 same-candle HVBs → 203 filtered + 2 published. More
+importantly for production startup, one strict signal lies inside the final 30
+days but outside the old 5,000-bar/10.4-day derived-3m window. The calendar-depth
+repair, per-timeframe blockers, commands, fixture provenance, and unchanged-gate
+evidence are in
+[`docs/chain-v8-signal-flow-repair-2026-11-01.md`](docs/chain-v8-signal-flow-repair-2026-11-01.md).
+
 ### Concurrent history and live scanning
 
 Warm-up and rescan use the bounded `workers` pool (shipped as **24**); the runtime
@@ -334,8 +343,11 @@ sparser than accepting near misses:
 * optional book-only gates (FVG, volume bar, liquidity pool blocking) are off
   because they are not part of the stated setup.
 
-Signal volume comes from scanning the whole futures universe, nine timeframes and
-5,000 bars per timeframe—not by changing “same candle” into “within three bars”.
+Signal volume comes from scanning the whole futures universe and nine timeframes,
+not by changing “same candle” into “within three bars”. The deep replay keeps a
+5,000-bar floor **and** at least 30 calendar days on lower timeframes; this fixes
+the old mismatch where 5,000 derived 3m bars covered only 10.4 days and skipped a
+valid recent setup that the unchanged policy finds.
 
 ### The book's confluences (p.42, p.53, p.87)
 
@@ -382,10 +394,13 @@ python run.py universe --exchange mexc --top 30     # list pairs by 24h turnover
 
 Warm-up runs **after** the server is accepting requests, in a 24-worker pool.
 It is breadth-first in two passes: every contract/timeframe first gets 1,000 bars
-(`startup_history_bars`), then every contract is deep-replayed over the configured
-5,000 bars. Newly added batches use the same shallow-then-deep queue. This avoids
-spending all workers on deep history for the first 24 contracts while hundreds
-remain blind. The live socket pump starts immediately; closed candles arriving
+(`startup_history_bars`), then every contract is deep-replayed over the larger of
+the configured 5,000-bar floor and the 30-day calendar window (`history_days`).
+For example, the deep pass requests 43,200 1m bars, 14,400 derived 3m bars and
+8,640 5m bars, while 15m and higher retain the 5,000-bar floor. Newly added
+batches use the same shallow-then-deep queue. This avoids spending all workers on
+deep history for the first 24 contracts while hundreds remain blind. The live
+socket pump starts immediately; closed candles arriving
 while a symbol is rebuilt are buffered per symbol and replayed in timestamp
 order. Thus a full-universe deep scan does not create a blind live window. MEXC's
 2,000-row REST cap is paged rather than silently truncating the requested history.
@@ -610,7 +625,8 @@ simulation is claimed here.
   "auto_universe": true, "max_symbols": 2000, "workers": 24,
   "universe_min_expected": 100, "universe_retry_seconds": 60,
   "universe_refresh_seconds": 3600,
-  "strategy": "sweep", "startup_history_bars": 1000, "history_bars": 5000,
+  "strategy": "sweep", "startup_history_bars": 1000,
+  "history_bars": 5000, "history_days": 30,
   "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"],
   "tdi":   { "rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9, "band_mult": 1.6185 },
   "structure": { "pivot_len": 5, "sweep_max_wait": 60, "level_max_age": 180, "max_levels": 40, "target_mode": "range" },

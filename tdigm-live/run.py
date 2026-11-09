@@ -54,6 +54,7 @@ def make_engine(config: dict) -> Engine:
         strategy=config.get("strategy", "sweep"),
         book=config.get("book"),
         history_bars=int(config.get("history_bars", 5000)),
+        history_days=float(config.get("history_days", 30)),
     )
 
 
