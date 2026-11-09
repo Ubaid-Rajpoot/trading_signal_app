@@ -20,7 +20,7 @@ far as the bot was concerned.
 Warm-up now **replays** the fetched history through the same pipeline live uses:
 
 ```
-fetch 600 closed candles (per instrument per timeframe)
+fetch 5,000 closed candles (per instrument per timeframe; paged where needed)
   -> feed them through Cell (TDIGM, regime, structure, trend map)
   -> on every bar where the structure confirms a setup, run the real _evaluate
   -> run the setup lifecycle over the rest of the history
@@ -31,9 +31,12 @@ So a setup confirmed 8 hours ago is found, and it is found by the *same code*
 that will judge the next one. `tests/test_setups.py::test_backfill_and_live_agree_on_the_same_candle`
 pins that: replay and live must produce the identical setup from the same candle.
 
-**Window.** 600 bars per timeframe (6 days of 15m, 25 days of 1h, 100 days of 4h).
-That is ten times the 60-bar life of a setup, so nothing tradeable can be missed
-inside it. Older history is not scanned: a setup that old is not a setup anymore.
+**Window.** 5,000 bars per timeframe (about 52 days of 15m, 208 days of 1h,
+and 833 days of 4h, where the contract has that history). MEXC contract history
+is capped at 2,000 rows per response, so the feed pages backwards and de-duplicates
+windows. An untouched setup has no age-only expiry in the shipped configuration;
+it remains valid until mitigation or price invalidation, and every valid archive
+row is rehydrated after restart so new candles keep its state current.
 
 ## 2. A failed request is retried, and reported
 
@@ -43,9 +46,10 @@ Anything still empty is recorded in `warm_failures` and shown in the UI as
 `tests/test_setups.py::test_a_failed_history_request_is_retried_instead_of_left_empty`
 covers the 429-then-recovery case.
 
-This is the one that made "500 symbols, zero setups" possible: 500 instruments ×
-7 timeframes is 3,500 REST calls at start-up, and one rate-limited minute used to
-be permanent.
+This is one cause of "hundreds of symbols, zero setups": thousands of REST
+windows are needed at start-up, and one rate-limited minute used to be permanent.
+The live socket now starts immediately; per-symbol closed bars are buffered while
+that symbol warms, so the deep scan does not miss new signals.
 
 ## 3. Perpetuals, not spot
 
@@ -58,8 +62,9 @@ ones:
 | Binance | `fapi.binance.com/fapi/v1/klines` | `wss://fstream.binance.com` `@kline_1m` | `contractType: PERPETUAL`, `status: TRADING` |
 
 `python run.py serve --market spot` still works if you ever want the other book.
-Timeframes are now 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h (and 1d for a replay);
-anything the exchange has no interval for is rolled up from 1m.
+Timeframes are 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h and 1d. MEXC-native
+history is used where available; 3m is built from 1m and 2h from clock-aligned
+1h history. The live 1m stream rolls every configured timeframe locally.
 
 **Honest limitation:** the exchange hosts are not reachable from where this was
 developed, so the futures feeds are exercised against recorded payload shapes
@@ -69,21 +74,66 @@ contract endpoints because the default market is futures.
 
 ## 4. Valid vs invalid — a setup is a living object
 
+Before lifecycle starts, structural validity is exact:
+
+1. the swept pivot and opposite broken pivot must be the two endpoints of one
+   completed leg;
+2. the liquidity run may take **exactly one structural level at the selected
+   degree**: one high for a short or one low for a long;
+3. a clean outer bearish leg may contain directional `LH+LL` internals (and a
+   bullish leg `HL+HH` internals) **before its final paired opposite endpoint**.
+   Those pivots define one outer directional leg rather than a range;
+4. once that paired endpoint forms, price must move **directly** to sweep the
+   other endpoint. Any intervening pivot or back-and-forth before the sweep is
+   the X drawing and invalidates the run;
+5. the sweep is a rejection candle: its wick takes the liquidity, but its real
+   body must displace back in the eventual trade direction (high sweep down for
+   a short; low sweep up for a long) by at least
+   `structure.displacement_body_atr` (default **1.0**) times ATR calculated only
+   from prior closed candles;
+6. after the valid sweep, price may move however it chooses while seeking the
+   opposite break. Continuing beyond the selected sweep extreme is allowed, but
+   taking a second independent/equal same-side level before release is not;
+7. the body break must occur later and through the exact paired endpoint, and
+   that break candle must independently meet the same prior-ATR displacement
+   threshold in the trade direction;
+8. on that same closed break candle, the purple TDIGM price line must cross the
+   moving black MBL. Previous/current purple and MBL values must prove the
+   transition. A fixed-50, slow-line, or outer-blue-band crossing is not an HVB.
+
+The supplied worked chart is the canonical regression for point 5: the long's
+sweep candle wicks below the marked low, closes with an upward displacement body,
+and the following upward displacement closes through the paired high. Treating
+the first body as needing to point *down into* the low was the reason that valid
+setup never reached the remaining v4.1 gates.
+
+Repeated equal highs/lows, a contracting range, an oscillating sweep approach,
+or an outer-band spike cannot be cherry-picked into a chain. `chain_version: 8`
+stores `swept_count: 1`, `leg_model: directional_outer_v1`,
+`approach_model: direct_from_paired_endpoint_v1` with zero approach pivots,
+`hvb_model: mbl_centre_cross_v1` with all four crossing values, and immutable
+OHLC/prior-ATR/body-ratio proofs for both displacement events. The publication/
+database boundary refuses a current-version row without every proof.
+
 A setup is not a moment. Each one becomes a record with a state:
 
 | state | meaning | still tradeable? |
 |---|---|---|
-| **pending** | price has not come back into the order block yet | **yes** |
-| **active** | price is in the zone (the entry is filled) | **yes** |
-| win | the target was reached | no |
-| stopped | the stop was hit | no |
-| expired | 60 bars went by without the zone being touched | no |
-| invalidated | the stop was taken before the entry was ever filled | no |
+| **pending** | neither the order block nor eligible breaker has been touched; no trade is filled, while the favorable confirmation-leg H/L continues to extend on fully closed candles | **yes** |
+| **active** | mitigation fixed the entry/stop and froze the last pre-mitigation confirmation-leg H/L as target | **yes** |
+| win | a candle after mitigation reached that frozen leg target | no |
+| stopped | the stop was reached after mitigation | no |
+| expired | optional positive `setup_max_bars` limit elapsed (disabled by default) | no |
+| invalidated | stop was reached while still unmitigated; no trade was filled | no |
 
-`valid` = pending or active, and that is exactly the "it hasn't been mitigated
-yet" test: mitigation means price traded back into the block. Nothing is deleted
-when a setup dies — the card keeps it, with the state and the bar it happened on,
-because "this idea died here" is information.
+`valid` = pending or active. `unmitigated` specifically means pending. These are
+internal lifecycle names; the board deliberately displays an unmitigated
+`pending` row as **ACTIVE** and a filled unresolved `active` row as **MITIGATED**,
+so a zone that has already traded is never presented as an untouched active
+signal. Every row stores `state_reason`, so “invalidated” is never an unexplained label: an integrity
+quarantine names the broken proof, while a lifecycle invalidation says that the
+stop preceded every eligible zone. Unfilled invalidations do not enter the win
+rate. Nothing is deleted when a setup dies.
 
 ### The order block
 
@@ -96,9 +146,42 @@ that broke structure** — the classic definition, and the red box on your chart
 
 If there is no opposite candle in the previous 12 bars (a straight run), the
 break candle itself becomes the zone and the card says so.
-`bot/setups.py::order_block` is the only implementation, and
-`tests/test_setups.py::test_order_block_is_the_last_opposite_candle_before_the_break`
-pins it.
+`bot/setups.py::order_block` is the only implementation.
+
+### The aggressive-shift breaker block
+
+The book's pp.88–89 place the breaker on the left of an aggressive market
+structure shift and explicitly say that an aggressive momentum shift makes the
+breaker strong. For this paired-leg strategy that is deterministic: the candle
+that formed the same-leg endpoint now being body-broken is the breaker candidate.
+It is enabled only when the directed break candle body is at least
+`breaker_body_atr` (default 1.0) times the preceding ATR and the zone lies between
+displacement close and stop. A normal break does not invent a breaker.
+
+The order block and breaker are parallel mitigation choices. The first proximal
+edge touched after confirmation fills the setup. For SHORT that is a zone's low;
+for LONG it is its high. An **order-block** fill retains the structural sweep
+stop. A **breaker-block** fill replaces that distant stop with the breaker distal
+edge plus `breaker_stop_buffer_atr` (shipped as 0.10 ATR): above the breaker high
+for shorts, below its low for longs. A breaker is omitted if that local stop would
+not improve risk over the structural stop.
+
+The exit comes from the same displacement leg as confirmation, not a fixed R
+multiple. The leg starts on the selected sweep candle and includes the candle
+that both prints the directed moving-MBL-cross HVB and body-closes through the
+paired endpoint.
+For SHORT, its favorable extreme is the lowest low; for LONG, the highest high.
+Every fully closed candle while the setup remains pending may extend that extreme.
+
+At mitigation—and not at the break close—the engine freezes entry and the
+selected post-fill stop plus the **previous** favorable leg extreme. The
+mitigation candle is deliberately excluded: OHLC data cannot prove whether its
+extreme happened before or after the zone touch, so using it would improve the
+exit retrospectively. For the same reason, a target touch on the mitigation
+candle is not awarded as a win; a later candle must revisit it. A same-candle
+zone-and-stop touch is conservatively `stopped`, not the factually wrong
+“unfilled invalidated”. Winning R is `(entry − leg low) / initial risk` for SHORT
+or `(leg high − entry) / initial risk` for LONG; therefore R varies by setup.
 
 ## 5. What the page draws
 
@@ -107,19 +190,39 @@ For the selected setup, on real candles:
 | mark | what it is |
 |---|---|
 | amber `BOS↑` / `BOS↓` | every 20-bar structure break in the window (not just the one in the setup) |
-| purple dot | every TDIGM HVB — the price line crossing the centre band — in the window |
-| red/green box | the order block, from the last opposite candle before the break |
+| blue `BODY BREAK + MBL CROSS HVB` outline | the selected body-break candle, labelled HVB only when stored previous/current values prove the moving-MBL cross |
+| red `HVB UNPROVEN` outline | legacy/non-current body-break row that lacks that mathematical proof |
+| blue box | order block, from the last opposite candle before displacement |
+| purple box | paired-endpoint breaker, only for an aggressive shift |
+| pale-blue `DIRECT SWEEP APPROACH` window | paired opposite endpoint to sweep; no intervening pivot is permitted |
 | dashed purple | the liquidity level that was swept |
-| dashed white / red / green | entry, stop, 2R, and the structure target |
+| dashed white / red / green | mitigation entry, stop, and frozen confirmation-leg H/L target; entry/target begin at mitigation |
 | vertical line | the candle the setup confirmed on |
 
-The markers are computed with the same functions the live engine uses
-(`break_signal`, the TDI centre cross), so the chart cannot show a break the
-engine would not have seen (`Engine._markers`).
+The chart/API evidence is computed with the same functions the live engine uses
+(`break_signal`, `hvb_signal`), including the points and speed gates. The selected
+candle is never labelled HVB from a stored side string alone (`Engine._markers`).
 
 Every instrument/timeframe cell in the matrix is clickable and opens its chart,
 so a cell that says `range` or `sweep high` can be checked against the candles
 that produced it.
+
+For an open setup, **LIVE** shows the latest in-memory market tail and appends the
+exchange's still-forming candle, refreshed once per second. The live strip keeps
+four different quantities explicit:
+
+* `price` — the current forming-kline close;
+* `plan` — target reward divided by initial risk (`1:x`), projected only while
+  pending and frozen from the actual entry/stop after mitigation;
+* `now` — mark-to-market P/L from the mitigation entry in initial-risk R units
+  (never invented for an unfilled setup);
+* `remaining` — reward to the frozen target divided by risk to the current stop,
+  both measured from current market price.
+
+A live intrabar stop/target touch is warned immediately, but it does not mutate
+the archive. Structure, HVB, mitigation, target extension, and lifecycle outcomes
+still consume closed candles only. **SETUP** returns to the immutable historical
+window containing the selected sweep and confirmation chain.
 
 ## 6. Filters on top, and more instruments
 
@@ -134,23 +237,24 @@ The bar above the setups list:
 * **HVB required** — only setups whose confirming candle printed an HVB;
 * **↻ rescan** — re-read every instrument's history and re-run the scan with the
   current rules (also runs automatically after a filter change);
-* **+ top 500** — add the 500 biggest contracts by 24h turnover, added in the
-  background and warmed as they land.
+* the exchange-universe controls remain available for manual overrides, while
+  `auto_universe: true` loads every active USDT perpetual at boot.
 
-`max_symbols` is 600 in `config.json`; raise it if you want the whole board.
-Adding 500 instruments does not block the page: cells show *warming*, and the
-sweep retries anything that fails.
+`max_symbols` is 2000 in `config.json`, deliberately above the expected MEXC
+futures universe. Adding the full universe does not block the page: cells show
+*warming*, live closes are buffered, and the retry sweep revisits failures.
 
 ## 7. Reproduce the numbers
 
 ```bash
 cd tdigm-live
 python run.py check                 # contract REST + websocket reachable?
-python run.py serve                 # LIVE perps, 7 timeframes
-python -m pytest tests -q           # 123 tests
+python run.py serve                 # LIVE perps, 9 timeframes
+python -m pytest tests -q           # deterministic offline suite
 ```
 
-The setup rules themselves are unchanged from round 17 and still measured in
-[`trend-rules.md`](trend-rules.md): `docs/trend-rules.md` explains which of those
-gates the data supports and which it does not, and the page always shows the
-evidence for a setup rather than asking you to trust it.
+The current structural-context rules are documented in
+[`trend-rules.md`](trend-rules.md). Its old measurements are explicitly labelled
+legacy; no production-universe lifecycle-v7 win rate is claimed without replaying compatible real data.
+The page shows the evidence and rejection reason instead of asking you to trust a
+silent decision.

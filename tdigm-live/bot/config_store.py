@@ -28,6 +28,8 @@ DEFAULT_STRUCTURE: dict[str, Any] = {
     "sweep_max_wait": 60,
     "level_max_age": 180,
     "max_levels": 40,
+    "displacement_atr_period": 14,
+    "displacement_body_atr": 1.0,
 }
 
 # keys added after the first release: the file on disk may not have them yet
@@ -35,12 +37,16 @@ _INT_KEYS = {"max_bars_since_sweep", "trend_ema", "cooldown_minutes", "bos_max_a
              "volume_period"}
 _FLOAT_KEYS = {"hvb_min_points", "hvb_min_speed", "regime_adx_min", "regime_er_min", "min_rr",
                "premium_level", "pool_tolerance", "pool_count", "structure_atr_min",
-               "structure_atr_max", "volume_mult", "confirm_min_score"}
+               "structure_atr_max", "volume_mult", "confirm_min_score",
+               "breaker_body_atr", "breaker_stop_buffer_atr", "min_directional_ratio"}
 _BOOL_KEYS = {"structure", "hvb", "break", "regime", "premium_discount", "structure_direction",
               "require_ms", "require_fvg", "block_liquidity_pool", "premium_on_entry",
-              "trend_context", "require_hh_hl", "require_bos", "volume_break"}
-# whole-number keys that must stay integers (they are counts of bars)
-_COUNT_KEYS = {"max_internal_depth", "setup_max_bars", "hvb_window"}
+              "trend_context", "require_hh_hl", "require_bos", "volume_break",
+              "clear_structure"}
+# whole-number keys that must stay integers.  Depth starts at one; windows may
+# intentionally be zero (same-candle HVB, and no age-only setup expiry).
+_COUNT_KEYS = {"max_internal_depth", "min_trend_steps"}
+_ZERO_COUNT_KEYS = {"setup_max_bars", "hvb_window", "fresh_shift_max_bars"}
 
 
 def read(path: str | Path) -> dict[str, Any]:
@@ -51,7 +57,12 @@ def read(path: str | Path) -> dict[str, Any]:
     data.setdefault("filters", dict(DEFAULT_FILTERS))
     data.setdefault("structure", dict(DEFAULT_STRUCTURE))
     data.setdefault("exchange", "binance")
-    data.setdefault("max_symbols", 500)
+    data.setdefault("max_symbols", 2000)
+    # A uniform bar count only covered ten days on the derived 3m cell, even
+    # though the exact v4.1 + chain-v8 setup is intentionally selective. Keep a
+    # calendar window as well as the per-timeframe bar floor so recent valid
+    # setups are actually replayed after a restart.
+    data.setdefault("history_days", 30)
     return data
 
 
@@ -87,7 +98,7 @@ def validate_structure(payload: dict[str, Any]) -> dict[str, Any]:
     """Only known keys, clamped to sane ranges - this writes a user-facing file."""
     merged = dict(DEFAULT_STRUCTURE)
     for key in ("pivot_len", "sweep_max_wait", "level_max_age", "max_levels",
-                "major_len", "macro_len"):
+                "major_len", "macro_len", "displacement_atr_period"):
         if key not in payload:
             continue
         try:
@@ -97,6 +108,15 @@ def validate_structure(payload: dict[str, Any]) -> dict[str, Any]:
     if "hh_tolerance_atr" in payload:
         try:
             merged["hh_tolerance_atr"] = max(0.0, float(payload["hh_tolerance_atr"]))
+        except (TypeError, ValueError):
+            pass
+    merged["displacement_atr_period"] = max(2, int(merged["displacement_atr_period"]))
+    if "displacement_body_atr" in payload:
+        try:
+            # Displacement is a strategy invariant, not an optional confluence.
+            merged["displacement_body_atr"] = max(
+                0.1, float(payload["displacement_body_atr"])
+            )
         except (TypeError, ValueError):
             pass
     if "target_mode" in payload:
@@ -123,6 +143,11 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
                 merged[key] = max(1, int(value))
             except (TypeError, ValueError):
                 pass
+        elif key in _ZERO_COUNT_KEYS:
+            try:
+                merged[key] = max(0, int(value))
+            except (TypeError, ValueError):
+                pass
         elif key in _INT_KEYS:
             try:
                 merged[key] = max(0, int(value))
@@ -139,4 +164,10 @@ def validate_filters(payload: dict[str, Any]) -> dict[str, Any]:
             merged[key] = sides or ["long", "short"]
         elif key == "sessions":
             merged[key] = [str(s) for s in (value or [])][:8]
+    merged["min_directional_ratio"] = min(1.0, merged["min_directional_ratio"])
+    # These are strategy invariants, not optional confluence knobs. Keeping them
+    # fixed prevents saved settings or score mode from admitting a body-break
+    # candle without its own moving-centre-band HVB.
+    merged["hvb"] = True
+    merged["hvb_window"] = 0
     return merged

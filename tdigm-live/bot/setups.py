@@ -8,20 +8,21 @@ scrolled away, and there was no such thing as "the state of a setup".
 
 Here every published setup becomes a record with a state machine:
 
-    pending      price has not come back into the order block yet  -> tradeable
-    active       price is in the zone (the entry is filled)        -> in a trade
-    win          the target was reached
-    stopped      the stop was hit
-    expired      too many bars went by without the zone being touched
-    invalidated  the stop was taken before the entry was ever filled
+    pending      neither the order block nor eligible breaker was mitigated
+    active       a mitigation fixed the entry and armed the confirmation-leg H/L target
+    win          the post-mitigation leg target was reached
+    stopped      the post-mitigation stop was reached
+    expired      optional positive max-bars limit elapsed (disabled by default)
+    invalidated  the stop was taken before any mitigation (no trade was filled)
 
 ``valid`` means pending or active - a setup you can still act on. Everything
 else is history, and the UI keeps it visible instead of deleting it, because
 "this idea died and here is where" is information, not noise.
 
 The **order block** is the last candle in the opposite direction before the
-displacement that broke structure (the classic definition). Its high/low is the
-zone, and the zone is drawn on the chart:
+displacement that broke structure. An aggressive displacement also promotes the
+paired endpoint candle on its left to an ICT-style **breaker block** (book
+pp.88–89). Either zone may mitigate the setup. Its high/low is drawn on chart:
 
     SHORT  last bullish candle before the down break   (supply)
     LONG   last bearish candle before the up break     (demand)
@@ -37,6 +38,11 @@ from typing import Any
 
 VALID = {"pending", "active"}
 DONE = {"win", "stopped", "breakeven", "expired", "invalidated"}
+LIFECYCLE_VERSION = 7
+# Retained for book-plan compatibility only. Sweep setups use the frozen H/L of
+# their own HVB/BOS confirmation leg and derive the achieved R from that price.
+DEFAULT_TARGET_RR = 4.0
+LEG_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
 def order_block(candles: list[dict], side: str, lookback: int = 12) -> dict[str, Any] | None:
@@ -62,6 +68,7 @@ def order_block(candles: list[dict], side: str, lookback: int = 12) -> dict[str,
                 "time": int(bar["close_time"]),
                 "index_ago": upto - i,
                 "kind": "supply" if side == "SHORT" else "demand",
+                "type": "order_block",
             }
     # no opposite candle in sight (a straight run): use the break candle itself
     bar = candles[-1]
@@ -73,6 +80,86 @@ def order_block(candles: list[dict], side: str, lookback: int = 12) -> dict[str,
         "time": int(bar["close_time"]),
         "index_ago": 0,
         "kind": "displacement" if side != "SHORT" else "supply",
+        "type": "order_block",
+    }
+
+
+def breaker_block(
+    candles: list[dict],
+    side: str,
+    broke_level_time: int,
+    stop: float,
+    *,
+    min_body_atr: float = 1.0,
+    stop_buffer_atr: float = 0.10,
+    atr_period: int = 14,
+) -> dict[str, Any] | None:
+    """Return the paired endpoint candle as an aggressive-shift breaker block.
+
+    The book's breaker is on the *left* of the displacement: it is the candle
+    that formed the structural endpoint the aggressive MS later closes through.
+    It is an alternative mitigation zone, not a replacement for the order block.
+    A normal-sized break does not promote that candle to a breaker.
+    """
+    if len(candles) < 3 or not broke_level_time:
+        return None
+    shift = candles[-1]
+    opened, closed = float(shift["open"]), float(shift["close"])
+    directed = closed < opened if side == "SHORT" else closed > opened
+    if not directed:
+        return None
+
+    prior = candles[max(0, len(candles) - 1 - max(2, atr_period)):len(candles) - 1]
+    ranges: list[float] = []
+    previous_close: float | None = None
+    for bar in prior:
+        high, low = float(bar["high"]), float(bar["low"])
+        true_range = high - low
+        if previous_close is not None:
+            true_range = max(true_range, abs(high - previous_close), abs(low - previous_close))
+        if true_range > 0:
+            ranges.append(true_range)
+        previous_close = float(bar["close"])
+    atr = sum(ranges) / len(ranges) if ranges else 0.0
+    body = abs(closed - opened)
+    body_atr = body / atr if atr > 0 else 0.0
+    if atr <= 0 or body_atr < max(0.0, min_body_atr):
+        return None
+
+    source = next(
+        (bar for bar in candles[:-1] if int(bar.get("close_time") or 0) == int(broke_level_time)),
+        None,
+    )
+    if source is None:
+        return None
+    high, low = float(source["high"]), float(source["low"])
+    if high <= low:
+        return None
+    # The complete zone—not merely its proximal edge—must sit between the
+    # displacement close and invalidation stop.
+    if side == "SHORT" and not (closed < low < high < float(stop)):
+        return None
+    if side == "LONG" and not (float(stop) < low < high < closed):
+        return None
+    buffer = max(0.0, float(stop_buffer_atr)) * atr
+    breaker_stop = high + buffer if side == "SHORT" else low - buffer
+    # The breaker stop must improve risk versus the structural sweep stop.
+    if side == "SHORT" and breaker_stop >= float(stop):
+        return None
+    if side == "LONG" and breaker_stop <= float(stop):
+        return None
+    return {
+        "high": high,
+        "low": low,
+        "mid": (high + low) / 2,
+        "time": int(source["close_time"]),
+        "kind": "bearish_breaker" if side == "SHORT" else "bullish_breaker",
+        "type": "breaker_block",
+        "body_atr": round(body_atr, 3),
+        "atr": atr,
+        "stop_buffer": buffer,
+        "breaker_stop": breaker_stop,
+        "break_time": int(shift["close_time"]),
     }
 
 
@@ -95,6 +182,17 @@ class SetupRecord:
     sweep_ms: int
     bos_level: float
     bos_ms: int
+    zones: list[dict[str, Any]] = field(default_factory=list)
+    target_rr: float | None = None  # actual R to the frozen target after mitigation
+    target_model: str = LEG_TARGET_MODEL
+    leg_target: float | None = None
+    leg_target_ms: int | None = None
+    leg_start_ms: int | None = None
+    leg_break_ms: int | None = None
+    lifecycle_version: int = LIFECYCLE_VERSION
+    mitigation_kind: str | None = None
+    mitigation_zone: dict[str, Any] | None = None
+    state_reason: str | None = None
     break_kind: str = "SHIFT"
     hvb_ms: int | None = None
     hvb_side: str | None = None
@@ -120,12 +218,39 @@ class SetupRecord:
 
     def __post_init__(self) -> None:
         self.state_since = self.created_ms
-        if not self.risk0:
-            self.risk0 = abs(self.entry - self.stop)
+        if self.target_rr is not None:
+            self.target_rr = max(0.0, float(self.target_rr))
         if not self.stop0:
             self.stop0 = self.stop
         if self.zone is None:
-            self.zone = {"high": self.entry, "low": self.entry, "mid": self.entry}
+            self.zone = {"high": self.entry, "low": self.entry, "mid": self.entry,
+                         "kind": "entry", "type": "order_block"}
+        if not self.zones:
+            self.zones = [self.zone]
+        # Risk/reward does not exist until mitigation creates an actual fill.
+        # The target level can be known while pending, but `target` remains
+        # unarmed: the favorable confirmation-leg extreme keeps extending until
+        # the first later candle mitigates an eligible zone.
+        if self.leg_target is None and self.target is not None:
+            self.leg_target = float(self.target)
+        if self.state == "active" or self.touched_ms is not None:
+            if not self.risk0:
+                self.risk0 = abs(self.entry - self.stop)
+            if self.target is None and self.leg_target is not None:
+                self.target = float(self.leg_target)
+            if self.risk0 > 0 and self.target is not None:
+                reward = (
+                    self.entry - self.target if self.side == "SHORT"
+                    else self.target - self.entry
+                )
+                actual_rr = max(0.0, reward / self.risk0)
+                self.rr = round(actual_rr, 4)
+                self.target_rr = self.rr
+        elif self.state == "pending":
+            self.target = None
+            self.rr = None
+            self.target_rr = None
+            self.risk0 = 0.0
 
     # ------------------------------------------------------------------ view
     @property
@@ -134,7 +259,7 @@ class SetupRecord:
 
     @property
     def mitigated(self) -> bool:
-        """Has price traded back into the order block at all?
+        """Has price traded into an order block or eligible breaker block?
 
         This is the trader's own wording ("it hasn't been mitigated yet") and it
         is tracked separately from the state, so a setup that is old but untouched
@@ -144,12 +269,21 @@ class SetupRecord:
         return self.touched_ms is not None
 
     @property
-    def target_2r(self) -> float:
-        """Where 2R sits, so every setup has a measurable target."""
-        risk = abs(self.entry - self.stop)
-        if self.side == "SHORT":
-            return self.entry - 2 * risk
-        return self.entry + 2 * risk
+    def target_rr_price(self) -> float | None:
+        """Compatibility field: the armed leg target after mitigation."""
+        if not self.mitigated or self.target is None:
+            return None
+        return self.target
+
+    @property
+    def target_2r(self) -> float | None:
+        """Legacy 2R reference; never used by the current lifecycle target."""
+        if not self.mitigated:
+            return None
+        risk = self.risk0 or abs(self.entry - self.stop0)
+        if risk <= 0:
+            return None
+        return self.entry - 2 * risk if self.side == "SHORT" else self.entry + 2 * risk
 
     @property
     def realized_r(self) -> float | None:
@@ -163,11 +297,15 @@ class SetupRecord:
         risk = self.risk0 or abs(self.entry - self.stop0)
         if risk <= 0:
             return None
+        if not self.mitigated:
+            return None
         if self.state == "win":
-            target = self.target if self.target is not None else self.target_2r
+            target = self.target if self.target is not None else self.target_rr_price
+            if target is None:
+                return None
             move = (self.entry - target) if self.side == "SHORT" else (target - self.entry)
-            return round(move / risk, 2)
-        if self.state in ("stopped", "invalidated"):
+            return round(move / risk, 4)
+        if self.state == "stopped":
             move = (self.stop0 - self.entry) if self.side == "SHORT" else (self.entry - self.stop0)
             return round(-abs(move) / risk, 2)
         if self.state == "breakeven":
@@ -175,6 +313,8 @@ class SetupRecord:
         return None            # expired: the trade never resolved, it is not an R
 
     def r_multiple(self, price: float | None = None) -> float | None:
+        if not self.mitigated:
+            return None
         price = self.last_price if price is None else price
         risk = self.risk0 or abs(self.entry - self.stop)
         if price is None or risk <= 0:
@@ -188,7 +328,15 @@ class SetupRecord:
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "side": self.side,
+            # Internal lifecycle terms stay stable for persistence and P/L.
+            # The screen uses trader-facing setup terms: an untouched valid
+            # signal is active, while a filled-but-unresolved one is mitigated.
             "state": self.state,
+            "display_state": (
+                "active" if self.state == "pending" and not self.mitigated
+                else "mitigated" if self.state == "active" and self.mitigated
+                else self.state
+            ),
             "valid": self.valid,
             "mitigated": self.mitigated,
             "created_ms": self.created_ms,
@@ -199,11 +347,24 @@ class SetupRecord:
             "entry": round(self.entry, 8),
             "stop": round(self.stop, 8),
             "stop0": round(self.stop0, 8),
+            "risk0": round(self.risk0, 8),
             "target": None if self.target is None else round(self.target, 8),
-            "target_2r": round(self.target_2r, 8),
+            "target_2r": None,  # retained only so old CSV consumers do not break
+            "target_rr": self.target_rr,
+            "target_rr_price": None if self.target_rr_price is None else round(self.target_rr_price, 8),
+            "target_model": self.target_model,
+            "leg_target": None if self.leg_target is None else round(self.leg_target, 8),
+            "leg_target_ms": self.leg_target_ms,
+            "leg_start_ms": self.leg_start_ms,
+            "leg_break_ms": self.leg_break_ms,
             "rr": self.rr,
             "r_now": self.realized_r if self.state in DONE else self.r_multiple(),
             "zone": self.zone,
+            "zones": self.zones,
+            "mitigation_kind": self.mitigation_kind,
+            "mitigation_zone": self.mitigation_zone,
+            "lifecycle_version": self.lifecycle_version,
+            "state_reason": self.state_reason,
             "swept_level": self.swept_level,
             "swept_side": self.swept_side,
             "sweep_ms": self.sweep_ms,
@@ -226,69 +387,153 @@ class SetupRecord:
         }
 
     # --------------------------------------------------------------- lifecycle
-    def advance(self, bar: dict, max_bars: int | None = None) -> bool:
-        """One closed bar moves the state on. Returns True if anything changed.
+    def _extend_pending_leg(self, high: float, low: float, at: int) -> bool:
+        """Extend only the favorable extreme before the mitigation candle.
 
-        Conservative where it has to be: if a single bar contains both the target
-        and the stop, the **stop** is assumed to have been hit first.
+        SHORT confirmation legs seek their low; LONG legs seek their high. The
+        mitigation candle is deliberately excluded because OHLC cannot prove
+        whether its extension happened before or after it touched the entry zone.
+        """
+        candidate = low if self.side == "SHORT" else high
+        if self.leg_target is None:
+            self.leg_target, self.leg_target_ms = candidate, at
+            return True
+        improved = candidate < self.leg_target if self.side == "SHORT" else candidate > self.leg_target
+        if improved:
+            self.leg_target, self.leg_target_ms = candidate, at
+        return improved
+
+    def advance(self, bar: dict, max_bars: int | None = None) -> bool:
+        """Advance one closed candle through mitigation, leg target, and stop.
+
+        No P/L is measured while pending. The confirmation leg starts at the
+        sweep and contains the same-candle HVB/body break. Its favorable extreme
+        may extend on later pending candles. The first order-block or eligible
+        breaker-block mitigation freezes that prior extreme as the target. If one
+        candle contains both stop and target, stop wins.
         """
         if self.state in DONE:
-            # never again: a finished trade's numbers are history
             return False
-        high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
+        high, low = float(bar["high"]), float(bar["low"])
+        opened, close = float(bar.get("open", bar["close"])), float(bar["close"])
+        at = int(bar["close_time"])
         self.last_price = close
         self.bars += 1
         limit = self.max_bars if max_bars is None else max_bars
-        changed = False
 
         if self.state == "pending":
-            touched = high >= self.zone["low"] and low <= self.zone["high"]
-            if touched:
-                self.state, self.state_since, self.touched_ms = "active", int(bar["close_time"]), int(bar["close_time"])
-                return True
+            touched = [
+                zone for zone in self.zones
+                if high >= float(zone.get("low", 0)) and low <= float(zone.get("high", 0))
+            ]
             beyond_stop = high >= self.stop if self.side == "SHORT" else low <= self.stop
-            if beyond_stop:
-                self.state, self.state_since = "invalidated", int(bar["close_time"])
-                self.closed_ms = int(bar["close_time"])
-                return True
-            if self.bars >= limit:
-                self.state, self.state_since = "expired", int(bar["close_time"])
-                self.closed_ms = int(bar["close_time"])
-                return True
-            return False
+            gapped_stop = opened >= self.stop if self.side == "SHORT" else opened <= self.stop
 
-        # active: the trade is on. The stop and target are tested against the
-        # levels the trade is *actually* carrying on this bar - a break-even move
-        # made on this bar cannot be "hit" by the very bar that made it.
+            if gapped_stop:
+                self.state, self.state_since, self.closed_ms = "invalidated", at, at
+                self.state_reason = "price opened beyond the stop before mitigation; no trade was filled"
+                return True
+
+            if touched:
+                # Price approaches a short zone from below and a long zone from
+                # above. The proximal edge is the first deterministic fill.
+                if self.side == "SHORT":
+                    selected = min(touched, key=lambda z: float(z["low"]))
+                    fill = float(selected["low"])
+                else:
+                    selected = max(touched, key=lambda z: float(z["high"]))
+                    fill = float(selected["high"])
+                if selected.get("type") == "breaker_block" and selected.get("breaker_stop") is not None:
+                    self.stop = float(selected["breaker_stop"])
+                risk = (self.stop - fill) if self.side == "SHORT" else (fill - self.stop)
+                if risk <= 0:
+                    self.state, self.state_since, self.closed_ms = "invalidated", at, at
+                    self.state_reason = "mitigation zone produced no correctly sided risk to the stop"
+                    return True
+
+                target = self.leg_target
+                reward = (
+                    fill - target if self.side == "SHORT" and target is not None
+                    else target - fill if self.side == "LONG" and target is not None
+                    else 0.0
+                )
+                if target is None or reward <= 0:
+                    self.state, self.state_since, self.closed_ms = "invalidated", at, at
+                    self.state_reason = (
+                        "confirmation-leg target was missing or not beyond the mitigation entry; "
+                        "no trade was armed"
+                    )
+                    return True
+
+                self.entry = fill
+                self.stop0 = self.stop
+                self.risk0 = risk
+                self.target = float(target)
+                self.rr = round(reward / risk, 4)
+                self.target_rr = self.rr
+                self.touched_ms = at
+                self.mitigation_zone = dict(selected)
+                self.mitigation_kind = str(selected.get("type") or selected.get("kind") or "zone")
+                self.state, self.state_since = "active", at
+                stop_note = " with buffered breaker stop" if self.mitigation_kind == "breaker_block" else ""
+                target_name = "leg low" if self.side == "SHORT" else "leg high"
+                self.state_reason = (
+                    f"mitigated at the {self.mitigation_kind}{stop_note}; "
+                    f"HVB/BOS confirmation-{target_name} target armed ({self.rr:.2f}R)"
+                )
+
+                hit_stop = high >= self.stop if self.side == "SHORT" else low <= self.stop
+                if hit_stop:
+                    self.state, self.closed_ms = "stopped", at
+                    self.state_reason = "mitigated and stopped on the same candle (conservative ordering)"
+                # Never award a target on the mitigation candle: OHLC cannot
+                # prove whether its favorable extreme occurred before or after
+                # the zone touch. A later candle must revisit the frozen H/L.
+                return True
+
+            if beyond_stop:
+                self.state, self.state_since, self.closed_ms = "invalidated", at, at
+                kinds = "/".join(sorted({str(z.get("type") or "zone") for z in self.zones}))
+                self.state_reason = f"stop was reached before {kinds or 'entry-zone'} mitigation; no trade was filled"
+                return True
+            leg_extended = self._extend_pending_leg(high, low, at)
+            if limit > 0 and self.bars >= limit:
+                self.state, self.state_since, self.closed_ms = "expired", at, at
+                self.state_reason = "the unmitigated setup exceeded its configured bar limit"
+                return True
+            return leg_extended
+
+        # Active means mitigation already happened, so stop/target now count.
         stop_level = self.stop
         hit_target = self.target is not None and (
             low <= self.target if self.side == "SHORT" else high >= self.target
         )
         hit_stop = high >= stop_level if self.side == "SHORT" else low <= stop_level
         if hit_stop:
-            # the stop had already been moved to break-even: a scratch, not a loss
             self.state = "breakeven" if self.be_ms is not None else "stopped"
-            self.state_since = int(bar["close_time"])
-            self.closed_ms = int(bar["close_time"])
-            changed = True
-        elif hit_target:
-            self.state, self.state_since = "win", int(bar["close_time"])
-            self.closed_ms = int(bar["close_time"])
-            changed = True
-        else:
-            if self.breakeven_at_r and self.be_ms is None:
-                risk = self.risk0 or abs(self.entry - self.stop)
-                reached = (low <= self.entry - self.breakeven_at_r * risk if self.side == "SHORT"
-                           else high >= self.entry + self.breakeven_at_r * risk)
-                if reached:
-                    # p.109 "move your SL to BE when the price breaks structure":
-                    # the stop goes to the entry and the R maths keeps the original risk
-                    self.be_ms = int(bar["close_time"])
-                    self.stop = self.entry
-                    changed = True
-            if self.bars >= limit:
-                # no target in reach and it has been open far too long
-                self.state, self.state_since = "expired", int(bar["close_time"])
-                self.closed_ms = int(bar["close_time"])
+            self.state_since = self.closed_ms = at
+            self.state_reason = (
+                "break-even stop reached after mitigation" if self.be_ms is not None
+                else "stop reached after mitigation"
+            )
+            return True
+        if hit_target:
+            self.state, self.state_since, self.closed_ms = "win", at, at
+            self.state_reason = "frozen HVB/BOS confirmation-leg target reached after mitigation"
+            return True
+
+        changed = False
+        if self.breakeven_at_r and self.be_ms is None:
+            risk = self.risk0 or abs(self.entry - self.stop)
+            reached = (low <= self.entry - self.breakeven_at_r * risk if self.side == "SHORT"
+                       else high >= self.entry + self.breakeven_at_r * risk)
+            if reached:
+                self.be_ms = at
+                self.stop = self.entry
+                self.state_reason = f"stop moved to break-even at {self.breakeven_at_r:g}R"
                 changed = True
+        if limit > 0 and self.bars >= limit:
+            self.state, self.state_since, self.closed_ms = "expired", at, at
+            self.state_reason = "the active setup exceeded its configured bar limit"
+            changed = True
         return changed

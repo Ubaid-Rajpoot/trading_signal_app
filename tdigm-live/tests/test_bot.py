@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot.buckets import Rollup, bucket_start  # noqa: E402
-from bot.engine import Engine  # noqa: E402
+from bot.engine import Engine, sweep_chain_errors  # noqa: E402
 from bot.indicators import break_signal, centre_of, hvb_signal, rsi, sma, stdev, tdi  # noqa: E402
 
 
@@ -227,10 +227,74 @@ def test_engine_ignores_forming_candles_for_alerts():
         forming["closed"] = False
         before = len(engine.alerts)
         await engine.on_candle(forming)
-        return before, len(engine.alerts)
+        live_chart = engine.chart("BTCUSDT", "5m", live=True)
+        audit_chart = engine.chart("BTCUSDT", "5m")
+        return before, len(engine.alerts), live_chart, audit_chart
 
-    before, after = asyncio.run(run())
+    before, after, live_chart, audit_chart = asyncio.run(run())
     assert after == before, "a forming candle must never raise an alert"
+    assert live_chart["candles"][-1]["closed"] is False
+    assert live_chart["candles"][-1]["c"] == 500.0
+    assert live_chart["live"]["enabled"] is True and live_chart["live"]["forming"] is True
+    assert all(candle["closed"] is not False for candle in audit_chart["candles"])
+
+
+def test_live_ohlc_survives_the_full_universe_cap_without_double_counting_volume():
+    engine = Engine(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        timeframes=["1m", "5m"],
+        tdi_settings={"rsi_period": 14, "band_period": 14, "fast_period": 1, "slow_period": 3},
+        filters={"trend_context": False},
+        structure={"pivot_len": 2},
+        preview_max_symbols=1,
+    )
+
+    async def run():
+        start = 1_700_000_100_000 - (1_700_000_100_000 % 300_000)
+        closed = bar(start, 100.0)
+        await engine.on_candle(closed)
+        forming = bar(start + 60_000, 101.0)
+        forming.update({"closed": False, "volume": 2.0})
+        await engine.on_candle(forming)
+        update = {**forming, "close": 102.0, "high": 103.0, "volume": 4.0}
+        await engine.on_candle(update)
+
+    asyncio.run(run())
+    one = engine.cells[("BTCUSDT", "1m")]
+    five = engine.cells[("BTCUSDT", "5m")]
+    assert one.forming["close"] == 102.0 and one.forming["volume"] == 4.0
+    assert five.forming["close"] == 102.0 and five.forming["volume"] == 5.0
+    assert one.preview is None and five.preview is None, "only indicators are capped, not live OHLC"
+
+
+def test_live_risk_reward_is_marked_from_the_actual_mitigation_entry():
+    setup = {
+        "side": "SHORT", "state": "active", "mitigated": True,
+        "entry": 100.0, "stop": 104.0, "stop0": 104.0, "risk0": 4.0,
+        "target": 90.0,
+    }
+    market = {
+        "open_time": 1_000, "close_time": 1_999, "open": 99.0,
+        "high": 99.5, "low": 97.0, "close": 98.0, "closed": False,
+    }
+    live = Engine._live_risk_reward(setup, market, True)
+    assert live["planned_rr"] == 2.5
+    assert live["current_r"] == 0.5
+    assert live["remaining_rr"] == pytest.approx(1.3333)
+    assert live["status"] == "active_live"
+
+    both = Engine._live_risk_reward(
+        setup, {**market, "high": 105.0, "low": 89.0}, True
+    )
+    assert both["status"] == "both_touched_live"
+
+    pending = Engine._live_risk_reward(
+        {**setup, "state": "pending", "mitigated": False, "target": None, "leg_target": 90.0},
+        market,
+        True,
+    )
+    assert pending["planned_rr"] == 2.5
+    assert pending["current_r"] is None and pending["status"] == "pending_unfilled"
 
 
 # --------------------------------------------------------------- structure
@@ -239,14 +303,22 @@ from bot.structure import Structure  # noqa: E402
 
 
 def series(rows, symbol="BTCUSDT"):
-    return [
+    candles = [
         bar(i * 60_000, close, high=high, low=low, symbol=symbol)
         for i, (high, low, close) in enumerate(rows)
     ]
+    for i, candle in enumerate(candles):
+        previous = rows[i - 1][2] if i else candle["close"]
+        candle["open"] = max(float(candle["low"]), min(float(candle["high"]), previous))
+    return candles
 
 
 def run_structure(rows, settings=None):
-    st = Structure(settings or {"pivot_len": 2, "sweep_max_wait": 30})
+    # Most tests below isolate pairing/approach/lifecycle behavior that predates
+    # chain-v8 rejection displacement. Tests of the live displacement invariant pass an
+    # explicit positive threshold and use the worked rejection fixture.
+    defaults = {"pivot_len": 2, "sweep_max_wait": 30, "displacement_body_atr": 0}
+    st = Structure({**defaults, **(settings or {})})
     pivots, sweeps, setups, invalid = [], [], [], []
     for i, item in enumerate(series(rows)):
         events = st.add(item)
@@ -264,13 +336,44 @@ def run_structure(rows, settings=None):
 # a swing high at 106, a swing low at 95, then the sweep of the high and the
 # break back through the low - the drawing, as numbers
 SHORT_PATTERN = [
-    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),   # high 106
-    (105, 100, 101), (101, 96, 97), (98, 95, 96),                      # low 95
-    (100, 95, 99), (103, 98, 102), (107, 101, 106),                    # high 107
-    (106, 101, 102), (102, 97, 98), (99, 95, 96),                      # low 95 again
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),   # one high 106
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),                      # paired low 95
+    (100, 96, 99), (103, 98, 102),
+    (107, 101, 106),                   # sweep exactly that one high
+    (104, 90, 91),                     # then break its paired low -> SHORT
+]
+
+# The former "valid" fixture is intentionally retained as an X regression. It
+# first takes 106, establishes another high at 107 while oscillating back to the
+# same 95 low, then takes 107 too. That is one run through multiple highs, not a
+# single clean sweep-and-release leg.
+LONG_PATTERN = [(200 - low, 200 - high, 200 - close) for high, low, close in SHORT_PATTERN]
+
+# The user's worked chart: price first forms the paired structural leg, then a
+# rejection candle wicks through liquidity while its body displaces back in the
+# eventual trade direction. A second displacement closes through the paired
+# endpoint. The long mirror is the exact screenshot geometry (low-sweep candle
+# rejects upward, then the paired high breaks upward).
+REJECTION_SHORT_PATTERN = [
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),
+    (100, 96, 99), (105.5, 98, 105),
+    (107, 99, 100),                    # wick high, bearish displacement away
+    (104, 90, 91),                     # bearish displacement through paired low
+]
+WORKED_EXAMPLE_LONG_PATTERN = [
+    (200 - low, 200 - high, 200 - close)
+    for high, low, close in REJECTION_SHORT_PATTERN
+]
+
+
+OSCILLATING_MULTI_SWEEP_PATTERN = [
+    (101, 99, 100), (102, 99, 101), (104, 100, 103), (106, 102, 105),
+    (105, 100, 101), (101, 96, 97), (98, 95, 96),
+    (100, 95, 99), (103, 98, 102), (107, 101, 106),
+    (106, 101, 102), (102, 97, 98), (99, 95, 96),
     (100, 97, 98), (101, 98, 99), (102, 99, 100), (103, 100, 101),
-    (104, 101, 102), (108, 102, 104),  # sweep the 107 high (high 108 > 107)
-    (104, 90, 91),                     # break below the 95 low -> SHORT setup
+    (104, 101, 102), (108, 102, 104), (104, 90, 91),
 ]
 
 
@@ -283,21 +386,646 @@ def test_sweep_then_opposite_break_makes_a_short_setup():
     index, setup = setups[0]
     assert setup.side == "SHORT"
     assert setup.entry == 91.0
-    assert setup.stop == 108.0, "the stop is just beyond the sweep extreme"
+    assert setup.stop == 107.0, "the stop is just beyond the sweep extreme"
     assert setup.broke.price == 95.0, "the opposite swing low is what broke"
-    assert setup.target is None, "no pre-sweep liquidity was left below the entry"
+    assert setup.target == 90.0, "SHORT targets the low of its own sweep-to-HVB/BOS leg"
+    proof = setup.as_dict()
+    assert proof["target_model"] == "hvb_bos_leg_extreme_v1"
+    assert proof["confirmation_leg"]["low"] == proof["leg_target"] == 90.0
+    assert proof["confirmation_leg"]["start_time"] == proof["sweep_time"]
+    assert proof["confirmation_leg"]["break_time"] == proof["break_time"]
+    assert proof["sweep_time"] < proof["break_time"]
+    assert proof["sweep_high"] > proof["swept_level"]
+    assert proof["sweep_low"] == 101.0
+    assert proof["swept_level"] == 106.0
+    assert proof["swept_level_time"] < proof["broke_level_time"] < proof["sweep_time"]
 
 
-def test_sweep_is_invalidated_when_price_keeps_going():
-    # sweep the 107 high and then CLOSE above it: no reversal, no setup
-    rows = SHORT_PATTERN[:19] + [(110, 103, 109)]
-    st, _, sweeps, setups, invalid = run_structure(rows)
+def test_sweep_then_opposite_break_makes_a_long_with_its_leg_high_target():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(LONG_PATTERN)
+    assert sweeps and setups
+    _index, setup = setups[0]
+    assert setup.side == "LONG" and setup.target == 110.0
+    proof = setup.as_dict()
+    assert proof["confirmation_leg"]["high"] == proof["leg_target"] == 110.0
+    assert proof["confirmation_leg"]["target_side"] == "high"
+
+
+def test_users_worked_long_example_rejects_from_the_low_then_breaks_up():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(
+        WORKED_EXAMPLE_LONG_PATTERN, {"displacement_body_atr": 1.0}
+    )
+    assert sweeps and setups, "the supplied worked example must be signal-capable"
+    setup = setups[0][1]
+    assert setup.side == "LONG"
+    proof = setup.as_dict()
+    assert proof["swept_side"] == "low"
+    assert proof["sweep_low"] < proof["swept_level"]
+    assert proof["sweep_close"] > proof["swept_level"], "the sweep rejected back above liquidity"
+    assert proof["sweep_displacement"]["direction"] == "up"
+    assert proof["break_displacement"]["direction"] == "up"
+    assert proof["sweep_displacement"]["body_atr"] >= 1.0
+    assert proof["break_displacement"]["body_atr"] >= 1.0
+    publication = {
+        "kind": "signal", "chain_version": 8, "side": "LONG",
+        "time": proof["break_time"], "hvb": "up", "hvb_lag": 0,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 45.0, "hvb_prev_centre": 50.0,
+        "hvb_fast": 55.0, "hvb_centre": 51.0,
+        "setup": proof,
+    }
+    assert sweep_chain_errors(publication) == [], (
+        "the worked low-sweep rejection must pass the publication boundary"
+    )
+
+
+def test_worked_example_rule_is_mirrored_for_a_short():
+    _st, _pivots, sweeps, setups, _invalid = run_structure(
+        REJECTION_SHORT_PATTERN, {"displacement_body_atr": 1.0}
+    )
+    assert sweeps and setups
+    proof = setups[0][1].as_dict()
+    assert proof["swept_side"] == "high"
+    assert proof["sweep_close"] < proof["swept_level"]
+    assert proof["sweep_displacement"]["direction"] == "down"
+    assert proof["break_displacement"]["direction"] == "down"
+
+
+def _mirror(rows):
+    return [(200 - low, 200 - high, 200 - close) for high, low, close in rows]
+
+
+@pytest.mark.parametrize(
+    ("rows", "weak_close"),
+    [(REJECTION_SHORT_PATTERN, 104.8), (WORKED_EXAMPLE_LONG_PATTERN, 95.2)],
+)
+def test_mirrored_setups_reject_a_liquidity_take_without_sweep_displacement(rows, weak_close):
+    weak = list(rows)
+    # Keep the wick through the level but leave only a tiny rejection body.
+    high, low, _close = weak[-2]
+    weak[-2] = (high, low, weak_close)
+    _st, _pivots, _sweeps, setups, invalid = run_structure(
+        weak, {"displacement_body_atr": 1.0}
+    )
+    assert not setups and invalid
+
+
+@pytest.mark.parametrize("rows", [REJECTION_SHORT_PATTERN, WORKED_EXAMPLE_LONG_PATTERN])
+def test_mirrored_setups_reject_a_paired_close_without_break_displacement(rows):
+    weak = list(rows)
+    # Gap across the endpoint with a flat body. It is a close-through event, but
+    # it is not the correctly directed displacement now required at the break.
+    weak[-1] = (
+        (94.0, 90.0, 94.0)
+        if rows[-1][2] < rows[-2][2]
+        else (110.0, 106.0, 106.0)
+    )
+    _st, _pivots, sweeps, setups, invalid = run_structure(
+        weak, {"displacement_body_atr": 1.0}
+    )
+    assert sweeps and not setups and invalid
+    assert "no directed break displacement" in (_st.events.get("invalid_reason") or "")
+
+
+def test_oscillation_that_takes_two_highs_before_the_break_is_invalid():
+    _st, _pivots, sweeps, setups, invalid = run_structure(OSCILLATING_MULTI_SWEEP_PATTERN)
+    assert sweeps, "the first high was genuinely swept"
+    assert invalid, "taking the next resting high must invalidate that same liquidity run"
+    assert not setups, "a later opposite break cannot rescue a multi-sweep range"
+
+
+def test_signal_integrity_requires_a_real_preceding_sweep_and_same_candle_hvb():
+    valid = {
+        "kind": "signal", "chain_version": 3,
+        "side": "SHORT", "time": 20_000, "hvb": "down", "hvb_lag": 0,
+        "setup": {
+            "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
+            "swept_count": 1,
+            "swept_levels": [{"side": "high", "price": 107.0, "time": 5_000}],
+            "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
+            "swept_level_time": 5_000, "broke_level_time": 8_000,
+            "broke_level": 95.0, "break_time": 20_000,
+        },
+    }
+    assert sweep_chain_errors(valid) == []
+
+    missing = {**valid, "setup": {**valid["setup"], "sweep_time": 0}}
+    assert any("sweep time" in reason for reason in sweep_chain_errors(missing))
+    wrong_hvb = {**valid, "hvb": "up"}
+    assert any("down HVB" in reason for reason in sweep_chain_errors(wrong_hvb))
+    fake_wick = {**valid, "setup": {**valid["setup"], "sweep_high": 106.9}}
+    assert any("did not take" in reason for reason in sweep_chain_errors(fake_wick))
+    multiple = {**valid, "setup": {**valid["setup"], "swept_count": 2}}
+    assert any("exactly one" in reason for reason in sweep_chain_errors(multiple))
+    ambiguous = {
+        **valid,
+        "setup": {**valid["setup"], "swept_levels": [
+            {"side": "high", "price": 106.0}, {"side": "high", "price": 107.0},
+        ]},
+    }
+    assert any("ambiguous" in reason for reason in sweep_chain_errors(ambiguous))
+    unrelated = {**valid, "setup": {**valid["setup"], "swept_level_time": 9_000,
+                                      "broke_level_time": 6_000}}
+    assert any("same completed leg" in reason for reason in sweep_chain_errors(unrelated))
+    unproved = {**valid, "chain_version": 2,
+                "setup": {k: v for k, v in valid["setup"].items()
+                          if k not in {"swept_level_time", "broke_level_time"}}}
+    assert any("endpoint proof" in reason for reason in sweep_chain_errors(unproved))
+
+    direct = {
+        **valid,
+        "chain_version": 5,
+        "setup": {
+            **valid["setup"],
+            "leg_model": "directional_outer_v1",
+            "approach_model": "direct_from_paired_endpoint_v1",
+            "approach_start_time": 8_000,
+            "approach_end_time": 10_000,
+            "approach_bars": 1,
+            "approach_pivot_count": 0,
+        },
+    }
+    assert sweep_chain_errors(direct) == []
+    missing_direct_count = {
+        **direct,
+        "setup": {
+            key: value for key, value in direct["setup"].items()
+            if key != "approach_pivot_count"
+        },
+    }
+    assert any("approach proof is missing" in reason
+               for reason in sweep_chain_errors(missing_direct_count))
+    null_direct_count = {
+        **direct,
+        "setup": {**direct["setup"], "approach_pivot_count": None},
+    }
+    assert any("approach proof is missing" in reason
+               for reason in sweep_chain_errors(null_direct_count))
+    oscillated = {
+        **direct,
+        "setup": {**direct["setup"], "approach_pivot_count": 1},
+    }
+    assert any("oscillated" in reason for reason in sweep_chain_errors(oscillated))
+
+    mbl_proved = {
+        **direct,
+        "chain_version": 6,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 55.0,
+        "hvb_prev_centre": 50.0,
+        "hvb_fast": 45.0,
+        "hvb_centre": 49.0,
+    }
+    assert sweep_chain_errors(mbl_proved) == []
+    same_side_spike = {
+        **mbl_proved,
+        # Purple remained below the MBL; a lower-band spike is not a new cross.
+        "hvb_prev_fast": 45.0,
+        "hvb_prev_centre": 50.0,
+        "hvb_fast": 35.0,
+        "hvb_centre": 49.0,
+    }
+    assert any("did not cross the moving centre band" in reason
+               for reason in sweep_chain_errors(same_side_spike))
+
+
+def test_chain_v8_audits_both_immutable_displacement_events():
+    _st, _pivots, _sweeps, setups, _invalid = run_structure(
+        REJECTION_SHORT_PATTERN, {"displacement_body_atr": 1.0}
+    )
+    setup = setups[0][1].as_dict()
+    current = {
+        "kind": "signal", "chain_version": 8, "side": "SHORT",
+        "time": setup["break_time"], "hvb": "down", "hvb_lag": 0,
+        "hvb_model": "mbl_centre_cross_v1",
+        "hvb_prev_fast": 55.0, "hvb_prev_centre": 50.0,
+        "hvb_fast": 45.0, "hvb_centre": 49.0,
+        "setup": setup,
+    }
+    assert sweep_chain_errors(current) == []
+
+    changed = {
+        **current,
+        "setup": {
+            **setup,
+            "break_displacement": {**setup["break_displacement"], "body_atr": 0.01},
+        },
+    }
+    assert any(
+        "break candle did not meet" in reason for reason in sweep_chain_errors(changed)
+    )
+
+    missing_sweep = {
+        **current,
+        "setup": {**setup, "sweep_displacement": None},
+    }
+    assert any(
+        "sweep displacement proof is missing" in reason
+        for reason in sweep_chain_errors(missing_sweep)
+    )
+
+
+@pytest.mark.asyncio
+async def test_publication_boundary_refuses_an_hvb_and_break_without_a_sweep():
+    engine = make_engine(hvb=True)
+    cell = engine.cells[("BTCUSDT", "5m")]
+    candle = bar(20_000, 95.0, high=100.0, low=94.0)
+    candle["timeframe"] = "5m"
+    malformed = {
+        "kind": "signal", "symbol": "BTCUSDT", "timeframe": "5m",
+        "side": "SHORT", "time": candle["close_time"], "hvb": "down", "hvb_lag": 0,
+        "setup": {"side": "SHORT", "broke_level": 96.0, "break_time": candle["close_time"]},
+    }
+    await engine._publish(cell, malformed, candle)
+    assert not engine.signals and not engine.setup_payloads
+    assert any("preceding high sweep" in reason for reason in engine.filters.rejections)
+
+
+@pytest.mark.asyncio
+async def test_publication_boundary_requires_exact_paired_leg_proof():
+    engine = make_engine(hvb=True)
+    cell = engine.cells[("BTCUSDT", "5m")]
+    candle = bar(20_000, 95.0, high=100.0, low=94.0)
+    candle["timeframe"] = "5m"
+    unproved = {
+        "kind": "signal", "symbol": "BTCUSDT", "timeframe": "5m",
+        "side": "SHORT", "time": candle["close_time"], "hvb": "down", "hvb_lag": 0,
+        "setup": {
+            "side": "SHORT", "swept_side": "high", "swept_level": 107.0,
+            "sweep_time": 10_000, "sweep_high": 108.0, "sweep_low": 102.0,
+            "broke_level": 96.0, "break_time": candle["close_time"],
+        },
+    }
+    await engine._publish(cell, unproved, candle)
+    assert not engine.signals and not engine.setup_payloads
+    assert any("paired-leg endpoint proof" in reason for reason in engine.filters.rejections)
+
+
+def test_a_candle_that_only_remains_beyond_the_level_is_not_a_body_break():
+    # The sweep candle itself closes below the opposite low.  Because the rule
+    # requires the break *subsequently*, a following candle that merely stays
+    # below 95 must not be mislabelled as the body-break candle.
+    rows = list(SHORT_PATTERN[:-1])
+    rows[-1] = (107, 90, 91)  # sweep high + close below low on this one bar
+    rows.append((94, 89, 90))
+    _st, _pivots, sweeps, setups, _invalid = run_structure(
+        rows, {"pivot_len": 2, "sweep_max_wait": 30, "displacement_body_atr": 0}
+    )
     assert sweeps and not setups
-    assert invalid, "closing beyond the sweep extreme must drop the setup"
+
+
+def test_swept_leg_survives_an_extension_and_stop_follows_the_final_extreme():
+    # The BTC reference does exactly this: price takes the paired leg high,
+    # continues higher, and only then reverses through that leg's low. Accepting
+    # above the first swept price must not make the later valid chain disappear.
+    rows = SHORT_PATTERN[:-1] + [(110, 103, 109), (109, 90, 91)]
+    _st, _, sweeps, setups, invalid = run_structure(rows)
+    assert sweeps and setups
+    assert not invalid
+    assert setups[-1][1].stop == 110.0
+
+
+def test_crossing_a_paired_high_and_newer_unpaired_high_is_multi_sweep():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    # The completed high-120 -> low-100 leg is exact, but the same candle also
+    # takes a newer resting high at 130.  One run took two highs, so no candidate
+    # may be rescued by silently ignoring the unpaired level.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 130.0, 3, 180_000),
+    ])
+    st.count = 4
+    swept = st.add(bar(240_000, 129.0, high=131.0, low=121.0))
+    assert swept["sweep"] is None
+    assert swept["invalidated"] is not None
+    assert "multiple highs" in swept["invalid_reason"]
+    broken = st.add(bar(300_000, 95.0, high=129.0, low=94.0))
+    assert broken["setup"] is None
+
+
+def test_sequential_second_high_invalidates_the_active_liquidity_run():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 130.0, 3, 180_000),
+    ])
+    st.count = 4
+    first = st.add(bar(240_000, 119.0, high=121.0, low=115.0))
+    assert first["sweep"] is not None and first["sweep"].level == 120.0
+
+    second = st.add(bar(300_000, 129.0, high=131.0, low=121.0))
+    assert second["sweep"] is None and second["invalidated"] is True
+    assert "multiple highs" in second["invalid_reason"]
+    broken = st.add(bar(360_000, 95.0, high=129.0, low=94.0))
+    assert broken["setup"] is None
+
+
+def _seed_paired_short_leg_for_approach_test():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    seed = [(110, 108, 109), (120, 110, 118), (115, 105, 107), (108, 100, 102)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("high", 120.0, 1, 119_999),
+        Level("low", 100.0, 3, 239_999),
+    ])
+    return st
+
+
+def test_cross_drawing_rejects_an_oscillating_approach_before_the_sweep():
+    st = _seed_paired_short_leg_for_approach_test()
+    # After the paired 100 low, price rises, pulls back to a visible 105 pivot,
+    # then resumes into the 120 sweep. That is the newly supplied X drawing:
+    # the approach was not one direct endpoint-to-sweep stroke.
+    rows = [
+        (105, 102, 104), (110, 106, 109), (114, 109, 113),
+        (111, 105, 107), (115, 108, 114), (118, 112, 117),
+        (121, 114, 120), (118, 95, 96),
+    ]
+    setup = None
+    rejected = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        setup = events["setup"] or setup
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None and rejected["sweep"] is not None
+    assert rejected["sweep"].approach_turns == 1
+    assert setup is None, "a later opposite break cannot rescue an indirect sweep approach"
+
+
+def test_an_indirect_run_cannot_relabel_a_later_high_as_a_fresh_sweep():
+    from bot.structure import Level
+
+    st = _seed_paired_short_leg_for_approach_test()
+    indirect = [
+        (105, 102, 104), (110, 106, 109), (114, 109, 113),
+        (111, 105, 107), (115, 108, 114), (118, 112, 117),
+        (121, 114, 120),
+    ]
+    rejected = None
+    for i, (high, low, close) in enumerate(indirect, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None
+
+    # A second high before the paired low releases is still part of that rejected
+    # run. It cannot be renamed as a clean one-level sweep and later confirmed.
+    st.levels.append(Level("high", 130.0, st.count - 1, st.times[-1]))
+    second = st.add(bar(st.count * 60_000, 129.0, high=131.0, low=118.0))
+    assert second["setup"] is None and second["invalidated"] is True
+    assert "invalid liquidity run" in second["invalid_reason"]
+    broken = st.add(bar(st.count * 60_000, 96.0, high=120.0, low=95.0))
+    assert broken["setup"] is None
+
+
+def test_tick_drawing_allows_any_path_after_a_direct_sweep_before_the_break():
+    st = _seed_paired_short_leg_for_approach_test()
+    # The paired low-to-high-sweep approach is direct. Only after sweeping 120
+    # does price oscillate; the user's middle tick explicitly permits that.
+    rows = [
+        (108, 102, 107), (115, 106, 114), (121, 112, 120),
+        (118, 108, 110), (116, 105, 114), (119, 107, 108),
+        (112, 95, 96),
+    ]
+    sweep = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["sweep"] is not None and events["sweep"].side == "high":
+            sweep = events["sweep"]
+        setup = events["setup"] or setup
+    assert sweep is not None and sweep.level == 120.0 and sweep.approach_turns == 0
+    assert setup is not None and setup.side == "SHORT"
+    proof = setup.as_dict()
+    assert proof["approach_model"] == "direct_from_paired_endpoint_v1"
+    assert proof["approach_start_time"] == proof["broke_level_time"]
+    assert proof["approach_end_time"] == proof["sweep_time"]
+    assert proof["approach_pivot_count"] == 0
+
+
+def test_direct_sweep_approach_rule_is_symmetric_for_longs():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    seed = [(92, 90, 91), (90, 80, 82), (95, 85, 93), (100, 92, 98)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("low", 80.0, 1, 119_999),
+        Level("high", 100.0, 3, 239_999),
+    ])
+    # Mirror of the invalid short approach: a visible high turn occurs before
+    # price finally sweeps the paired 80 low.
+    rows = [
+        (98, 95, 96), (94, 90, 91), (91, 86, 87),
+        (95, 89, 93), (92, 85, 86), (88, 82, 83),
+        (86, 79, 80), (105, 82, 104),
+    ]
+    rejected = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        setup = events["setup"] or setup
+        if events["invalid_reason"] and "not direct" in events["invalid_reason"]:
+            rejected = events
+    assert rejected is not None and rejected["sweep"].side == "low"
+    assert rejected["sweep"].approach_turns >= 1
+    assert setup is None
+
+
+def test_direct_sweep_and_arbitrary_post_sweep_path_are_symmetric_for_longs():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    seed = [(92, 90, 91), (90, 80, 82), (95, 85, 93), (100, 92, 98)]
+    for i, (high, low, close) in enumerate(seed):
+        st.highs.append(high)
+        st.lows.append(low)
+        st.closes.append(close)
+        st.times.append((i + 1) * 60_000 - 1)
+    st.count = 4
+    st.levels.extend([
+        Level("low", 80.0, 1, 119_999),
+        Level("high", 100.0, 3, 239_999),
+    ])
+    rows = [
+        (98, 92, 93), (92, 85, 86), (86, 79, 80),
+        (91, 82, 89), (88, 83, 84), (96, 85, 94),
+        (105, 92, 104),
+    ]
+    sweep = setup = None
+    for i, (high, low, close) in enumerate(rows, 4):
+        events = st.add(bar(i * 60_000, close, high=high, low=low))
+        if events["sweep"] is not None and events["sweep"].side == "low":
+            sweep = events["sweep"]
+        setup = events["setup"] or setup
+    assert sweep is not None and sweep.level == 80.0 and sweep.approach_turns == 0
+    assert setup is not None and setup.side == "LONG"
+    assert setup.as_dict()["approach_pivot_count"] == 0
+
+
+def test_tick_drawing_allows_one_outer_leg_with_directional_internal_structure():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    # The right-hand tick drawing: 120 -> 100 -> 115 -> 90 is one clear
+    # bearish structural leg (LH + LL internally).  The rise to 125 passes the
+    # internal 115 on its way to sweeping the one outer high at 120; 115 is not
+    # a second same-degree range high.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 90.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 121.0, high=125.0, low=116.0))
+    assert swept["invalidated"] is False
+    assert swept["sweep"] is not None and swept["sweep"].level == 120.0
+    assert swept["sweep"].opposite.price == 90.0
+
+    broken = st.add(bar(360_000, 85.0, high=121.0, low=84.0))
+    assert broken["setup"] is not None
+    proof = broken["setup"].as_dict()
+    assert proof["swept_count"] == 1 and proof["leg_model"] == "directional_outer_v1"
+    assert proof["swept_level"] == 120.0 and proof["broke_level"] == 90.0
+
+
+def test_tick_drawing_is_recognised_from_confirmed_candle_pivots():
+    rows = [
+        (111, 109, 110), (115, 110, 114), (120, 114, 119),
+        (119, 110, 112), (110, 104, 105), (105, 100, 101),
+        (108, 101, 107), (112, 106, 111), (115, 110, 114),
+        (113, 105, 106), (104, 95, 96), (96, 90, 91),
+        (100, 91, 99), (110, 99, 109), (125, 110, 121),
+        (121, 84, 85),
+    ]
+    _st, _pivots, _sweeps, setups, invalid = run_structure(rows)
+    shorts = [setup for _index, setup in setups if setup.side == "SHORT"]
+    assert not invalid and shorts
+    proof = shorts[-1].as_dict()
+    assert proof["swept_level"] == 120.0 and proof["broke_level"] == 90.0
+    assert proof["swept_count"] == 1
+
+
+def test_tick_drawing_outer_leg_is_symmetric_for_a_long():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    st.levels.extend([
+        Level("low", 80.0, 1, 60_000),
+        Level("high", 100.0, 2, 120_000),
+        Level("low", 85.0, 3, 180_000),
+        Level("high", 110.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 79.0, high=84.0, low=75.0))
+    assert swept["invalidated"] is False
+    assert swept["sweep"] is not None and swept["sweep"].level == 80.0
+    assert swept["sweep"].opposite.price == 110.0
+    broken = st.add(bar(360_000, 115.0, high=116.0, low=79.0))
+    assert broken["setup"] is not None and broken["setup"].side == "LONG"
+    assert broken["setup"].as_dict()["swept_count"] == 1
+
+
+def test_tick_drawing_can_upgrade_an_internal_sweep_to_the_outer_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 90.0, 4, 240_000),
+    ])
+    st.count = 5
+    internal = st.add(bar(300_000, 114.0, high=116.0, low=110.0))
+    assert internal["sweep"] is not None and internal["sweep"].level == 115.0
+
+    outer = st.add(bar(360_000, 122.0, high=125.0, low=114.0))
+    assert outer["invalidated"] is False
+    assert outer["sweep"] is not None and outer["sweep"].level == 120.0
+    assert outer["sweep"].opposite.price == 90.0
+    broken = st.add(bar(420_000, 85.0, high=121.0, low=84.0))
+    assert broken["setup"] is not None
+    assert broken["setup"].sweep.level == 120.0
+
+
+def test_cross_drawing_rejects_nested_oscillation_without_a_directional_leg():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    # The left-hand X drawing contracts: the second high is lower but the second
+    # low is higher. There is no clear H1 -> L2 leg that can absorb H2 as internal
+    # structure, so taking both highs is a genuine multi-sweep range.
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 115.0, 3, 180_000),
+        Level("low", 105.0, 4, 240_000),
+    ])
+    st.count = 5
+    swept = st.add(bar(300_000, 121.0, high=125.0, low=116.0))
+    assert swept["sweep"] is None and swept["invalidated"] is True
+    assert "multiple highs" in swept["invalid_reason"]
+    assert st.add(bar(360_000, 95.0, high=121.0, low=94.0))["setup"] is None
+
+
+def test_cross_drawing_rejects_several_equal_box_highs_on_one_candle():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    st.levels.extend([
+        Level("high", 120.0, 1, 60_000),
+        Level("low", 100.0, 2, 120_000),
+        Level("high", 120.0, 3, 180_000),
+        Level("low", 100.0, 4, 240_000),
+        Level("high", 120.0, 5, 300_000),
+        Level("low", 101.0, 6, 360_000),
+    ])
+    st.count = 7
+    swept = st.add(bar(420_000, 121.0, high=125.0, low=116.0))
+    assert swept["sweep"] is None and swept["invalidated"] is True
+    assert "multiple highs" in swept["invalid_reason"]
+    assert st.add(bar(480_000, 95.0, high=121.0, low=94.0))["setup"] is None
+
+
+def test_crossing_a_paired_low_and_newer_unpaired_low_is_multi_sweep():
+    from bot.structure import Level
+
+    st = Structure({"pivot_len": 2, "sweep_max_wait": 30, "level_max_age": 100, "displacement_body_atr": 0})
+    st.levels.extend([
+        Level("low", 80.0, 1, 60_000),
+        Level("high", 100.0, 2, 120_000),
+        Level("low", 70.0, 3, 180_000),
+    ])
+    st.count = 4
+    swept = st.add(bar(240_000, 71.0, high=79.0, low=69.0))
+    assert swept["sweep"] is None
+    assert swept["invalidated"] is not None
+    assert "multiple lows" in swept["invalid_reason"]
+    broken = st.add(bar(300_000, 105.0, high=106.0, low=71.0))
+    assert broken["setup"] is None
 
 
 def test_no_setup_without_the_opposite_break():
-    rows = SHORT_PATTERN[:19] + [(104, 96, 97)]  # sweeps the high, stays inside
+    rows = SHORT_PATTERN[:-1] + [(104, 96, 97)]  # after sweep, stays inside
     _, _, sweeps, setups, _ = run_structure(rows)
     assert sweeps and not setups
 
@@ -310,7 +1038,7 @@ def test_long_mirror_of_the_pattern():
     assert sweeps and setups
     assert sweeps[0][1].side == "low"
     assert setups[0][1].side == "LONG"
-    assert setups[0][1].stop == 92.0
+    assert setups[0][1].stop == 93.0
 
 
 def test_target_is_the_next_liquidity_level_beyond_the_entry():
@@ -381,10 +1109,27 @@ def test_hvb_is_required_and_counted():
     assert f.summary()["rejected"] == 1
 
 
+def test_score_mode_cannot_substitute_other_points_for_the_hvb():
+    f = Filters({"hvb": True, "confirm_mode": "score", "confirm_min_score": 0})
+    ok, reasons = f.apply(candidate(hvb=None))
+    assert not ok and any("price line did not cross" in reason for reason in reasons)
+
+
 def test_hvb_min_points_filter():
     f = Filters({"hvb": True, "hvb_min_points": 5})
     assert not f.apply(candidate(hvb_points=2.0))[0]
     assert f.apply(candidate(hvb_points=6.0))[0]
+
+
+def test_hvb_must_point_the_same_way_as_the_structure_break():
+    f = Filters({
+        "hvb": True, "hvb_min_points": 0, "hvb_min_speed": 0,
+        "trend_context": False, "require_bos": False, "structure_direction": False,
+    })
+    ok, reasons = f.apply(candidate(side="SHORT", hvb="up"))
+    assert not ok
+    assert any("direction up opposes the short" in reason for reason in reasons)
+    assert f.apply(candidate(side="SHORT", hvb="down"))[0]
 
 
 def test_min_rr_filters_small_targets():
@@ -428,7 +1173,8 @@ def test_filters_validation_ignores_junk_and_clamps(tmp_path):
     got = config_store.validate_filters(
         {"hvb": 0, "min_rr": -3, "trend": "sideways", "sides": ["long", "banana"], "nonsense": 1}
     )
-    assert got["hvb"] is False
+    assert got["hvb"] is True, "HVB cannot be disabled for sweep signals"
+    assert got["hvb_window"] == 0, "HVB must share the body-break candle"
     assert got["min_rr"] == 0.0
     assert got["trend"] == "off"
     assert got["sides"] == ["long"]
@@ -470,7 +1216,7 @@ def test_adding_and_removing_symbols_bumps_the_generation():
 def test_mexc_has_no_3m_candle_so_the_engine_must_aggregate():
     feed = MexcFeed(["BTCUSDT"])
     assert feed.exchange_interval("3m") is None
-    assert feed.exchange_interval("1h") == "60m"
+    assert feed.exchange_interval("1h") == "1h", "the feed translates to 60m inside history()"
     assert make_feed("binance", ["BTCUSDT"]).exchange_interval("1h") == "1h"
     with pytest.raises(Exception):
         make_feed("ftx", ["BTCUSDT"])
@@ -510,9 +1256,7 @@ def make_engine(**filters):
 
 
 def market_rows():
-    """A monotone rise (no swing points at all, so the fixture is unambiguous)
-    followed by the pattern. Rows are 5 minutes apart, so each row IS one 5m
-    candle; a candle only closes when the next one opens, hence the last row."""
+    """A monotone rise followed by the structure fixture, but no final HVB."""
     rows = []
     for i in range(160):
         base = 90 + i * 0.06
@@ -520,23 +1264,68 @@ def market_rows():
     return rows + SHORT_PATTERN + [(95, 93, 94)]
 
 
+def hvb_market_rows():
+    """The same setup with a genuine MBL cross on its body-break candle."""
+    prefix = []
+    for i in range(180):
+        close = 98 + (i % 10) * 0.15 - (i % 3) * 0.03
+        prefix.append((close + 0.3, close - 0.3, close))
+    return prefix + SHORT_PATTERN + [(95, 93, 94)]
+
+
 async def push_5m(engine, rows):
     for i, (high, low, close) in enumerate(rows):
-        await engine.on_candle(bar(1_735_689_600_000 + i * 300_000, close, high=high, low=low))
+        candle = bar(1_735_689_600_000 + i * 300_000, close, high=high, low=low)
+        previous = rows[i - 1][2] if i else close
+        candle["open"] = max(float(low), min(float(high), float(previous)))
+        if (high, low, close) == (107, 101, 106):
+            # Keep the close sequence that makes the same-candle MBL cross, but
+            # give the sweep a real default-threshold bearish rejection body.
+            candle["open"] = 112.0
+            candle["high"] = 113.0
+        await engine.on_candle(candle)
 
 
 @pytest.mark.asyncio
 async def test_engine_emits_a_signal_for_the_complete_setup():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
-    assert signals, "the sweep + opposite break is a complete setup"
+    assert signals, "the sweep + opposite break + same-candle MBL cross is complete"
     alert = signals[-1]
     assert alert["side"] == "SHORT"
     assert alert["structure"] is True
-    assert alert["setup"]["stop"] == 108.0, "the stop sits just beyond the swept high"
+    assert alert["chain_version"] == 8
+    assert alert["approach_model"] == "direct_from_paired_endpoint_v1"
+    assert alert["approach_pivot_count"] == 0
+    assert alert["hvb_model"] == "mbl_centre_cross_v1"
+    assert alert["hvb_prev_fast"] >= alert["hvb_prev_centre"]
+    assert alert["hvb_fast"] < alert["hvb_centre"]
+    assert alert["setup"]["leg_model"] == "directional_outer_v1"
+    assert alert["setup"]["stop"] == 113.0, "the stop sits just beyond the swept high"
     assert alert["setup"]["entry"] < alert["setup"]["stop"]
     assert alert["filtered"] == []
+
+
+@pytest.mark.asyncio
+async def test_production_tdigm_settings_confirm_the_break_on_the_same_candle():
+    # A neutral, moving RSI baseline followed by the trader's sweep/body-break
+    # fixture. The final drop crosses the MBL down with speed on exactly the
+    # candle that closes below the opposite low.
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
+    signals = [row for row in engine.setup_payloads.values() if row["side"] == "SHORT"]
+    assert signals
+    signal = signals[-1]
+    assert signal["hvb_side"] == "down"
+    assert signal["hvb_ms"] == signal["created_ms"]
+    assert signal["bos_ms"] <= signal["created_ms"]
 
 
 @pytest.mark.asyncio
@@ -576,31 +1365,31 @@ async def test_adding_a_symbol_builds_its_cells():
 
 
 # ------------------------------------------------- the centre band of the HVB
-def test_hvb_centre_defaults_to_the_middle_of_the_bands():
+def test_hvb_centre_is_only_the_moving_middle_band():
     closes = [100 + (i % 11) * 0.4 for i in range(400)]
     points = tdi(closes, 50, 50, 1, 9, 1.6185)
     last = points[-1]
     assert last.mbl == pytest.approx((last.upper + last.lower) / 2)
-    assert centre_of(last, "mbl") == last.mbl
-    assert centre_of(last, "fifty") == 50.0
+    assert centre_of(last) == last.mbl
 
 
-def test_hvb_fifty_reference_crosses_the_50_line():
-    closes = [100 + (i % 7) * 1.5 for i in range(400)]  # swings well either side of 50
-    points = tdi(closes, 50, 50, 1, 9, 1.6185)
-    fifty = [i for i in range(1, len(points)) if hvb_signal(points, i, 0, "fifty")]
-    mbl = [i for i in range(1, len(points)) if hvb_signal(points, i, 0, "mbl")]
-    assert fifty, "the price line must cross 50 in this series"
-    for i in fifty:
-        assert (points[i - 1].fast - 50) * (points[i].fast - 50) <= 0
-    assert fifty != mbl, "different centre lines give different crosses"
+def test_crossing_the_fixed_fifty_axis_without_crossing_the_mbl_is_not_hvb():
+    from bot.indicators import TdiPoint
+
+    # Purple crosses RSI 50 here, but it stays above the moving black MBL on
+    # both candles. The removed fixed-axis mode must never call this an HVB.
+    points = [
+        TdiPoint(fast=49, slow=48, mbl=45, upper=55, lower=35),
+        TdiPoint(fast=51, slow=49, mbl=46, upper=56, lower=36),
+    ]
+    assert hvb_signal(points, 1) is None
 
 
 def test_the_aggressive_break_threshold_rejects_grazes():
     closes = [100 + (i % 13) * 0.2 for i in range(600)]
     points = tdi(closes, 50, 50, 1, 9, 1.6185)
-    loose = [i for i in range(1, len(points)) if hvb_signal(points, i, 0.0, "mbl")]
-    strict = [i for i in range(1, len(points)) if hvb_signal(points, i, 1.0, "mbl")]
+    loose = [i for i in range(1, len(points)) if hvb_signal(points, i, min_points=0.0)]
+    strict = [i for i in range(1, len(points)) if hvb_signal(points, i, min_points=1.0)]
     assert loose and strict
     assert set(strict) < set(loose), "a threshold can only remove events"
     for i in strict:
@@ -609,24 +1398,77 @@ def test_the_aggressive_break_threshold_rejects_grazes():
 
 @pytest.mark.asyncio
 async def test_signal_carries_the_centre_band_and_a_chart_tail():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        regime=False, structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     alert = signals[-1]
-    assert alert["centre_reference"] in {"mbl", "fifty"}
+    assert alert["centre_reference"] == "mbl"
     assert alert["centre"] is not None
     assert len(alert["tdi_tail"]) >= 5
     assert all(len(pair) == 2 for pair in alert["tdi_tail"])
 
 
 @pytest.mark.asyncio
-async def test_switching_the_centre_reference_is_live():
+async def test_old_signal_chart_is_fetched_around_the_setup_not_around_today():
+    focus = 1_769_644_800_000  # 2026-01-29 UTC
+    step = 86_400_000
+
+    class HistoricalFeed:
+        def __init__(self):
+            self.end_time = None
+
+        def exchange_interval(self, timeframe):
+            return timeframe
+
+        async def history(self, symbol, interval, limit=500, end_time=None):
+            self.end_time = end_time
+            start = end_time - limit * step
+            return [
+                {
+                    "symbol": symbol, "open_time": start + i * step,
+                    "close_time": start + (i + 1) * step - 1,
+                    "open": 2.0, "high": 2.1, "low": 1.9, "close": 2.0,
+                    "volume": 10.0, "closed": True,
+                }
+                for i in range(limit)
+            ]
+
+    engine = Engine(
+        symbols=["XRPUSDT"], timeframes=["1d"],
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={}, structure={"pivot_len": 5}, strategy="sweep",
+    )
+    feed = HistoricalFeed()
+    candles = await engine.chart_history(feed, "XRPUSDT", "1d", bars=600, at=focus)
+    assert len(candles) == 600
+    assert feed.end_time > focus, "the window leaves post-signal context"
+    assert candles[0]["close_time"] < focus < candles[-1]["close_time"]
+
+    selected = {
+        "key": f"XRPUSDT|1d|{focus}", "symbol": "XRPUSDT", "timeframe": "1d",
+        "side": "SHORT", "created_ms": focus, "hvb_side": "down", "hvb_ms": focus,
+        "hvb_lag": 0, "swept_side": "high", "swept_level": 2.05,
+        "sweep_ms": focus - 3 * step, "bos_level": 1.95,
+        "setup": {"side": "SHORT", "swept_side": "high", "swept_level": 2.05,
+                  "sweep_time": focus - 3 * step, "sweep_high": 2.1,
+                  "broke_level": 1.95, "break_time": focus},
+    }
+    body = engine.chart("XRPUSDT", "1d", 600, candles_override=candles, selected=selected)
+    assert body["selected"]["chain_valid"] is True
+    assert 0 < body["focus_index"] < len(body["candles"]) - 1
+
+
+@pytest.mark.asyncio
+async def test_hvb_centre_cannot_be_switched_away_from_the_mbl():
     engine = make_engine(hvb=False)
     await push_5m(engine, market_rows())
-    assert engine.set_centre("fifty") == "fifty"
-    assert engine.centre_reference == "fifty"
-    assert engine.tdi_settings["hvb_reference"] == "fifty"
+    assert engine.set_centre("fifty") == "mbl"
+    assert engine.centre_reference == "mbl"
+    assert engine.tdi_settings["hvb_reference"] == "mbl"
     assert engine.set_centre("nonsense") == "mbl"
 
 
@@ -701,12 +1543,15 @@ def test_hvb_never_fires_on_an_outer_band_touch():
     def point(fast, centre, mult=1.0):
         return TdiPoint(fast=fast, slow=fast, mbl=centre, upper=centre + mult, lower=centre - mult)
 
-    # price line leaves the upper band and comes back to it, never touching the centre
-    points = [point(62, 50), point(61.5, 50), point(61, 50), point(61.9, 50)]
-    assert [hvb_signal(points, i) for i in range(1, len(points))] == [None, None, None]
-    # and the centre cross still fires on the same shape
-    points = [point(48, 50), point(51, 50)]
+    # Exact shape in the supplied screenshot: purple is already above the black
+    # MBL, then spikes from inside to beyond the upper blue band. That outer-band
+    # cross is not an HVB because no centre crossing happened on this candle.
+    points = [point(55, 50, 10), point(64, 50, 10), point(56, 50, 10)]
+    assert [hvb_signal(points, i) for i in range(1, len(points))] == [None, None]
+    # and the actual centre cross still fires on the crossing candle only
+    points = [point(48, 50), point(51, 50), point(64, 50, 10)]
     assert hvb_signal(points, 1) == "up"
+    assert hvb_signal(points, 2) is None
 
 
 def test_hvb_needs_speed_when_the_speed_gate_is_on():
@@ -717,15 +1562,18 @@ def test_hvb_needs_speed_when_the_speed_gate_is_on():
     points.append(TdiPoint(52.0, 50, 50, 54, 48))
     speed = line_speed(points, len(points) - 1)
     assert speed and speed > 5
-    assert hvb_signal(points, len(points) - 1, 0, "mbl", min_speed=2.0) == "up"
+    assert hvb_signal(points, len(points) - 1, min_points=0, min_speed=2.0) == "up"
     quiet = [TdiPoint(49.9, 50, 50, 52, 48), TdiPoint(50.05, 50, 50, 52, 48)]
-    assert hvb_signal(quiet, 1, 0, "mbl", min_speed=2.0) is None
+    assert hvb_signal(quiet, 1, min_points=0, min_speed=2.0) is None
 
 
 @pytest.mark.asyncio
 async def test_engine_publishes_regime_with_every_signal():
-    engine = make_engine(hvb=False)
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     for alert in signals:
@@ -838,7 +1686,9 @@ def test_book_gates_reject_and_explain():
     cand = candidate(book=book)
 
     assert not Filters({"structure_direction": True}).apply(cand)[0]          # against structure
-    assert Filters({"structure_direction": True}).apply(candidate(book={**book, "external_trend": 1}))[0] is False
+    assert Filters({"structure_direction": True}).apply(
+        candidate(book={**book, "external_trend": 1})
+    )[0] is True  # unrelated book gates are optional unless explicitly enabled
     open_filters = {"structure_direction": False, "premium_discount": False,
                     "block_liquidity_pool": False, "require_fvg": False, "require_ms": False}
     assert Filters(open_filters).apply(candidate(book={**book, "external_trend": -1}))[0] is True
@@ -861,8 +1711,11 @@ def test_book_gates_reject_and_explain():
 
 @pytest.mark.asyncio
 async def test_every_signal_carries_the_book_labels():
-    engine = make_engine(hvb=False, filters={"structure_direction": False, "block_liquidity_pool": False})
-    await push_5m(engine, market_rows())
+    engine = make_engine(
+        hvb=True, hvb_window=0, hvb_min_points=1.0, hvb_min_speed=1.5,
+        structure_direction=False, block_liquidity_pool=False,
+    )
+    await push_5m(engine, hvb_market_rows())
     signals = [a for a in engine.alerts if a["kind"] == "signal"]
     assert signals
     book = signals[-1]["book"]

@@ -36,6 +36,14 @@ try {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(predicate, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(50);
+  }
+  return false;
+}
 
 async function main() {
   let probe;
@@ -51,11 +59,15 @@ async function main() {
   const dom = new JSDOM(html, { url: BASE + "/", pretendToBeVisual: true, runScripts: "outside-only" });
   const { window } = dom;
   const doc = window.document;
+  // A reload must restore the operator's view rather than silently resetting it.
+  window.localStorage.setItem("tdigm.ui.preferences.v2", JSON.stringify({
+    filters: { search: "", side: "both", state: "all", sort: "symbol", tfs: [], grades: [], sessions: [] },
+  }));
 
   // jsdom has no canvas; the page must survive a chart it cannot draw
   window.HTMLCanvasElement.prototype.getContext = () => ({
     setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
-    fill() {}, fillRect() {}, arc() {}, closePath() {}, setLineDash() {}, fillText() {},
+    fill() {}, fillRect() {}, strokeRect() {}, arc() {}, closePath() {}, setLineDash() {}, fillText() {},
     save() {}, restore() {}, measureText: () => ({ width: 10 }),
     set font(v) {}, set fillStyle(v) {}, set strokeStyle(v) {}, set lineWidth(v) {},
     set textBaseline(v) {},
@@ -69,18 +81,85 @@ async function main() {
     send() {}
     close() { this.readyState = 3; if (this.onclose) this.onclose(); }
   };
+  // Use the real archive/state endpoints, but make the live chart deterministic:
+  // two consecutive exchange-style forming updates move both the last candle and
+  // mark-to-market R without ever declaring that candle closed.
+  let liveChartRequests = 0;
   window.fetch = async (url) => {
-    const res = await fetch(BASE + url);
+    const request = String(url);
+    if (request.includes("/api/chart?") && request.includes("live=1")) {
+      liveChartRequests += 1;
+      const moved = liveChartRequests > 1;
+      const start = 1_735_690_800_000;
+      const candles = Array.from({ length: 20 }, (_, i) => ({
+        t: start + i * 300_000, ct: start + (i + 1) * 300_000 - 1,
+        o: 100 - i * 0.05, h: 100.5 - i * 0.05,
+        l: 99.4 - i * 0.05, c: 100 - (i + 1) * 0.05,
+        v: 10, closed: true,
+      }));
+      candles.push({
+        t: start + 20 * 300_000, ct: start + 21 * 300_000 - 1,
+        o: 99, h: 99.5, l: moved ? 96.5 : 97,
+        c: moved ? 97 : 98, v: moved ? 6 : 4, closed: false,
+      });
+      return {
+        ok: true,
+        json: async () => ({
+          symbol: "BTCUSDT", timeframe: "5m", historical_window: false,
+          candles, structure: [], tdi: [], selected: null,
+          live: {
+            enabled: true, forming: true, price: moved ? 97 : 98, age_ms: 100,
+            planned_rr: 2.5, current_r: moved ? 0.75 : 0.5,
+            remaining_rr: moved ? 1 : 1.3333, status: "active_live",
+          },
+        }),
+      };
+    }
+    const res = await fetch(BASE + request);
     return { ok: res.ok, json: async () => res.json() };
   };
 
   window.eval(read("notify.js"));
+  window.eval(read("state.js"));
   window.eval(read("app.js"));
 
-  await sleep(1500);
+  await waitFor(() => doc.querySelectorAll("#rows tr").length > 0
+    && doc.getElementById("story").textContent.includes("moving centre crossed on this candle"));
 
   const rows = doc.querySelectorAll("#rows tr").length;
   if (!rows) throw new Error("the table is empty after boot - the archive never reached the page");
+  const story = doc.getElementById("story").textContent;
+  if (!story.includes("moving centre crossed on this candle")) {
+    throw new Error("the selected signal does not display its four-value MBL-cross proof: " + story.slice(0, 300));
+  }
+  if (story.includes("NON-CURRENT POLICY")) {
+    throw new Error("the chain-v8/lifecycle-v7 archive was incorrectly labelled non-current");
+  }
+  if (doc.getElementById("sort-select").value !== "symbol") {
+    throw new Error("saved page settings were reset during reload");
+  }
+  const sort = doc.getElementById("sort-select");
+  sort.value = "rr";
+  sort.dispatchEvent(new window.Event("change", { bubbles: true }));
+  const savedPrefs = JSON.parse(window.localStorage.getItem("tdigm.ui.preferences.v2") || "{}");
+  if (!savedPrefs.filters || savedPrefs.filters.sort !== "rr") {
+    throw new Error("a changed page setting was not persisted");
+  }
+
+  // Exercise the actual LIVE button and its one-second refresh loop. The second
+  // mocked forming-kline update moves from 98 to 97, so every displayed risk
+  // metric must move with it while the state still says LIVE CANDLE.
+  doc.getElementById("btn-chart-live").click();
+  await sleep(1200);
+  if (liveChartRequests < 2) throw new Error("the live chart did not poll for a moving forming candle");
+  if (!doc.getElementById("chart-live-state").textContent.includes("LIVE CANDLE")) {
+    throw new Error("the forming exchange candle is not labelled live");
+  }
+  if (doc.getElementById("chart-plan-rr").textContent !== "1:2.50"
+      || doc.getElementById("chart-current-r").textContent !== "+0.75R"
+      || doc.getElementById("chart-remaining-rr").textContent !== "1:1.00") {
+    throw new Error("planned, mark-to-market, or remaining live R:R did not follow price");
+  }
 
   const ws = sockets[sockets.length - 1];
   const snapshot = await (await fetch(BASE + "/api/state")).json();
@@ -97,7 +176,7 @@ async function main() {
         toast: true,
         event: {
           key: `burst-${i}`, title: `LONG SYM${i}USDT 15m`, severity: "action",
-          category: "signal", grade: "A", detail: "entry 1 · draw 2 · 1:4.0",
+          category: "signal", grade: "A", detail: "entry 1 · confirmation-leg target 2 · 1.7R",
           time: Date.now(), count: 1,
         },
       }),

@@ -7,7 +7,7 @@ a folder of real CSV files. Nothing here can produce a signal the live bot would
 not produce.
 
     python tools/scan_history.py data/btc --symbol BTCUSDT --timeframes 5m,15m,30m,1h
-    python tools/scan_history.py data/btc --symbol BTCUSDT --no-hvb --min-rr 1.5
+    python tools/scan_history.py data/btc --symbol BTCUSDT --hvb-points 1.5
 """
 
 from __future__ import annotations
@@ -65,13 +65,15 @@ async def main() -> int:
     ap.add_argument("--timeframes", default="5m,15m,30m,1h")
     ap.add_argument("--pivot-len", type=int, default=5)
     ap.add_argument("--sweep-max-wait", type=int, default=60)
+    ap.add_argument("--displacement-atr-period", type=int, default=14,
+                    help="prior closed bars used by both displacement proofs")
+    ap.add_argument("--displacement-body-atr", type=float, default=1.0,
+                    help="minimum directed real body / prior ATR on both events")
     ap.add_argument("--min-rr", type=float, default=0.0)
     ap.add_argument("--max-bars", type=int, default=0)
     ap.add_argument("--trend", default="off")
     ap.add_argument("--target", default="next", choices=["next", "range"])
-    ap.add_argument("--no-hvb", action="store_true")
-    ap.add_argument("--hvb-points", type=float, default=1.0, help="how far the price line must break the centre band, in RSI points")
-    ap.add_argument("--centre", default="mbl", choices=["mbl", "fifty"], help="which line is the centre band")
+    ap.add_argument("--hvb-points", type=float, default=1.0, help="how far the price line must break the moving centre band, in RSI points")
     ap.add_argument("--hvb-speed", type=float, default=1.5,
                     help="this candle's step must be this many times the price line's average step")
     ap.add_argument("--no-regime", action="store_true", help="switch the ADX/ER trend gate off")
@@ -86,8 +88,16 @@ async def main() -> int:
                     help="how many bars back a break of structure still counts (0 = forever)")
     ap.add_argument("--max-depth", type=int, default=2,
                     help="1 = external only, 2 = one level of internal (default), 3+ allows nesting")
-    ap.add_argument("--hvb-window", type=int, default=3,
-                    help="the HVB may print on the break candle or up to N bars after it")
+    ap.add_argument("--no-clear-structure", dest="clear_structure", action="store_false",
+                    help="research only: allow one recent HH/HL pair without wider left context")
+    ap.add_argument("--trend-steps", type=int, default=2,
+                    help="consecutive high and low swing steps required at major/macro degree")
+    ap.add_argument("--directional-ratio", type=float, default=1.0,
+                    help="fraction of recent structural steps that must agree")
+    ap.add_argument("--fresh-shift-bars", type=int, default=20,
+                    help="bars for a major close beyond the remembered range edge to establish direction")
+    ap.add_argument("--hvb-window", type=int, default=0,
+                    help="0 = shipped same-candle HVB; larger windows are research only")
     ap.add_argument("--volume-break", action="store_true",
                     help="the signal candle must be a high-volume bar")
     ap.add_argument("--volume-mult", type=float, default=1.5, help="how many x the average volume")
@@ -96,8 +106,8 @@ async def main() -> int:
                     help="all = every condition must hold; score = weighted confluence >= --confirm-min")
     ap.add_argument("--confirm-min", type=float, default=60.0, help="the confluence score needed")
     ap.add_argument("--macro-len", type=int, default=80, help="bars each side of the macro swing")
-    ap.add_argument("--adx-min", type=float, default=20.0, help="ADX(14) needed for a trending market")
-    ap.add_argument("--er-min", type=float, default=0.10, help="efficiency ratio (50) needed for a trending market")
+    ap.add_argument("--adx-min", type=float, default=22.0, help="ADX(14) needed for a trending market")
+    ap.add_argument("--er-min", type=float, default=0.30, help="efficiency ratio (50) needed for a trending market")
     ap.add_argument("--regime-dir", default="any", choices=["any", "with"], help="also demand the EMA direction")
     ap.add_argument("--horizon", type=int, default=300, help="bars to look ahead when scoring a signal")
     ap.add_argument("--score-target", default="structure", choices=["structure", "fixed"],
@@ -143,10 +153,10 @@ async def main() -> int:
         symbols=[args.symbol],
         timeframes=args.timeframes.split(","),
         tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9,
-                      "band_mult": 1.6185, "hvb_reference": args.centre},
+                      "band_mult": 1.6185, "hvb_reference": "mbl"},
         filters={
             "structure": not args.no_structure,
-            "hvb": not args.no_hvb,
+            "hvb": True,
             "hvb_min_points": args.hvb_points,
             "hvb_window": args.hvb_window,
             "break": bool(args.require_break),
@@ -170,6 +180,10 @@ async def main() -> int:
             "structure_atr_max": args.structure_atr_max,
             "trend_context": args.trend_context,
             "require_hh_hl": args.require_hh_hl,
+            "clear_structure": args.clear_structure,
+            "min_trend_steps": args.trend_steps,
+            "min_directional_ratio": args.directional_ratio,
+            "fresh_shift_max_bars": args.fresh_shift_bars,
             "require_bos": args.require_bos,
             "bos_max_age": args.bos_age,
             "max_internal_depth": args.max_depth,
@@ -181,7 +195,9 @@ async def main() -> int:
         },
         structure={"pivot_len": args.pivot_len, "major_len": args.major_len,
                    "macro_len": args.macro_len,
-                   "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target},
+                   "sweep_max_wait": args.sweep_max_wait, "target_mode": args.target,
+                   "displacement_atr_period": args.displacement_atr_period,
+                   "displacement_body_atr": args.displacement_body_atr},
     )
 
     signals: dict[str, list[dict]] = defaultdict(list)
@@ -193,9 +209,12 @@ async def main() -> int:
         signals[alert["timeframe"]].append(alert)
 
     days = (candles[-1]["close_time"] - candles[0]["open_time"]) / 86_400_000
-    print(f"{args.symbol}: {len(candles)} 1m bars, {days:.0f} days, timeframes {list(signals)}")
+    print(f"{args.symbol}: {len(candles)} 1m bars, {days:.0f} days, timeframes {engine.timeframes}")
     print(f"filters: {engine.filters.config}")
-    print(f"structure: pivot_len={args.pivot_len} sweep_max_wait={args.sweep_max_wait}")
+    print(
+        f"structure: pivot_len={args.pivot_len} sweep_max_wait={args.sweep_max_wait} "
+        f"displacement={args.displacement_body_atr:g} prior-ATR/{args.displacement_atr_period}"
+    )
     print()
     total = 0
     for tf in engine.timeframes:
@@ -220,8 +239,23 @@ async def main() -> int:
               f"long {sides.get('LONG', 0)} short {sides.get('SHORT', 0)}  "
               f"hvb {hvb}  median RR {sorted(rrs)[len(rrs) // 2] if rrs else '-'}")
     print(f"\ntotal {total} signals over {days:.0f} days = {total / max(days, 1):.2f}/day")
-    summary = engine.filters.summary()
-    print(f"filtered out: {summary['rejected']}  ({summary['reasons']})")
+    funnel = engine.decision_funnel()
+    print(
+        "decision funnel: "
+        f"{funnel['setups']} completed setups -> {funnel['hvb_aligned']} same-candle HVBs -> "
+        f"{funnel['filtered']} filtered + {funnel['passed']} passed"
+    )
+    print(f"first decisive blockers (one/setup): {funnel['first_rejections']}")
+    print(f"overlapping rejection hits: {funnel['rejection_hits']}")
+    for timeframe, row in funnel["by_timeframe"].items():
+        if not row["setups"]:
+            continue
+        print(
+            f"  {timeframe}: {row['setups']} setups, {row['hvb_aligned']} HVB-aligned, "
+            f"{row['filtered']} filtered, {row['passed']} passed; "
+            f"first blockers {row['first_rejections']}"
+        )
+    print(f"top blocker combinations: {funnel['rejection_combinations']}")
     print(f"other events: {engine.kinds}")
 
     if args.json:

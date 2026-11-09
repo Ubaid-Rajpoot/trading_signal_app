@@ -51,8 +51,10 @@ def make_engine(config: dict) -> Engine:
         filters=config.get("filters"),
         structure=config.get("structure"),
         preview_max_symbols=int(config.get("preview_max_symbols", 200)),
-        strategy=config.get("strategy", "book"),
+        strategy=config.get("strategy", "sweep"),
         book=config.get("book"),
+        history_bars=int(config.get("history_bars", 5000)),
+        history_days=float(config.get("history_days", 30)),
     )
 
 

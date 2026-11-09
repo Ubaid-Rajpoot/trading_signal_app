@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS signals (
     stop         REAL,
     target       REAL,
     target_2r    REAL,
+    target_rr    REAL,
+    target_rr_price REAL,
+    target_model TEXT,
+    leg_target   REAL,
+    leg_target_ms INTEGER,
+    leg_start_ms INTEGER,
+    leg_break_ms INTEGER,
     rr           REAL,
     r_now        REAL,
     score        REAL,
@@ -70,6 +77,10 @@ CREATE TABLE IF NOT EXISTS signals (
     state_since  INTEGER,
     touched_ms   INTEGER,
     closed_ms    INTEGER,
+    chain_version INTEGER NOT NULL DEFAULT 1,
+    lifecycle_version INTEGER NOT NULL DEFAULT 1,
+    mitigation_kind TEXT,
+    state_reason TEXT,
     bars         INTEGER DEFAULT 0,
     evidence     TEXT,
     payload      TEXT,
@@ -90,10 +101,24 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("mitigated", "ALTER TABLE signals ADD COLUMN mitigated INTEGER NOT NULL DEFAULT 0"),
     ("market", "ALTER TABLE signals ADD COLUMN market TEXT NOT NULL DEFAULT 'futures'"),
     ("session", "ALTER TABLE signals ADD COLUMN session TEXT"),
+    ("target_rr", "ALTER TABLE signals ADD COLUMN target_rr REAL"),
+    ("target_rr_price", "ALTER TABLE signals ADD COLUMN target_rr_price REAL"),
+    ("target_model", "ALTER TABLE signals ADD COLUMN target_model TEXT"),
+    ("leg_target", "ALTER TABLE signals ADD COLUMN leg_target REAL"),
+    ("leg_target_ms", "ALTER TABLE signals ADD COLUMN leg_target_ms INTEGER"),
+    ("leg_start_ms", "ALTER TABLE signals ADD COLUMN leg_start_ms INTEGER"),
+    ("leg_break_ms", "ALTER TABLE signals ADD COLUMN leg_break_ms INTEGER"),
+    ("chain_version", "ALTER TABLE signals ADD COLUMN chain_version INTEGER NOT NULL DEFAULT 1"),
+    ("lifecycle_version", "ALTER TABLE signals ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1"),
+    ("mitigation_kind", "ALTER TABLE signals ADD COLUMN mitigation_kind TEXT"),
+    ("state_reason", "ALTER TABLE signals ADD COLUMN state_reason TEXT"),
 )
 
 # a decided outcome is final - these are never overwritten by a later "live" push
 FINAL_STATES = ("win", "stopped", "breakeven")
+CURRENT_CHAIN_VERSION = 8
+CURRENT_LIFECYCLE_VERSION = 7
+CURRENT_TARGET_MODEL = "hvb_bos_leg_extreme_v1"
 
 
 def _num(value: Any) -> float | None:
@@ -132,6 +157,13 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "stop": _num(payload.get("stop")),
         "target": _num(payload.get("target")),
         "target_2r": _num(payload.get("target_2r")),
+        "target_rr": _num(payload.get("target_rr")),
+        "target_rr_price": _num(payload.get("target_rr_price")),
+        "target_model": payload.get("target_model"),
+        "leg_target": _num(payload.get("leg_target")),
+        "leg_target_ms": _int(payload.get("leg_target_ms")),
+        "leg_start_ms": _int(payload.get("leg_start_ms")),
+        "leg_break_ms": _int(payload.get("leg_break_ms")),
         "rr": _num(payload.get("rr")),
         "r_now": _num(payload.get("r_now")),
         "score": _num(payload.get("score")),
@@ -150,6 +182,10 @@ def row_of(payload: dict, market: str = "futures") -> dict[str, Any]:
         "state_since": _int(payload.get("state_since")),
         "touched_ms": _int(payload.get("touched_ms")),
         "closed_ms": _int(payload.get("closed_ms")),
+        "chain_version": _int(payload.get("chain_version")) or 1,
+        "lifecycle_version": _int(payload.get("lifecycle_version")) or 1,
+        "mitigation_kind": payload.get("mitigation_kind"),
+        "state_reason": payload.get("state_reason"),
         "bars": _int(payload.get("bars")) or 0,
         "evidence": json.dumps(payload.get("reasons") or [], ensure_ascii=False),
         "payload": json.dumps(payload, ensure_ascii=False, default=str),
@@ -205,7 +241,7 @@ class SignalStore:
             assert self._db is not None
             try:
                 existing = self._db.execute(
-                    "SELECT state, closed_ms FROM signals WHERE key = ?", (row["key"],)
+                    "SELECT state, closed_ms, lifecycle_version, payload FROM signals WHERE key = ?", (row["key"],)
                 ).fetchone()
                 if existing is None:
                     cols = ", ".join(COLUMNS)
@@ -219,15 +255,46 @@ class SignalStore:
                     # a decided outcome is final: a re-scan replaying the same
                     # setup must not turn "win" back into "pending"
                     final = existing["state"] in FINAL_STATES
+                    lifecycle_upgrade = int(row.get("lifecycle_version") or 1) > int(
+                        existing["lifecycle_version"] or 1
+                    )
                     updates = {
                         k: v
                         for k, v in row.items()
                         if k not in ("first_seen", "created_ms")
                     }
-                    if final:
-                        # keep the row exactly as it was decided - including the
-                        # JSON the page reads back
-                        for key in ("state", "valid", "closed_ms", "r_now", "target", "stop", "payload"):
+                    if final and not lifecycle_upgrade:
+                        # The outcome is write-once within one lifecycle rule, but
+                        # a version upgrade deliberately replays and re-scores it.
+                        # A deeper re-scan may
+                        # correct immutable structural evidence (for example the
+                        # swept endpoint of the paired leg). Merge that evidence
+                        # into JSON while retaining the decided lifecycle.
+                        try:
+                            old_payload = json.loads(existing["payload"] or "{}")
+                            new_payload = json.loads(row["payload"] or "{}")
+                        except json.JSONDecodeError:
+                            old_payload, new_payload = {}, {}
+                        for key in (
+                            "state", "display_state", "valid", "mitigated", "closed_ms", "state_since",
+                            "touched_ms", "bars", "r_now", "last_price", "be_ms",
+                            "entry", "stop", "stop0", "risk0", "target", "target_2r",
+                            "target_rr", "target_rr_price", "target_model", "leg_target",
+                            "leg_target_ms", "leg_start_ms", "leg_break_ms", "rr", "zone", "zones",
+                            "mitigation_kind", "mitigation_zone", "state_reason",
+                            "breakeven_at_r", "chain_valid", "chain_errors",
+                            "integrity_checked_ms", "invalid_reason",
+                        ):
+                            if key in old_payload:
+                                new_payload[key] = old_payload[key]
+                        updates["payload"] = json.dumps(new_payload, ensure_ascii=False, default=str)
+                        for key in (
+                            "state", "valid", "mitigated", "closed_ms", "state_since",
+                            "touched_ms", "bars", "r_now", "entry", "target", "target_rr",
+                            "target_rr_price", "target_model", "leg_target", "leg_target_ms",
+                            "leg_start_ms", "leg_break_ms", "stop", "rr", "zone", "mitigation_kind",
+                            "state_reason",
+                        ):
                             updates.pop(key, None)
                     sets = ", ".join(f"{k} = ?" for k in updates)
                     self._db.execute(
@@ -244,7 +311,65 @@ class SignalStore:
     def record_many(self, payloads: Iterable[dict], market: str = "futures") -> int:
         return sum(1 for payload in payloads if self.record(payload, market))
 
+    def quarantine(self, key: str, problems: list[str]) -> bool:
+        """Mark an archive row non-tradeable without deleting its audit trail.
+
+        This is intentionally separate from ``record``: a structurally invalid
+        historical row must be quarantined even when its old lifecycle happened
+        to reach a final state.  Its original fields stay in JSON alongside the
+        integrity explanation, so the bad row remains inspectable.
+        """
+        if not self.enabled or self._db is None or not key:
+            return False
+        with self._lock:
+            try:
+                row = self._db.execute("SELECT payload FROM signals WHERE key = ?", (key,)).fetchone()
+                if row is None:
+                    return False
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {"key": key}
+                payload.update(
+                    {
+                        "valid": False,
+                        "state": "invalidated",
+                        "chain_valid": False,
+                        "chain_errors": list(problems),
+                        "state_reason": "integrity quarantine: " + "; ".join(problems),
+                    }
+                )
+                self._db.execute(
+                    "UPDATE signals SET valid = 0, state = 'invalidated', state_reason = ?, payload = ?, last_seen = ? WHERE key = ?",
+                    (payload["state_reason"], json.dumps(payload, ensure_ascii=False, default=str),
+                     int(time.time() * 1000), key),
+                )
+                self._db.commit()
+                return True
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return False
+
     # ------------------------------------------------------------- reading
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Read one complete immutable signal payload by its archive key."""
+        if not self.enabled or self._db is None or not key:
+            return None
+        with self._lock:
+            try:
+                row = self._db.execute("SELECT payload FROM signals WHERE key = ?", (key,)).fetchone()
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return None
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        payload["stored"] = True
+        return payload
+
     def list(
         self,
         limit: int = 200,
@@ -290,7 +415,7 @@ class SignalStore:
             args.append(int(since))
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         sql = f"SELECT payload FROM signals{clause} ORDER BY created_ms DESC LIMIT ?"
-        args.append(max(1, min(2000, int(limit))))
+        args.append(max(1, min(50000, int(limit))))
         with self._lock:
             try:
                 rows = self._db.execute(sql, tuple(args)).fetchall()
@@ -298,6 +423,31 @@ class SignalStore:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return []
         out = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            payload["stored"] = True
+            out.append(payload)
+        return out
+
+    def all_payloads(self) -> list[dict]:
+        """Read every archived payload for startup integrity auditing.
+
+        The visible archive is deliberately paged; an integrity boundary is not.
+        A malformed row must not escape quarantine because it happened to be row
+        50,001 in a long-running database.
+        """
+        if not self.enabled or self._db is None:
+            return []
+        with self._lock:
+            try:
+                rows = self._db.execute("SELECT payload FROM signals ORDER BY created_ms DESC").fetchall()
+            except Exception as exc:
+                self.problem = f"{type(exc).__name__}: {exc}"
+                return []
+        out: list[dict] = []
         for row in rows:
             try:
                 payload = json.loads(row["payload"] or "{}")
@@ -334,11 +484,23 @@ class SignalStore:
                 by_grade = {row[0] or "?": row[1] for row in self._db.execute(
                     "SELECT grade, COUNT(*) FROM signals GROUP BY grade")}
                 total = self._db.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+                valid = self._db.execute("SELECT COUNT(*) FROM signals WHERE valid = 1").fetchone()[0]
+                unmitigated = self._db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE valid = 1 AND mitigated = 0"
+                ).fetchone()[0]
+                current_version = self._db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE lifecycle_version = ? "
+                    "AND chain_version = ? AND target_model = ?",
+                    (CURRENT_LIFECYCLE_VERSION, CURRENT_CHAIN_VERSION, CURRENT_TARGET_MODEL),
+                ).fetchone()[0]
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
         return {
             "total": int(total),
+            "valid": int(valid),
+            "unmitigated": int(unmitigated),
+            "current_lifecycle": int(current_version),
             "by_state": by_state,
             "by_grade": by_grade,
             "recorded": self.recorded,
@@ -356,35 +518,49 @@ class SignalStore:
         with self._lock:
             try:
                 rows = self._db.execute(
-                    "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target FROM signals"
+                    "SELECT state, grade, timeframe, side, session, r_now, entry, stop, target, "
+                    "target_rr, target_model, mitigated, chain_version, lifecycle_version FROM signals "
+                    "WHERE lifecycle_version = ? AND chain_version = ? AND target_model = ?",
+                    (CURRENT_LIFECYCLE_VERSION, CURRENT_CHAIN_VERSION, CURRENT_TARGET_MODEL),
                 ).fetchall()
             except Exception as exc:
                 self.problem = f"{type(exc).__name__}: {exc}"
                 return {}
 
         def r_of(row: sqlite3.Row) -> float:
-            """Risk units won or lost - the trade's own outcome, not a convention.
+            """Risk units won or lost from the trade's actual frozen prices.
 
-            The archive stores the realised R (the draw it was aiming at, or the
-            stop it hit). Quoting a fixed 2R instead would make the page's
-            record disagree with the same plan in the back-test, and two
-            yardsticks for one number is how a track record becomes a story.
-            Rows written before the field existed fall back to the convention.
+            Current-policy wins resolve at their own confirmation-leg H/L, so R is
+            variable. Unfilled invalidations never enter the sample. ``r_now`` is
+            authoritative; the price calculation is only for migrated v5 rows.
             """
             if row["state"] == "breakeven":
                 return 0.0
             stored = row["r_now"] if "r_now" in row.keys() else None
             if stored is not None:
                 return float(stored)
-            return 2.0 if row["state"] == "win" else -1.0
+            if row["state"] == "win":
+                entry, stop, target = row["entry"], row["stop"], row["target"]
+                if entry is not None and stop is not None and target is not None:
+                    risk = abs(float(entry) - float(stop))
+                    move = (
+                        float(entry) - float(target)
+                        if str(row["side"]).upper() == "SHORT"
+                        else float(target) - float(entry)
+                    )
+                    if risk > 0 and move > 0:
+                        return move / risk
+                return float(row["target_rr"] or 0.0)
+            return -1.0
 
         def summarise(rows: list[sqlite3.Row]) -> dict[str, Any]:
-            wins = sum(1 for r in rows if r["state"] == "win")
-            losses = sum(1 for r in rows if r["state"] == "stopped")
-            scratches = sum(1 for r in rows if r["state"] == "breakeven")
+            trades = [r for r in rows if bool(r["mitigated"])]
+            wins = sum(1 for r in trades if r["state"] == "win")
+            losses = sum(1 for r in trades if r["state"] == "stopped")
+            scratches = sum(1 for r in trades if r["state"] == "breakeven")
             decided = wins + losses
-            total_r = sum(r_of(r) for r in rows if r["state"] in FINAL_STATES)
-            scored = [r_of(r) for r in rows if r["state"] in FINAL_STATES]
+            total_r = sum(r_of(r) for r in trades if r["state"] in FINAL_STATES)
+            scored = [r_of(r) for r in trades if r["state"] in FINAL_STATES]
             plain = len(scored)
             mean = total_r / plain if plain else 0.0
             # The honest error bar. With ~30 trades a +0.3R average has a 95%
@@ -399,6 +575,7 @@ class SignalStore:
             low, high = mean - 1.96 * se, mean + 1.96 * se
             return {
                 "n": len(rows),
+                "mitigated": len(trades),
                 "wins": wins,
                 "losses": losses,
                 "decided": decided,
@@ -420,8 +597,17 @@ class SignalStore:
                 ),
             }
 
-        out: dict[str, Any] = {"all": summarise(list(rows)),
-                                "r_basis": "realised R per trade (the draw it aimed at, or the stop)"}
+        out: dict[str, Any] = {
+            "all": summarise(list(rows)),
+            "r_basis": (
+                "HVB/BOS confirmation-leg H/L frozen immediately before mitigation; "
+                "invalidated/unfilled setups excluded"
+            ),
+            "chain_version": CURRENT_CHAIN_VERSION,
+            "lifecycle_version": CURRENT_LIFECYCLE_VERSION,
+            "target_model": CURRENT_TARGET_MODEL,
+            "target_rr": None,
+        }
         # every dimension the page filters on is also a dimension the scanner is
         # *judged* on: these are the buckets a trader would actually split by
         for dimension in ("grade", "timeframe", "side", "session"):

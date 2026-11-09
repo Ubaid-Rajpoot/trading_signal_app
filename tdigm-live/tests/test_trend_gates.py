@@ -23,7 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot.engine import Engine  # noqa: E402
-from bot.filters import SCORE_WEIGHTS, Filters  # noqa: E402
+from bot.filters import SCORE_WEIGHTS, Filters, rejection_key  # noqa: E402
+
+
+def test_rejection_counter_groups_live_values_but_keeps_the_20_bar_rule():
+    assert rejection_key("ranging market: ADX 20.9 < 22") == "ranging market: ADX N < N"
+    assert rejection_key("no 20-bar high/low break on this candle").startswith("no 20-bar")
 
 
 # --------------------------------------------------------------- fixtures
@@ -95,6 +100,142 @@ def test_the_clean_hh_hl_requirement_can_be_relaxed():
 def test_a_trend_that_agrees_passes():
     ok, reasons = gates().apply(candidate())
     assert ok, reasons
+
+
+def strict_degree(
+    *, direction=1, steps=2, ratio=1.0, range_like=False,
+    bos_direction=1, bos_age=2, range_break=False,
+):
+    return {
+        "direction": direction,
+        "clean": direction is not None,
+        "trend_steps": steps,
+        "directional_ratio": ratio,
+        "range_like": range_like,
+        "bos_direction": bos_direction,
+        "bos_age": bos_age,
+        "bos_range_break": range_break,
+    }
+
+
+def strict_context(*, major=None, internal=None, macro=None):
+    return {
+        "major": major or {},
+        "macro": macro or {},
+        "internal": internal or {},
+        "external": major or macro or {},
+    }
+
+
+def strict_gates(**overrides):
+    return gates(
+        clear_structure=True,
+        min_trend_steps=2,
+        min_directional_ratio=1.0,
+        fresh_shift_max_bars=20,
+        **overrides,
+    )
+
+
+def test_strict_gate_rejects_a_recent_directional_flicker_inside_a_range():
+    flicker = strict_degree(steps=1, ratio=0.5, range_like=True, range_break=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=flicker, internal=flicker))
+    )
+    assert not ok
+    assert any("ranging/unclear structure to the left" in reason for reason in reasons)
+
+
+def test_strict_gate_rejects_even_one_mixed_step_in_remembered_outer_structure():
+    almost = strict_degree(steps=3, ratio=0.75, range_like=False)
+    local = strict_degree(steps=1, ratio=1.0, range_like=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=almost, internal=local))
+    )
+    assert not ok
+    assert any("100% consistency" in reason for reason in reasons)
+
+
+def test_strict_gate_accepts_repeated_major_structure_and_its_directional_leg():
+    major = strict_degree(steps=3, ratio=1.0)
+    internal = strict_degree(steps=2, ratio=1.0)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=major, internal=internal))
+    )
+    assert ok, reasons
+
+
+def test_established_larger_trend_allows_one_clear_specific_internal_leg():
+    major = strict_degree(steps=3, ratio=1.0)
+    local_leg = strict_degree(steps=1, ratio=1.0, range_like=False)
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=major, internal=local_leg))
+    )
+    assert ok, reasons
+
+    # The same one-step shape cannot stand on its own when the larger structure
+    # is mixed/ranging. This is the key difference between the tick drawing and
+    # a 1-minute directional flicker inside an old range.
+    mixed_major = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=2, range_break=False,
+    )
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=mixed_major, internal=local_leg))
+    )
+    assert not ok
+    assert any("ranging/unclear structure" in reason for reason in reasons)
+
+
+def test_fresh_major_range_break_can_establish_the_new_direction():
+    # Prior major swings can still be mixed at the exact reversal.  What makes
+    # this admissible is a body close beyond the full remembered range edge,
+    # not a small internal BOS or a briefly directional indicator.
+    reversal = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=0, range_break=True,
+    )
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=reversal))
+    )
+    assert ok, reasons
+
+    stale = {**reversal, "bos_age": 21}
+    ok, reasons = strict_gates().apply(
+        candidate(context=strict_context(major=stale))
+    )
+    assert not ok
+    assert any("ranging/unclear structure" in reason for reason in reasons)
+
+
+def test_fresh_major_shift_is_not_starved_by_lagging_adx_er():
+    """The explicit structure shift rule outranks a lagging range indicator.
+
+    This is narrow: only a fresh major/macro close beyond the remembered range
+    gets the exception. An established trend with merely a local leg still has
+    to satisfy the configured ADX/ER regime gate.
+    """
+    reversal = strict_degree(
+        direction=None, steps=0, ratio=0.0, range_like=True,
+        bos_direction=1, bos_age=0, range_break=True,
+    )
+    shifted = candidate(context=strict_context(major=reversal))
+    strict = strict_gates(regime=True, regime_adx_min=22.0, regime_er_min=0.3)
+    ok, reasons = strict.apply(
+        shifted,
+        regime={"state": "range", "adx": 16.0, "er": 0.08, "direction": 1},
+    )
+    assert ok, reasons
+    assert shifted["range_clearance"] == "fresh major/macro range-breaking shift"
+
+    established = strict_degree(steps=3, ratio=1.0, range_break=False)
+    local = strict_degree(steps=1, ratio=1.0, range_break=True)
+    ok, reasons = strict.apply(
+        candidate(context=strict_context(major=established, internal=local)),
+        regime={"state": "range", "adx": 16.0, "er": 0.08, "direction": 1},
+    )
+    assert not ok
+    assert any("ranging market" in reason for reason in reasons)
 
 
 # ------------------------------------------------------- break of structure
@@ -172,21 +313,18 @@ def test_the_score_adds_up_only_the_evidence_that_is_there():
     assert weak[1]["trend"] is True, "the trend still agrees - only the other three are missing"
 
 
-def test_score_mode_replaces_the_hard_hvb_gate_with_a_threshold():
-    """The point of combining: a very strong setup does not need every single box."""
-    # hvb missing but everything else present -> 75, passes a 60 threshold
-    strong = candidate(hvb=None)
+def test_score_mode_never_replaces_the_mandatory_hvb():
+    """Other confluences may rank a setup, but cannot fabricate its trigger."""
+    missing = candidate(hvb=None)
+    for threshold in (0, 60, 80):
+        ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=threshold).apply(
+            json.loads(json.dumps(missing)))
+        assert not ok and any("no HVB" in reason for reason in reasons), reasons
+
+    complete = candidate(hvb="up")
     ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=60).apply(
-        json.loads(json.dumps(strong)))
+        json.loads(json.dumps(complete)))
     assert ok, reasons
-    # ... and the same candidate fails if the trader asks for 80
-    ok, reasons = gates(hvb=True, confirm_mode="score", confirm_min_score=80).apply(
-        json.loads(json.dumps(strong)))
-    assert not ok
-    assert any("confluence score" in r for r in reasons), reasons
-    # in "all" mode the same candidate fails because the HVB is missing
-    ok, reasons = gates(hvb=True, confirm_mode="all").apply(json.loads(json.dumps(strong)))
-    assert not ok and any("no HVB" in r for r in reasons), reasons
 
 
 # ---------------------------------------------------------- in the engine
@@ -266,6 +404,18 @@ async def test_the_engine_reports_depth_among_the_candidates_it_rejects():
     assert engine.alerts or seen
 
 
+def test_shipped_config_keeps_the_production_structure_gate_strict():
+    shipped = json.loads((ROOT / "config.json").read_text())["filters"]
+    assert shipped["trend_context"] is True
+    assert shipped["require_hh_hl"] is True
+    assert shipped["clear_structure"] is True
+    assert shipped["min_trend_steps"] == 2
+    assert shipped["min_directional_ratio"] == 1.0
+    assert shipped["fresh_shift_max_bars"] == 20
+    assert shipped["regime_adx_min"] == 22.0 and shipped["regime_er_min"] == 0.30
+    assert shipped["breaker_stop_buffer_atr"] == 0.10
+
+
 def test_filters_config_round_trips_through_the_store(tmp_path):
     from bot import config_store
 
@@ -274,10 +424,16 @@ def test_filters_config_round_trips_through_the_store(tmp_path):
         "bos_max_age": 180, "max_internal_depth": 2, "volume_break": True,
         "volume_mult": 2.0, "volume_period": 30, "confirm_mode": "score",
         "confirm_min_score": 70,
+        "clear_structure": True, "min_trend_steps": 3,
+        "min_directional_ratio": 0.8, "fresh_shift_max_bars": 12,
+        "breaker_stop_buffer_atr": 0.15,
     }
     cleaned = config_store.validate_filters(payload)
     for key, value in payload.items():
         assert cleaned[key] == value, key
     # rubbish is rejected, not stored
-    bad = config_store.validate_filters({"max_internal_depth": "deep", "confirm_mode": "maybe"})
+    bad = config_store.validate_filters({
+        "max_internal_depth": "deep", "confirm_mode": "maybe", "min_directional_ratio": 4,
+    })
     assert bad["max_internal_depth"] == 2 and bad["confirm_mode"] == "all"
+    assert bad["min_directional_ratio"] == 1.0

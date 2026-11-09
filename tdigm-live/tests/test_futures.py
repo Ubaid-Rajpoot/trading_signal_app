@@ -14,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -45,6 +46,74 @@ def test_the_default_market_is_perpetuals_and_spot_is_still_there():
     assert isinstance(make_feed("mexc", ["BTCUSDT"], market="spot"), MexcFeed)
     assert isinstance(make_feed("binance", ["BTCUSDT"]), BinanceFuturesFeed)
     assert make_feed("mexc", ["BTCUSDT"]).market == "futures"
+
+
+def test_mexc_history_interval_is_translated_exactly_once():
+    feed = MexcFuturesFeed(["BTCUSDT"])
+    assert feed.exchange_interval("1h") == "1h", "history() translates 1h to Min60"
+    assert feed.exchange_interval("3m") is None, "unsupported native candles are aggregated"
+
+
+@pytest.mark.asyncio
+async def test_rest_disables_brotli_and_recovers_from_a_bad_compressed_response():
+    """Production MEXC once returned a malformed `br` detail response.
+
+    Hosts with Brotli installed used to advertise it automatically and then make
+    every universe retry fail in the decoder. The pooled client no longer asks
+    for Brotli, and a decoder failure retries once with no compression at all.
+    """
+    feed = MexcFuturesFeed(["BTCUSDT"])
+    assert feed._http.headers["accept-encoding"] == "gzip, deflate"
+    await feed._http.aclose()
+
+    class BrokenOnce:
+        def __init__(self):
+            self.encodings = []
+
+        async def get(self, url, params=None, headers=None):
+            self.encodings.append(headers["Accept-Encoding"])
+            if len(self.encodings) == 1:
+                raise httpx.DecodingError(
+                    "brotli decoder received trailing data",
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(200, json={"success": True, "data": [1]})
+
+    client = BrokenOnce()
+    feed._http = client  # type: ignore[assignment]
+    payload = await feed._get_json("https://contract.mexc.com/api/v1/contract/detail")
+    assert payload == {"success": True, "data": [1]}
+    assert client.encodings == ["gzip, deflate", "identity"]
+
+
+@pytest.mark.asyncio
+async def test_engine_can_warm_a_mexc_native_timeframe(monkeypatch):
+    """Regression: exchange_interval once returned Min60 and history mapped it
+    again, leaving every MEXC cell empty while websocket frames kept arriving."""
+    feed = MexcFuturesFeed(["BTCUSDT"])
+    now_s = 1_800_000_000
+
+    async def fake_get(url, params=None):
+        assert params["interval"] == "Min60"
+        stamps = [now_s - (130 - i) * 3600 for i in range(130)]
+        n = len(stamps)
+        return {"success": True, "data": {
+            "time": stamps, "open": [100] * n, "high": [101] * n,
+            "low": [99] * n, "close": [100.5] * n, "vol": [10] * n,
+        }}
+
+    monkeypatch.setattr("bot.feed.time.time", lambda: now_s)
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    engine = Engine(
+        symbols=["BTCUSDT"], timeframes=["1h"], history_bars=120,
+        tdi_settings={"rsi_period": 50, "band_period": 50, "fast_period": 1, "slow_period": 9},
+        filters={"hvb": False, "regime": False, "trend_context": False, "require_bos": False},
+        structure={"pivot_len": 3}, strategy="sweep",
+    )
+    await engine.warm_symbol(feed, "BTCUSDT")
+    assert len(engine.cells[("BTCUSDT", "1h")].candles) == 120
+    assert not engine.warm_failures
+    await feed.close()
 
 
 @pytest.mark.asyncio
@@ -83,7 +152,46 @@ async def test_mexc_futures_history_parses_the_contract_kline_payload(monkeypatc
     assert first["open_time"] == 1_700_000_000_000, "seconds -> milliseconds"
     assert (first["open"], first["high"], first["low"], first["close"]) == (100.0, 101.5, 99.5, 101.0)
     assert first["volume"] == 12.0
+    assert first["close_time"] - first["open_time"] == 59_999
     assert first["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_pages_deep_history_instead_of_silently_truncating(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+    calls = []
+
+    async def fake_get(url, params=None):
+        calls.append(dict(params or {}))
+        step = 60
+        stamps = list(range(int(params["start"]), int(params["end"]) + 1, step))[-2000:]
+        n = len(stamps)
+        return {"success": True, "data": {
+            "time": stamps, "open": [100] * n, "high": [101] * n,
+            "low": [99] * n, "close": [100.5] * n, "vol": [10] * n,
+        }}
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    candles = await feed.history("BTCUSDT", "1m", 2_500)
+    assert len(candles) == 2_500
+    assert len(calls) >= 2, "MEXC returns at most 2,000 contract bars per request"
+    assert [row["open_time"] for row in candles] == sorted(row["open_time"] for row in candles)
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_history_uses_the_real_timeframe_close(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+
+    async def fake_get(url, params=None):
+        old = 1_700_000_000
+        return {"success": True, "data": {
+            "time": [old], "open": [100], "high": [101], "low": [99],
+            "close": [100.5], "vol": [10],
+        }}
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    candle = (await feed.history("BTCUSDT", "4h", 1))[0]
+    assert candle["close_time"] - candle["open_time"] == 4 * 60 * 60 * 1000 - 1
 
 
 @pytest.mark.asyncio
@@ -121,10 +229,53 @@ async def test_mexc_futures_universe_is_contracts_with_turnover(monkeypatch):
 
     monkeypatch.setattr(feed, "_get_json", fake_get)
     items = await feed.universe()
-    assert [item["symbol"] for item in items] == ["BTCUSDT", "DOGEUSDT"], (
-        "biggest turnover first, USDC contracts skipped, untraded ones dropped"
+    assert [item["symbol"] for item in items] == ["BTCUSDT", "DOGEUSDT", "DEADUSDT"], (
+        "turnover ranks contracts, but a missing ticker must not erase an enabled contract"
     )
     assert items[0]["market"] == "futures"
+    assert items[-1]["ticker"] is False and items[-1]["turnover"] == 0
+    assert feed.universe_diagnostics["eligible"] == 3
+    assert feed.universe_diagnostics["missing_tickers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_universe_survives_a_failed_ticker_endpoint(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+
+    async def fake_get(url, params=None):
+        if url.endswith("/contract/detail"):
+            return {
+                "success": True,
+                "data": [
+                    {"symbol": f"COIN{i}_USDT", "baseCoin": f"COIN{i}",
+                     "quoteCoin": "USDT", "state": 0, "isHidden": False}
+                    for i in range(520)
+                ] + [
+                    {"symbol": "PAUSED_USDT", "quoteCoin": "USDT", "state": 4},
+                    {"symbol": "HIDDEN_USDT", "quoteCoin": "USDT", "state": 0,
+                     "isHidden": "true"},
+                ],
+            }
+        raise RuntimeError("ticker temporarily unavailable")
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    items = await feed.universe()
+    assert len(items) == 520
+    assert all(item["symbol"].endswith("USDT") for item in items)
+    assert feed.universe_diagnostics["ticker_rows"] == 0
+    assert feed.universe_diagnostics["ticker_error"]
+
+
+@pytest.mark.asyncio
+async def test_mexc_futures_universe_rejects_an_empty_or_changed_detail_shape(monkeypatch):
+    feed = MexcFuturesFeed(["BTCUSDT"])
+
+    async def fake_get(url, params=None):
+        return {"success": True, "data": {"contracts": []}}
+
+    monkeypatch.setattr(feed, "_get_json", fake_get)
+    with pytest.raises(Exception, match="no data list"):
+        await feed.universe()
 
 
 def test_the_page_can_read_setups_and_a_chart(tmp_path):

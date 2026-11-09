@@ -7,10 +7,11 @@ A complete setup is the drawing:
     2. price pokes through it                    -> the liquidity is taken
     3. price then closes through the OPPOSITE swing, on the other side
                                                  -> the reversal is confirmed
-    4. the TDIGM purple line crosses the centre band (HVB) -> momentum agrees
+    4. on that same candle, TDIGM purple crosses the moving MBL -> HVB
 
-Step 2 and 3 are the structure, step 4 is the trader's TDIGM (50, 50, 1, 9).
-Everything the trader switched on in ``filters`` must also agree, and every
+Step 2 and 3 are the structure; step 4 is the mandatory trader's TDIGM
+(50, 50, 1, 9) trigger. Everything else switched on in ``filters`` must also
+agree, and every
 rejection is counted so the page can explain the quiet.
 
 Alerts only ever come from CLOSED candles. The candle that is still forming is
@@ -21,6 +22,7 @@ universe of instruments would otherwise melt the process.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -38,17 +40,317 @@ from .confluence import (
     position_in_range,
     zone_of,
 )
-from .filters import Filters
-from .indicators import TdiPoint, TdiTracker, break_signal, centre_of, crossed_above, crossed_below, hvb_signal, line_speed, tdi
+from .filters import Filters, rejection_key
+from .indicators import (
+    HVB_MODEL,
+    TdiPoint,
+    TdiTracker,
+    break_signal,
+    centre_cross_evidence,
+    centre_of,
+    hvb_signal,
+    tdi,
+)
 from .regime import RegimePoint, RegimeTracker
 from .book.narrative import BookSettings
 from .book.runner import BookRunner
-from .setups import DONE, SetupRecord, order_block
+from .setups import (
+    DEFAULT_TARGET_RR,
+    DONE,
+    LEG_TARGET_MODEL,
+    LIFECYCLE_VERSION,
+    SetupRecord,
+    breaker_block,
+    order_block,
+)
 from .store import SignalStore
-from .structure import Structure
+from .structure import APPROACH_MODEL, DISPLACEMENT_MODEL, LEG_MODEL, Structure
 from .trend import TrendMap
 
 MAX_CANDLES = 180
+CURRENT_CHAIN_VERSION = 8
+CURRENT_LEG_MODEL = LEG_MODEL
+CURRENT_APPROACH_MODEL = APPROACH_MODEL
+CURRENT_HVB_MODEL = HVB_MODEL
+
+
+def sweep_chain_errors(
+    payload: dict[str, Any], *, require_hvb: bool = True, require_leg_proof: bool = False,
+    require_single_sweep: bool = False,
+) -> list[str]:
+    """Return hard integrity failures for a TDIGM sweep signal.
+
+    Filters decide whether a *valid chain* is tradeable.  This function protects
+    the more fundamental invariant at the publication/database boundary:
+
+        H/L sweep -> later opposite body close -> same-candle directed HVB
+
+    Old archive rows did not retain the sweep candle OHLC, so they can still be
+    checked for identity and event ordering.  New rows carry OHLC and are also
+    checked mathematically against the swept level.
+    """
+    if str(payload.get("strategy") or "").lower() == "book":
+        return []
+    raw_setup = payload.get("setup") or {}
+    setup = raw_setup if isinstance(raw_setup, dict) else {}
+
+    def as_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    chain_version = as_int(payload.get("chain_version"))
+    require_leg_proof = require_leg_proof or chain_version >= 2
+    require_single_sweep = require_single_sweep or chain_version >= 3
+    require_hvb = require_hvb or chain_version >= 6
+    side = str(payload.get("side") or setup.get("side") or "").upper()
+    swept_side = str(setup.get("swept_side") or payload.get("swept_side") or "").lower()
+    swept_level = setup.get("swept_level", payload.get("swept_level"))
+    sweep_ms = as_int(setup.get("sweep_time") or payload.get("sweep_ms"))
+    break_ms = as_int(setup.get("break_time") or payload.get("created_ms") or payload.get("time"))
+    broke_level = setup.get("broke_level", payload.get("bos_level"))
+    hvb = str(payload.get("hvb") or payload.get("hvb_side") or "").lower()
+    hvb_ms = as_int(payload.get("hvb_ms") or payload.get("created_ms") or payload.get("time"))
+    lag = payload.get("hvb_lag")
+    errors: list[str] = []
+
+    if side not in {"LONG", "SHORT"}:
+        errors.append("signal side is missing")
+    swept_levels = setup.get("swept_levels", payload.get("swept_levels"))
+    if require_single_sweep:
+        if as_int(setup.get("swept_count") or payload.get("swept_count")) != 1:
+            errors.append("signal must sweep exactly one structural high/low")
+        if not isinstance(swept_levels, list) or len(swept_levels) != 1:
+            errors.append("single swept-level proof is missing or ambiguous")
+    if chain_version >= 4 and setup.get("leg_model") != CURRENT_LEG_MODEL:
+        errors.append("current directional outer-leg proof is missing")
+    expected_sweep = "low" if side == "LONG" else "high"
+    if swept_side != expected_sweep:
+        errors.append(f"{side or 'signal'} requires a preceding {expected_sweep} sweep")
+    try:
+        level = float(swept_level)
+    except (TypeError, ValueError):
+        level = 0.0
+    if not math.isfinite(level) or level <= 0:
+        errors.append("swept level is missing")
+    if require_single_sweep and isinstance(swept_levels, list) and len(swept_levels) == 1:
+        proof = swept_levels[0] if isinstance(swept_levels[0], dict) else {}
+        try:
+            proof_price = float(proof.get("price"))
+        except (TypeError, ValueError):
+            proof_price = 0.0
+        if proof.get("side") != swept_side or not math.isclose(proof_price, level, rel_tol=1e-9):
+            errors.append("single swept-level proof does not match the swept endpoint")
+    if sweep_ms <= 0:
+        errors.append("sweep time is missing")
+    if break_ms <= sweep_ms:
+        errors.append("sweep must precede the body-break candle")
+    swept_level_ms = as_int(setup.get("swept_level_time") or payload.get("swept_level_ms"))
+    broke_level_ms = as_int(setup.get("broke_level_time") or payload.get("broke_level_ms"))
+    if require_leg_proof and not (swept_level_ms and broke_level_ms):
+        errors.append("paired-leg endpoint proof is missing")
+    if swept_level_ms or broke_level_ms:
+        if not (0 < swept_level_ms < broke_level_ms < sweep_ms < break_ms):
+            errors.append("swept and broken levels are not endpoints of the same completed leg")
+    if chain_version >= 5:
+        approach_model = str(setup.get("approach_model") or payload.get("approach_model") or "")
+        approach_start_ms = as_int(
+            setup.get("approach_start_time") or payload.get("approach_start_ms")
+        )
+        approach_end_ms = as_int(
+            setup.get("approach_end_time") or payload.get("approach_end_ms")
+        )
+        pivot_proof_present = (
+            "approach_pivot_count" in setup or "approach_pivot_count" in payload
+        )
+        raw_approach_pivots = (
+            setup["approach_pivot_count"]
+            if "approach_pivot_count" in setup
+            else payload.get("approach_pivot_count")
+        )
+        try:
+            approach_pivots = int(raw_approach_pivots)
+            pivot_proof_valid = not isinstance(raw_approach_pivots, bool)
+        except (TypeError, ValueError, OverflowError):
+            approach_pivots, pivot_proof_valid = 0, False
+        approach_bars = as_int(setup.get("approach_bars") or payload.get("approach_bars"))
+        if (
+            approach_model != CURRENT_APPROACH_MODEL
+            or not pivot_proof_present
+            or not pivot_proof_valid
+        ):
+            errors.append("direct paired-endpoint-to-sweep approach proof is missing")
+        if approach_start_ms != broke_level_ms or approach_end_ms != sweep_ms:
+            errors.append("direct sweep approach must run from the paired endpoint to the sweep")
+        if pivot_proof_valid and approach_pivots != 0:
+            errors.append("price oscillated between the paired endpoint and the sweep")
+        if approach_bars <= 0:
+            errors.append("direct sweep approach bar count is missing")
+    try:
+        body_level = float(broke_level)
+    except (TypeError, ValueError):
+        body_level = 0.0
+    if not math.isfinite(body_level) or body_level <= 0:
+        errors.append("opposite body-break level is missing")
+
+    expected_hvb = "up" if side == "LONG" else "down"
+    if require_hvb:
+        if hvb != expected_hvb:
+            errors.append(f"{side or 'signal'} requires a same-candle {expected_hvb} HVB")
+        if hvb_ms != break_ms:
+            errors.append("HVB and body break are not on the same candle")
+        if lag not in (None, 0, "0"):
+            errors.append("HVB lag is not zero")
+    if chain_version >= 6:
+        hvb_model = str(payload.get("hvb_model") or "")
+        proof_names = (
+            "hvb_prev_fast", "hvb_prev_centre", "hvb_fast", "hvb_centre",
+        )
+        try:
+            proof = {name: float(payload[name]) for name in proof_names}
+            proof_valid = all(math.isfinite(value) for value in proof.values())
+        except (KeyError, TypeError, ValueError, OverflowError):
+            proof, proof_valid = {}, False
+        if hvb_model != CURRENT_HVB_MODEL or not proof_valid:
+            errors.append("moving-centre-band HVB crossing proof is missing")
+        elif hvb == "up" and not (
+            proof["hvb_prev_fast"] <= proof["hvb_prev_centre"]
+            and proof["hvb_fast"] > proof["hvb_centre"]
+        ):
+            errors.append("bullish HVB did not cross the moving centre band on this candle")
+        elif hvb == "down" and not (
+            proof["hvb_prev_fast"] >= proof["hvb_prev_centre"]
+            and proof["hvb_fast"] < proof["hvb_centre"]
+        ):
+            errors.append("bearish HVB did not cross the moving centre band on this candle")
+
+    if chain_version >= 7:
+        if setup.get("displacement_model") != DISPLACEMENT_MODEL:
+            errors.append("current sweep/break displacement model is missing")
+
+        def validate_displacement(
+            name: str, raw: Any, expected_direction: str, event_ms: int,
+        ) -> None:
+            if not isinstance(raw, dict) or raw.get("model") != DISPLACEMENT_MODEL:
+                errors.append(f"{name} displacement proof is missing")
+                return
+            try:
+                opened = float(raw["open"])
+                high_value = float(raw["high"])
+                low_value = float(raw["low"])
+                closed = float(raw["close"])
+                body = float(raw["body"])
+                prior_atr = float(raw["prior_atr"])
+                body_atr = float(raw["body_atr"])
+                minimum = float(raw["min_body_atr"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                errors.append(f"{name} displacement numbers are missing")
+                return
+            values = (opened, high_value, low_value, closed, body, prior_atr, body_atr, minimum)
+            if not all(math.isfinite(value) for value in values):
+                errors.append(f"{name} displacement numbers are not finite")
+                return
+            direction = "up" if closed > opened else "down" if closed < opened else "flat"
+            if (
+                raw.get("expected_direction") != expected_direction
+                or raw.get("direction") != direction
+                or direction != expected_direction
+            ):
+                errors.append(f"{name} displacement is not directed {expected_direction}")
+            if as_int(raw.get("event_time")) != event_ms:
+                errors.append(f"{name} displacement is attached to the wrong candle")
+            if high_value < max(opened, closed) or low_value > min(opened, closed) or high_value <= low_value:
+                errors.append(f"{name} displacement OHLC is inconsistent")
+            calculated_body = abs(closed - opened)
+            calculated_ratio = calculated_body / prior_atr if prior_atr > 0 else 0.0
+            if (
+                prior_atr <= 0
+                or minimum <= 0
+                or not math.isclose(body, calculated_body, rel_tol=1e-9, abs_tol=1e-12)
+                or not math.isclose(body_atr, calculated_ratio, rel_tol=1e-9, abs_tol=1e-12)
+                or calculated_ratio < minimum
+                or raw.get("passes") is not True
+            ):
+                errors.append(f"{name} candle did not meet its prior-ATR displacement threshold")
+            for field, value in (("open", opened), ("high", high_value), ("low", low_value), ("close", closed)):
+                recorded = setup.get(f"{name}_{field}")
+                try:
+                    matches = recorded is not None and math.isclose(
+                        float(recorded), value, rel_tol=1e-9, abs_tol=1e-12
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    matches = False
+                if not matches:
+                    errors.append(f"{name} displacement does not match stored candle OHLC")
+                    break
+
+        validate_displacement(
+            "sweep", setup.get("sweep_displacement"),
+            # Chain 8 corrects the event semantics to the user's worked chart:
+            # the wick takes liquidity and the body rejects in the trade
+            # direction (low sweep up / high sweep down). Chain 7 remains
+            # auditable under its historical into-liquidity direction but is
+            # excluded from current-policy statistics.
+            (
+                ("up" if swept_side == "low" else "down")
+                if chain_version >= 8
+                else ("up" if swept_side == "high" else "down")
+            ),
+            sweep_ms,
+        )
+        validate_displacement(
+            "break", setup.get("break_displacement"),
+            "up" if side == "LONG" else "down", break_ms,
+        )
+
+    lifecycle_version = as_int(payload.get("lifecycle_version"))
+    target_model = str(payload.get("target_model") or setup.get("target_model") or "")
+    if lifecycle_version >= 5 or target_model:
+        confirmation = setup.get("confirmation_leg") or {}
+        if target_model != LEG_TARGET_MODEL:
+            errors.append("current confirmation-leg H/L target proof is missing")
+        leg_target = payload.get("leg_target", setup.get("leg_target", setup.get("target")))
+        leg_target_ms = as_int(
+            payload.get("leg_target_ms")
+            or setup.get("leg_target_ms")
+            or confirmation.get("target_time")
+        )
+        leg_start_ms = as_int(
+            payload.get("leg_start_ms") or confirmation.get("start_time") or sweep_ms
+        )
+        leg_break_ms = as_int(
+            payload.get("leg_break_ms") or confirmation.get("break_time") or break_ms
+        )
+        try:
+            leg_target_value = float(leg_target)
+        except (TypeError, ValueError):
+            leg_target_value = 0.0
+        if not math.isfinite(leg_target_value) or leg_target_value <= 0:
+            errors.append("confirmation-leg target price is missing")
+        if leg_start_ms != sweep_ms or leg_break_ms != break_ms:
+            errors.append("target leg must run from the selected sweep through the HVB/body break")
+        touched_ms = as_int(payload.get("touched_ms"))
+        if leg_target_ms < sweep_ms or (touched_ms and leg_target_ms >= touched_ms):
+            errors.append("target extreme must form before mitigation")
+
+    # Strong proof on rows produced by this version.  Legacy rows remain
+    # inspectable through their timestamps/level instead of being destroyed.
+    sweep_high = setup.get("sweep_high", payload.get("sweep_high"))
+    sweep_low = setup.get("sweep_low", payload.get("sweep_low"))
+    if swept_side == "high" and sweep_high is not None:
+        try:
+            if float(sweep_high) <= level:
+                errors.append("sweep candle high did not take the swept high")
+        except (TypeError, ValueError):
+            errors.append("sweep candle high is invalid")
+    if swept_side == "low" and sweep_low is not None:
+        try:
+            if float(sweep_low) >= level:
+                errors.append("sweep candle low did not take the swept low")
+        except (TypeError, ValueError):
+            errors.append("sweep candle low is invalid")
+    return list(dict.fromkeys(errors))
 
 
 @dataclass
@@ -81,6 +383,18 @@ class Cell:
     ema_bars: int = 0
     last_setup: dict | None = None
     pending: dict | None = None   # a confirmed setup waiting for its HVB
+    # Per-current-history-window decision funnel. A fresh replay replaces the
+    # Cell, so these counts do not inflate every time the operator rescans.
+    raw_setups: int = 0
+    hvb_aligned_setups: int = 0
+    filtered_setups: int = 0
+    passed_setups: int = 0
+    # A rejection can fail several enabled gates. Keep both the first decisive
+    # blocker (one count per setup) and every overlapping blocker (diagnostic
+    # hits) instead of presenting the latter as if it were a setup count.
+    first_rejections: dict[str, int] = field(default_factory=dict)
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
+    rejection_combinations: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.tracker = TdiTracker(
@@ -202,19 +516,31 @@ class Engine:
         structure: dict[str, Any] | None = None,
         broadcast: Callable[[dict], Awaitable[None]] | None = None,
         preview_max_symbols: int = 200,
-        strategy: str = "book",
+        strategy: str = "sweep",
         book: dict[str, Any] | None = None,
+        history_bars: int = 5000,
+        history_days: float = 0,
     ) -> None:
-        self.symbols = [s.upper() for s in symbols]
+        self.symbols = list(dict.fromkeys(s.upper() for s in symbols))
         self.timeframes = [tf for tf in timeframes if tf in TIMEFRAMES]
-        self.tdi_settings = tdi_settings
-        self.centre_reference = str(tdi_settings.get("hvb_reference", "mbl"))
+        self.tdi_settings = {**tdi_settings, "hvb_reference": "mbl"}
+        # HVB has exactly one trigger: the purple price line crossing TDIGM's
+        # moving middle band. Older configs may still contain ``fifty``; never
+        # let that fixed-axis option change signal classification.
+        self.centre_reference = "mbl"
         self.break_lookback = int(break_lookback)
-        self.hvb_min_points = float(hvb_min_points)
-        self.hvb_min_speed = 0.0
         self.structure_settings = dict(structure or {})
         self.broadcast = broadcast
         self.filters = Filters(filters or {})
+        self.filters.config["hvb"] = True
+        self.filters.config["hvb_window"] = 0
+        # The active filter values are the one source of truth.  Previously the
+        # engine started at the obsolete top-level value (usually zero) until a
+        # user edited the settings page.
+        self.hvb_min_points = float(self.filters.config.get("hvb_min_points", hvb_min_points) or 0)
+        self.hvb_min_speed = float(self.filters.config.get("hvb_min_speed", 0) or 0)
+        self.history_bars = max(120, min(50_000, int(history_bars)))
+        self.history_days = max(0.0, min(3650.0, float(history_days or 0)))
         self.preview_max_symbols = int(preview_max_symbols)
         self.exchange = "binance"
 
@@ -243,9 +569,19 @@ class Engine:
         self._collected: list[dict] = []
         self.backfilled = 0
         self.warm_failures: dict[str, int] = {}
+        # Live sockets start immediately while REST history warms. Closed bars
+        # for a symbol being rebuilt are buffered and drained in order afterwards,
+        # so startup is concurrent without racing a fresh cell over live data.
+        self._warming_symbols: set[str] = set()
+        self._warm_backlog: dict[str, dict[int, dict]] = {}
+        self._warm_locks: dict[str, asyncio.Lock] = {}
+        self._last_stream_open: dict[str, int] = {}
         self.store: SignalStore | None = None
+        self.integrity_checked = 0
+        self.integrity_quarantined = 0
+        self.integrity_problems: dict[str, list[str]] = {}
         self.market = "futures"
-        # ---- which decision engine runs (round 21: the book's, by default)
+        # ---- which decision engine runs (TDIGM sweep checklist by default)
         self.strategy = "book" if str(strategy).lower() in {"book", "narrative", "v6"} else "sweep"
         self.book_config = dict(book or {})
         self.book: BookRunner | None = None
@@ -318,6 +654,9 @@ class Engine:
             self._add_cells(symbol)
             if self.book is not None:
                 self.book.add_symbol(symbol)
+            for payload in self.setup_payloads.values():
+                if str(payload.get("symbol") or "").upper() == symbol:
+                    self._restore_stored_record(payload)
             added.append(symbol)
         if added:
             self.state_interval = self._interval_for(len(self.symbols))
@@ -347,6 +686,8 @@ class Engine:
 
     def set_filters(self, filters: dict[str, Any]) -> None:
         self.filters = Filters(filters or {})
+        self.filters.config["hvb"] = True
+        self.filters.config["hvb_window"] = 0
         # the HVB gates live in the filter config: one source of truth
         self.hvb_min_points = float(self.filters.config.get("hvb_min_points", self.hvb_min_points) or 0)
         self.hvb_min_speed = float(self.filters.config.get("hvb_min_speed", self.hvb_min_speed) or 0)
@@ -358,9 +699,9 @@ class Engine:
             cell.regime_limits = limits
 
     def set_centre(self, reference: str) -> str:
-        """Which line is "the centre band" the price line must cross."""
-        self.centre_reference = reference if reference in {"mbl", "fifty"} else "mbl"
-        self.tdi_settings = {**self.tdi_settings, "hvb_reference": self.centre_reference}
+        """Keep legacy callers compatible while enforcing the sole MBL trigger."""
+        self.centre_reference = "mbl"
+        self.tdi_settings = {**self.tdi_settings, "hvb_reference": "mbl"}
         return self.centre_reference
 
     def set_structure(self, settings: dict[str, Any]) -> None:
@@ -386,7 +727,7 @@ class Engine:
         """Give the engine a database: every setup is written as it is found."""
         self.store = store
 
-    def load_stored(self, limit: int = 400) -> int:
+    def load_stored(self, limit: int = 2000) -> int:
         """Put the archive on the board before a single candle arrives.
 
         A restart used to mean an empty screen until the exchange answered - the
@@ -396,13 +737,152 @@ class Engine:
         """
         if self.store is None or not self.store.enabled:
             return 0
-        rows = self.store.list(limit=limit)
+        # Audit the complete archive, not merely the rows that fit on the first
+        # page.  This answers whether a missing sweep is systemic and prevents a
+        # malformed legacy row from remaining tradeable just because it is old.
+        audit_rows = self.store.all_payloads()
+        audited: dict[str, list[str]] = {}
+        require_hvb = bool(self.filters.config.get("hvb", True))
+        for row in audit_rows:
+            key = str(row.get("key") or "")
+            if not key:
+                continue
+            # A row that still claims to be tradeable must prove every current
+            # invariant, regardless of which older binary wrote it. Historical
+            # closed rows remain inspectable, but no legacy pending row may be
+            # rehydrated on weaker same-leg/single-sweep evidence.
+            tradeable = bool(row.get("valid"))
+            errors = sweep_chain_errors(
+                row,
+                require_hvb=require_hvb,
+                require_leg_proof=tradeable,
+                require_single_sweep=tradeable,
+            )
+            try:
+                lifecycle_version = int(row.get("lifecycle_version") or 1)
+                chain_version = int(row.get("chain_version") or 1)
+            except (TypeError, ValueError, OverflowError):
+                lifecycle_version, chain_version = 1, 1
+            if tradeable and (
+                lifecycle_version != LIFECYCLE_VERSION or chain_version != CURRENT_CHAIN_VERSION
+            ):
+                errors.append(
+                    "tradeable row does not match the current structure/lifecycle policy; deep replay required"
+                )
+            audited[key] = errors
+            self.integrity_checked += 1
+            if not errors:
+                continue
+            self.integrity_quarantined += 1
+            if len(self.integrity_problems) < 5000:
+                self.integrity_problems[key] = errors
+            self.store.quarantine(key, errors)
+
+        recent = self.store.list(limit=limit)
+        # A still-valid setup may be older than the newest archive page. Always
+        # restore valid rows too so restart cannot turn "unmitigated" into a
+        # stale JSON row that never receives another candle.
+        valid = [row for row in self.store.all_payloads() if row.get("valid")]
+        rows = list({row.get("key"): row for row in [*recent, *valid] if row.get("key")}.values())
         for row in rows:
             key = row.get("key")
             if not key or key in self.setup_payloads:
                 continue
+            errors = audited.get(str(key))
+            if errors is None:
+                tradeable = bool(row.get("valid"))
+                errors = sweep_chain_errors(
+                    row,
+                    require_hvb=require_hvb,
+                    require_leg_proof=tradeable,
+                    require_single_sweep=tradeable,
+                )
+                try:
+                    lifecycle_version = int(row.get("lifecycle_version") or 1)
+                    chain_version = int(row.get("chain_version") or 1)
+                except (TypeError, ValueError, OverflowError):
+                    lifecycle_version, chain_version = 1, 1
+                if tradeable and (
+                    lifecycle_version != LIFECYCLE_VERSION or chain_version != CURRENT_CHAIN_VERSION
+                ):
+                    errors.append(
+                        "tradeable row does not match the current structure/lifecycle policy; deep replay required"
+                    )
+            row.update({"chain_valid": not errors, "chain_errors": errors})
             self.setup_payloads[key] = row
+            self._restore_stored_record(row)
         return len(rows)
+
+    def _restore_stored_record(self, payload: dict) -> None:
+        """Rehydrate a valid archive row so live candles keep its state honest."""
+        key = str(payload.get("key") or "")
+        symbol = str(payload.get("symbol") or "").upper()
+        timeframe = str(payload.get("timeframe") or "")
+        if (
+            not key
+            or key in self.registry
+            or not payload.get("valid")
+            or (symbol, timeframe) not in self.cells
+        ):
+            return
+        try:
+            record = SetupRecord(
+                key=key,
+                symbol=symbol,
+                timeframe=timeframe,
+                side=str(payload.get("side") or "SHORT"),
+                created_ms=int(payload.get("created_ms") or payload.get("time") or 0),
+                entry=float(payload.get("entry") or 0),
+                stop=float(payload.get("stop") or 0),
+                target=None if payload.get("target") is None else float(payload["target"]),
+                rr=payload.get("rr"),
+                zone=payload.get("zone"),
+                zones=list(payload.get("zones") or []),
+                target_rr=(
+                    None if payload.get("target_rr") is None
+                    else float(payload["target_rr"])
+                ),
+                target_model=str(payload.get("target_model") or LEG_TARGET_MODEL),
+                leg_target=(
+                    None if payload.get("leg_target") is None
+                    else float(payload["leg_target"])
+                ),
+                leg_target_ms=payload.get("leg_target_ms"),
+                leg_start_ms=payload.get("leg_start_ms"),
+                leg_break_ms=payload.get("leg_break_ms"),
+                lifecycle_version=int(payload.get("lifecycle_version") or 1),
+                mitigation_kind=payload.get("mitigation_kind"),
+                mitigation_zone=payload.get("mitigation_zone"),
+                state_reason=payload.get("state_reason"),
+                swept_level=float(payload.get("swept_level") or 0),
+                swept_side=str(payload.get("swept_side") or ""),
+                sweep_ms=int(payload.get("sweep_ms") or 0),
+                bos_level=float(payload.get("bos_level") or 0),
+                bos_ms=int(payload.get("bos_ms") or 0),
+                break_kind=str(payload.get("break_kind") or "SHIFT"),
+                hvb_ms=payload.get("hvb_ms"),
+                hvb_side=payload.get("hvb_side"),
+                state=str(payload.get("state") or "pending"),
+                touched_ms=payload.get("touched_ms"),
+                max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
+            )
+        except (TypeError, ValueError):
+            return
+        record.state = str(payload.get("state") or "pending")
+        record.state_since = int(payload.get("state_since") or record.created_ms)
+        record.touched_ms = payload.get("touched_ms")
+        record.closed_ms = payload.get("closed_ms")
+        record.last_price = payload.get("last_price")
+        record.bars = int(payload.get("bars") or 0)
+        record.stop0 = float(payload.get("stop0") or record.stop)
+        record.risk0 = (
+            float(payload.get("risk0") or abs(record.entry - record.stop0))
+            if record.touched_ms is not None else 0.0
+        )
+        record.be_ms = payload.get("be_ms")
+        record.breakeven_at_r = float(payload.get("breakeven_at_r") or 0)
+        self.registry[key] = record
+        self.by_cell.setdefault((symbol, timeframe), []).append(record)
 
     def _remember(self, payload: dict) -> None:
         """Write-through to the database. Never allowed to break the scanner."""
@@ -414,6 +894,23 @@ class Engine:
             pass
 
     # -------------------------------------------------------------- warmup
+    def _history_depth(self, timeframe: str, base_depth: int, *, calendar: bool) -> int:
+        """Bars needed for both the configured floor and calendar lookback.
+
+        A single ``history_bars`` value represents radically different periods:
+        5,000 bars is 3.5 days on 1m, 10.4 days on 3m, and nearly 14 years on
+        1d.  The selective v4.1 chain can therefore exist in recent history but
+        sit just outside the lower-timeframe replay.  Deep passes use the larger
+        of the bar floor and ``history_days``; the fast startup pass deliberately
+        remains shallow so every contract becomes live before deep work begins.
+        """
+        depth = max(120, min(50_000, int(base_depth)))
+        if not calendar or self.history_days <= 0:
+            return depth
+        step = int(TIMEFRAMES.get(timeframe, 60_000))
+        calendar_bars = math.ceil(self.history_days * 86_400_000 / max(1, step))
+        return max(depth, min(50_000, calendar_bars))
+
     def seed(self, symbol: str, timeframe: str, candles: list[dict]) -> None:
         """Prime a cell with historical closed candles."""
         cell = self.cells.get((symbol.upper(), timeframe))
@@ -424,6 +921,10 @@ class Engine:
                 self._append(cell, {**candle, "closed": True})
 
     def _append(self, cell: Cell, bar: dict) -> TdiPoint | None:
+        # The first websocket close after a REST warm-up often repeats the last
+        # historical candle. Never advance indicators or setup lifecycles twice.
+        if cell.last_close_time and int(bar["close_time"]) <= cell.last_close_time:
+            return None
         cell.candles.append(bar)
         cell.last_close_time = int(bar["close_time"])
         point = cell.tracker.add(float(bar["close"]))
@@ -433,7 +934,49 @@ class Engine:
         cell.tmap_state = cell.tmap.add(bar, atr=cell.regime_point.atr)
         return point
 
-    async def warm_symbol(self, feed, symbol: str, attempts: int = 3, force: bool = False) -> int:
+    def prepare_warmup(self, symbols: list[str]) -> None:
+        """Mark symbols before the live pump starts, closing the startup race."""
+        self._warming_symbols.update(str(symbol).upper() for symbol in symbols)
+
+    async def warm_symbol(
+        self, feed, symbol: str, attempts: int = 3, force: bool = False,
+        history_bars: int | None = None,
+    ) -> int:
+        """Warm one symbol atomically while its live closed bars wait in memory.
+
+        ``history_bars`` permits a fast breadth-first startup pass before the
+        configured deep replay. The full depth remains ``self.history_bars``.
+        """
+        symbol = symbol.upper()
+        lock = self._warm_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            self._warming_symbols.add(symbol)
+            try:
+                empty = await self._warm_symbol_history(
+                    feed, symbol, attempts=attempts, force=force, history_bars=history_bars
+                )
+                # Bars can arrive while earlier buffered bars are being applied.
+                # Keep the symbol paused and drain until the queue is actually
+                # empty; at live speed this normally runs once.
+                while self._warm_backlog.get(symbol):
+                    pending = self._warm_backlog.pop(symbol, {})
+                    for candle in sorted(pending.values(), key=lambda row: int(row["open_time"])):
+                        await self._process_stream_candle(candle)
+                return empty
+            finally:
+                # Also drain on a failed REST warm-up.  Keep the pause in place
+                # during every await; once the final loop observes an empty
+                # backlog, discard is synchronous and no event can interleave.
+                while self._warm_backlog.get(symbol):
+                    pending = self._warm_backlog.pop(symbol, {})
+                    for candle in sorted(pending.values(), key=lambda row: int(row["open_time"])):
+                        await self._process_stream_candle(candle)
+                self._warming_symbols.discard(symbol)
+
+    async def _warm_symbol_history(
+        self, feed, symbol: str, attempts: int = 3, force: bool = False,
+        history_bars: int | None = None,
+    ) -> int:
         """Load enough history for one instrument, then read the setups it holds.
 
         Returns the number of cells that still came back empty. Two things matter
@@ -447,27 +990,65 @@ class Engine:
           can ever show you are the ones that happen while it is open.
         """
         symbol = symbol.upper()
+        base_depth = self.history_bars if history_bars is None else max(
+            120, min(50_000, int(history_bars))
+        )
+        # Explicitly smaller depths are the breadth-first startup pass. The
+        # configured/full depth is the deep pass and must also honor days.
+        calendar_window = history_bars is None or base_depth >= self.history_bars
         empty = 0
         book_mode = self.strategy == "book" and self.book is not None
+        # 3m and 2h are derived on MEXC. Share their deeper 1m/1h source
+        # windows with the native 1m/1h cells instead of downloading the same
+        # rows twice for every contract.
+        history_cache: dict[str, list[dict]] = {}
         for tf in self.timeframes:
+            depth = self._history_depth(tf, base_depth, calendar=calendar_window)
             cell = self.cells.get((symbol, tf))
             if cell is None or (len(cell.candles) >= 120 and not force):
                 continue
             candles: list[dict] = []
             for attempt in range(attempts):
                 interval = feed.exchange_interval(tf) if hasattr(feed, "exchange_interval") else tf
-                if interval is None:  # exchange has no such candle: build it from 1m
-                    if await self._warm_from_minutes(feed, symbol, tf):
+                if interval is None:  # exchange has no native candle: aggregate a lower one
+                    if await self._warm_from_lower(
+                        feed, symbol, tf, history_cache, history_bars=depth
+                    ):
                         candles = []
                         break
                 else:
                     try:
-                        candles = await feed.history(symbol, interval, 2500)
+                        request_bars = depth
+                        if (
+                            tf == "1m"
+                            and "3m" in self.timeframes
+                            and feed.exchange_interval("3m") is None
+                        ):
+                            derived = self._history_depth(
+                                "3m", base_depth, calendar=calendar_window
+                            )
+                            request_bars = min(50_000, max(depth, (derived + 3) * 3))
+                        elif (
+                            tf == "1h"
+                            and "2h" in self.timeframes
+                            and feed.exchange_interval("2h") is None
+                        ):
+                            derived = self._history_depth(
+                                "2h", base_depth, calendar=calendar_window
+                            )
+                            request_bars = min(50_000, max(depth, (derived + 3) * 2))
+                        cached = history_cache.get(interval) or []
+                        candles = cached if len(cached) >= request_bars - 3 else await feed.history(
+                            symbol, interval, request_bars
+                        )
                         if candles:
+                            history_cache[interval] = candles
                             break
                     except Exception as exc:
                         if attempt == attempts - 1:
-                            if await self._warm_from_minutes(feed, symbol, tf):
+                            if await self._warm_from_lower(
+                                feed, symbol, tf, history_cache, history_bars=depth
+                            ):
                                 candles = []
                                 break
                             self.warm_failures[f"{symbol}:{tf}"] = attempt + 1
@@ -477,7 +1058,9 @@ class Engine:
                         else:
                             await asyncio.sleep(0.6 * (attempt + 1))
             if candles:
-                await self._replay(symbol, tf, candles, evaluate=not book_mode)
+                await self._replay(
+                    symbol, tf, candles[-depth:], evaluate=not book_mode
+                )
                 self.warm_failures.pop(f"{symbol}:{tf}", None)
             current = self.cells.get((symbol, tf), cell)
             if len(current.candles) < 120:
@@ -568,8 +1151,8 @@ class Engine:
 
         Two details matter:
 
-        * the whole fetched history is replayed (600 bars), not just the 180 the
-          cell keeps, so a setup that confirmed 8 hours ago is still found;
+        * the whole configured history window is replayed, not just the 180 the
+          cell keeps for charts, so older unmitigated setups are still found;
         * the lifecycle runs over that history too, so an old setup is reported
           as expired/stopped instead of pretending to still be pending.
         """
@@ -584,7 +1167,9 @@ class Engine:
             rollup=cell.rollup if timeframe != "1m" else None,
             regime_limits=cell.regime_limits,
         )
-        self.by_cell[(cell.symbol, cell.timeframe)] = []
+        # Keep restored valid records attached: replayed candles after their
+        # creation must continue their lifecycle. Duplicate keys are replaced by
+        # the live derivation in _register, never tracked twice.
         self._quiet += 1
         self._collected = []
         try:
@@ -617,7 +1202,101 @@ class Engine:
             if cell.tracker.last is None or len(cell.candles) < 120
         )
 
-    async def warmup(self, feed, concurrency: int = 30) -> None:
+    def coverage(self) -> dict[str, int]:
+        """Exact warm-up breadth, separated from exchange/feed health."""
+        total = len(self.cells)
+        ready = sum(
+            1 for cell in self.cells.values()
+            if cell.tracker.last is not None and len(cell.candles) >= 120
+        )
+        ready_symbols = 0
+        partial_symbols = 0
+        empty_symbols = 0
+        for symbol in self.symbols:
+            cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
+            hits = sum(
+                1 for cell in cells
+                if cell is not None and cell.tracker.last is not None and len(cell.candles) >= 120
+            )
+            if cells and hits == len(cells):
+                ready_symbols += 1
+            elif hits:
+                partial_symbols += 1
+            else:
+                empty_symbols += 1
+        return {
+            "cells_total": total,
+            "cells_ready": ready,
+            "cells_waiting": max(0, total - ready),
+            "failed_cells": len(self.warm_failures),
+            "symbols_total": len(self.symbols),
+            "symbols_ready": ready_symbols,
+            "symbols_partial": partial_symbols,
+            "symbols_empty": empty_symbols,
+            "symbols_active_warmup": len(self._warming_symbols),
+        }
+
+    def decision_funnel(self) -> dict[str, Any]:
+        """Exact current-window funnel, first blockers, and overlapping gates.
+
+        ``filtered`` counts setups. ``rejection_hits`` deliberately counts every
+        failed gate and can therefore be larger. Earlier reporting labelled the
+        latter as "filtered out", making 42 rejected setups look like 160 and
+        obscuring the fact that every one first failed the same trend-context
+        gate. Per-timeframe evidence makes production silence auditable.
+        """
+
+        def blank() -> dict[str, Any]:
+            return {
+                "setups": 0,
+                "hvb_aligned": 0,
+                "filtered": 0,
+                "passed": 0,
+                "first_rejections": {},
+                "rejection_hits": {},
+                "rejection_combinations": {},
+            }
+
+        def merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+            for key, value in source.items():
+                target[key] = target.get(key, 0) + int(value)
+
+        def ranked(values: dict[str, int], limit: int = 12) -> dict[str, int]:
+            return dict(sorted(values.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+        total = blank()
+        by_timeframe: dict[str, dict[str, Any]] = {
+            timeframe: blank() for timeframe in self.timeframes
+        }
+        for cell in self.cells.values():
+            bucket = by_timeframe.setdefault(cell.timeframe, blank())
+            for name, value in (
+                ("setups", cell.raw_setups),
+                ("hvb_aligned", cell.hvb_aligned_setups),
+                ("filtered", cell.filtered_setups),
+                ("passed", cell.passed_setups),
+            ):
+                bucket[name] += value
+                total[name] += value
+            for target, source in (
+                (bucket["first_rejections"], cell.first_rejections),
+                (bucket["rejection_hits"], cell.rejection_reasons),
+                (bucket["rejection_combinations"], cell.rejection_combinations),
+                (total["first_rejections"], cell.first_rejections),
+                (total["rejection_hits"], cell.rejection_reasons),
+                (total["rejection_combinations"], cell.rejection_combinations),
+            ):
+                merge_counts(target, source)
+
+        for bucket in [total, *by_timeframe.values()]:
+            bucket["first_rejections"] = ranked(bucket["first_rejections"])
+            bucket["rejection_hits"] = ranked(bucket["rejection_hits"])
+            bucket["rejection_combinations"] = ranked(bucket["rejection_combinations"])
+        return {**total, "by_timeframe": by_timeframe}
+
+    async def warmup(
+        self, feed, concurrency: int = 30, history_bars: int | None = None
+    ) -> None:
         """History for every instrument, in parallel, one bad symbol at a time.
 
         Serial warm-up is what made a 120-instrument universe look dead for
@@ -628,13 +1307,17 @@ class Engine:
         symbols = list(self.symbols)
         if not symbols:
             return
+        self.prepare_warmup(symbols)
         limit = max(1, min(int(concurrency), len(symbols)))
         gate = asyncio.Semaphore(limit)
 
         async def one(symbol: str) -> None:
             async with gate:
                 try:
-                    await self.warm_symbol(feed, symbol)
+                    if history_bars is None:
+                        await self.warm_symbol(feed, symbol)
+                    else:
+                        await self.warm_symbol(feed, symbol, history_bars=history_bars)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # one bad symbol must not stop the rest
@@ -652,9 +1335,12 @@ class Engine:
         self.setup_payloads.clear()
         self.setup_events.clear()
         self.by_cell.clear()
+        self.seen.clear()
+        self.signals.clear()
 
     async def rescan(
-        self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30
+        self, feed, only_missing: bool = False, reset: bool = False, concurrency: int = 30,
+        history_bars: int | None = None,
     ) -> dict[str, Any]:
         """Re-read history and re-run the scan.
 
@@ -663,12 +1349,17 @@ class Engine:
         """
         if reset:
             self.forget_setups()
-        found = 0
+        # Rejection counters must describe this replay/current policy, not an
+        # ever-growing sum of startup pass + deep pass + every manual rescan.
+        self.filters.rejections.clear()
+        self.filters.passed = 0
+        before = set(self.setup_payloads)
         warmed = 0
+        self.prepare_warmup(list(self.symbols))
         gate = asyncio.Semaphore(max(1, int(concurrency)))
 
         async def one(symbol: str) -> None:
-            nonlocal found, warmed
+            nonlocal warmed
             async with gate:
                 cells = [self.cells.get((symbol, tf)) for tf in self.timeframes]
                 missing = any(c is None or len(c.candles) < 120 for c in cells)
@@ -676,11 +1367,14 @@ class Engine:
                     # re-fetch the full window: a cell only *keeps* 180 bars, so
                     # re-scanning the buffer would look at half the history the
                     # first scan saw and quietly lose setups that are still alive
-                    await self.warm_symbol(feed, symbol, force=True)
+                    await self.warm_symbol(
+                        feed, symbol, force=True, history_bars=history_bars
+                    )
                     warmed += 1
 
         await asyncio.gather(*(one(symbol) for symbol in self.symbols))
         await self._emit_state(force=True)
+        found = len(set(self.setup_payloads) - before)
         return {"symbols": len(self.symbols), "setups": found, "warmed": warmed}
 
     async def retry_failed(self, feed) -> int:
@@ -716,19 +1410,35 @@ class Engine:
             found.extend(await self._replay(symbol, tf, list(cell.candles)))
         return found
 
-    async def _warm_from_minutes(self, feed, symbol: str, tf: str) -> bool:
-        """Fall back to rolling 1m history up when the exchange has no such candle."""
+    async def _warm_from_lower(
+        self, feed, symbol: str, tf: str, history_cache: dict[str, list[dict]] | None = None,
+        history_bars: int | None = None,
+    ) -> bool:
+        """Build a non-native timeframe from the nearest practical lower one.
+
+        MEXC has no 3m or 2h contract candles. Building 2h from 1m multiplied a
+        deep scan into hundreds of thousands of rows per contract; 1h is exact,
+        clock-aligned input for 2h and is two orders of magnitude cheaper.
+        """
         cell = self.cells.get((symbol, tf))
         if cell is None:
             return False
-        minutes = int(TIMEFRAMES[tf] / 60_000)
-        # enough 1m bars to fill this timeframe's window - a 1h cell needs
-        # 120 hours of minutes, not 1,000 bars (that was 16 candles)
-        need = min(60_000, (self.min_bars + 5) * minutes)
-        try:
-            bars = await feed.history(symbol, "1m", need)
-        except Exception:
-            return False
+        source = {"3m": "1m", "2h": "1h"}.get(tf, "1m")
+        source_ms = TIMEFRAMES[source]
+        target_ms = TIMEFRAMES[tf]
+        ratio = max(1, target_ms // source_ms)
+        depth = self.history_bars if history_bars is None else max(
+            120, min(50_000, int(history_bars))
+        )
+        need = min(50_000, (depth + 3) * ratio)
+        cache = history_cache if history_cache is not None else {}
+        bars = cache.get(source) or []
+        if source not in cache:
+            try:
+                bars = await feed.history(symbol, source, need)
+                cache[source] = bars
+            except Exception:
+                return False
         if not bars:
             return False
         rollup = Rollup(tf)
@@ -738,7 +1448,7 @@ class Engine:
                 built.append(done)
         if not built:
             return False
-        await self._replay(symbol, tf, built)
+        await self._replay(symbol, tf, built[-depth:])
         return True
 
     def _prime_partial(self, cell: Cell, minutes: list[dict]) -> None:
@@ -751,13 +1461,28 @@ class Engine:
 
     # ------------------------------------------------------------- candles
     async def on_candle(self, candle: dict) -> None:
+        """Accept one stream update, buffering closed bars during REST rebuilds."""
         symbol = candle["symbol"].upper()
-
-        # The forming candle is only used for the live preview - never for alerts.
         if not candle.get("closed", True):
-            self._preview(symbol, candle)
+            if symbol not in self._warming_symbols:
+                self._preview(symbol, candle)
             return
+        if symbol in self._warming_symbols:
+            self._warm_backlog.setdefault(symbol, {})[int(candle["open_time"])] = dict(candle)
+            return
+        await self._process_stream_candle(candle)
 
+    async def _process_stream_candle(self, candle: dict) -> None:
+        """Apply one unique, closed base candle after warm-up coordination."""
+        symbol = candle["symbol"].upper()
+        opened = int(candle["open_time"])
+        if opened <= self._last_stream_open.get(symbol, -1):
+            return  # reconnects can repeat the last closed kline
+        self._last_stream_open[symbol] = opened
+        await self._process_candle(candle)
+
+    async def _process_candle(self, candle: dict) -> None:
+        symbol = candle["symbol"].upper()
         self.candles_seen += 1
         self.last_event_at = time.time()
 
@@ -772,14 +1497,15 @@ class Engine:
                 completed = cell.rollup.add(candle) if cell.rollup else []
             for bar in completed:
                 point = self._append(cell, bar)
+                if point is None:
+                    continue  # duplicate/out-of-order bar, no lifecycle advance
                 # first: did this candle change the life of an existing setup?
                 self._track_setups(cell, bar)
                 if book is not None:
                     # the decision belongs to the narrative engine; the cell is
                     # kept for the chart only (candles, markers, TDI pane)
                     continue
-                if point is not None:
-                    await self._evaluate(cell, bar, point)
+                await self._evaluate(cell, bar, point)
 
         if book is not None:
             for plan in book.on_candle(candle):
@@ -803,26 +1529,23 @@ class Engine:
     async def _evaluate(self, cell: Cell, bar: dict, point: TdiPoint) -> None:
         if len(cell.candles) < self.min_bars:
             return
-        prev = cell.tracker.prev
         hvb = None
         hvb_points = 0.0
         centre_cross = None
         hvb_speed = None
-        if prev is not None:
-            before = centre_of(prev, self.centre_reference)
-            centre = centre_of(point, self.centre_reference)
-            if before is not None and centre is not None:
-                if crossed_above(prev.fast, before, point.fast, centre):
-                    centre_cross = "up"
-                elif crossed_below(prev.fast, before, point.fast, centre):
-                    centre_cross = "down"
-                if centre_cross:
-                    hvb_points = (point.fast - centre) if centre_cross == "up" else (centre - point.fast)
-                    hvb_speed = line_speed(cell.tracker.history, len(cell.tracker.history) - 1)
-                    enough_points = self.hvb_min_points <= 0 or hvb_points >= self.hvb_min_points
-                    enough_speed = self.hvb_min_speed <= 0 or (hvb_speed is not None and hvb_speed >= self.hvb_min_speed)
-                    if enough_points and enough_speed:
-                        hvb = centre_cross
+        hvb_proof: dict[str, Any] | None = None
+        cross = centre_cross_evidence(
+            cell.tracker.history, len(cell.tracker.history) - 1
+        )
+        if cross is not None:
+            centre_cross = str(cross["side"])
+            hvb_points = float(cross["points"])
+            hvb_speed = float(cross["speed"])
+            enough_points = self.hvb_min_points <= 0 or hvb_points >= self.hvb_min_points
+            enough_speed = self.hvb_min_speed <= 0 or hvb_speed >= self.hvb_min_speed
+            if enough_points and enough_speed:
+                hvb = centre_cross
+                hvb_proof = cross
 
         brk = break_signal(list(cell.candles), len(cell.candles) - 1, self.break_lookback)
         structure = cell.structure
@@ -842,9 +1565,14 @@ class Engine:
             "fast": _r(point.fast),
             "slow": _r(point.slow),
             "mbl": _r(point.mbl),
-            "centre": _r(centre_of(point, self.centre_reference)),
-            "centre_reference": self.centre_reference,
-            "centre_label": "middle of bands" if self.centre_reference == "mbl" else "50 midline",
+            "centre": _r(centre_of(point)),
+            "centre_reference": "mbl",
+            "centre_label": "moving middle band",
+            "hvb_model": HVB_MODEL if hvb_proof else None,
+            "hvb_prev_fast": float(hvb_proof["prev_fast"]) if hvb_proof else None,
+            "hvb_prev_centre": float(hvb_proof["prev_centre"]) if hvb_proof else None,
+            "hvb_fast": float(hvb_proof["fast"]) if hvb_proof else None,
+            "hvb_centre": float(hvb_proof["centre"]) if hvb_proof else None,
             "upper": _r(point.upper),
             "lower": _r(point.lower),
             "trend": cell.trend,
@@ -861,6 +1589,9 @@ class Engine:
             await self._confirm_pending(cell, bar, hvb, hvb_points, hvb_speed, centre_cross, base, point)
 
         if setup is not None:
+            cell.raw_setups += 1
+            if hvb:
+                cell.hvb_aligned_setups += 1
             book = self._confluence(cell, setup, bar)
             depth = cell.tmap.depth(setup.side, setup.break_kind, setup.index)
             candidate = {
@@ -913,12 +1644,24 @@ class Engine:
             candidate["grade"] = grade_of(candidate)
             ok, reasons = self._apply_filters(cell, candidate, bar)
             if ok:
+                cell.passed_setups += 1
                 candidate["filtered"] = []
                 cell.last_setup = setup.as_dict()
                 cell.alerts += 1
                 self.cooldowns[(cell.symbol, cell.timeframe)] = time.time()
                 await self._publish(cell, candidate, bar)
             else:
+                cell.filtered_setups += 1
+                keys = list(dict.fromkeys(rejection_key(reason) for reason in reasons))
+                if keys:
+                    first = keys[0]
+                    cell.first_rejections[first] = cell.first_rejections.get(first, 0) + 1
+                    for key in keys:
+                        cell.rejection_reasons[key] = cell.rejection_reasons.get(key, 0) + 1
+                    combination = " + ".join(keys)
+                    cell.rejection_combinations[combination] = (
+                        cell.rejection_combinations.get(combination, 0) + 1
+                    )
                 await self._emit(
                     {
                         "type": "filtered",
@@ -997,17 +1740,22 @@ class Engine:
                 index = i - self.break_lookback if i >= self.break_lookback else 0
                 level = max(float(c["high"]) for c in candles[max(0, i - self.break_lookback):i]) if brk == "high" else min(float(c["low"]) for c in candles[max(0, i - self.break_lookback):i])
                 bos.append({"t": int(bar["open_time"]), "dir": 1 if brk == "high" else -1, "level": level})
-            prev, point = points[i - 1], points[i]
-            if prev is None or point is None:
-                continue
-            before = centre_of(prev, self.centre_reference)
-            centre = centre_of(point, self.centre_reference)
-            if before is None or centre is None:
-                continue
-            if crossed_above(prev.fast, before, point.fast, centre):
-                hvb.append({"t": int(bar["open_time"]), "side": "up"})
-            elif crossed_below(prev.fast, before, point.fast, centre):
-                hvb.append({"t": int(bar["open_time"]), "side": "down"})
+            proof = centre_cross_evidence(points, i)
+            side = hvb_signal(
+                points, i,
+                min_points=self.hvb_min_points,
+                min_speed=self.hvb_min_speed,
+            )
+            if side and proof is not None:
+                hvb.append({
+                    "t": int(bar["open_time"]),
+                    "side": side,
+                    "model": HVB_MODEL,
+                    "prev_fast": round(float(proof["prev_fast"]), 4),
+                    "prev_centre": round(float(proof["prev_centre"]), 4),
+                    "fast": round(float(proof["fast"]), 4),
+                    "centre": round(float(proof["centre"]), 4),
+                })
         return {"bos": bos[-40:], "hvb": hvb[-40:]}
 
     async def _confirm_pending(
@@ -1037,6 +1785,7 @@ class Engine:
         want = "down" if held["side"] == "SHORT" else "up"
         if lag > window:
             cell.pending = None
+            cell.filtered_setups += 1
             self.filters.rejections["no HVB inside the window"] = (
                 self.filters.rejections.get("no HVB inside the window", 0) + 1
             )
@@ -1044,6 +1793,7 @@ class Engine:
         if not hvb or hvb != want:
             return
         cell.pending = None
+        cell.hvb_aligned_setups += 1
         candidate = dict(held["candidate"])
         candidate.update(
             {
@@ -1064,8 +1814,10 @@ class Engine:
         candidate["grade"] = grade_of(candidate)
         ok, reasons = self._apply_filters(cell, candidate, bar)
         if not ok:
+            cell.filtered_setups += 1
             await self._emit({"type": "filtered", "alert": {**candidate, "filtered": reasons}})
             return
+        cell.passed_setups += 1
         candidate["filtered"] = []
         cell.alerts += 1
         self.cooldowns[(cell.symbol, cell.timeframe)] = time.time()
@@ -1101,6 +1853,25 @@ class Engine:
 
     async def _publish(self, cell: Cell, alert: dict, bar: dict) -> None:
         kind = alert["kind"]
+        if kind == "signal" and self.strategy == "sweep":
+            validation_payload = {**alert, "chain_version": CURRENT_CHAIN_VERSION}
+            errors = sweep_chain_errors(
+                validation_payload,
+                # HVB is a structural invariant, not an optional score/filter:
+                # no sweep setup can publish without the same-candle MBL cross.
+                require_hvb=True,
+                require_leg_proof=True,
+                require_single_sweep=True,
+            )
+            if errors:
+                reason = "integrity: " + "; ".join(errors)
+                self.filters.rejections[reason] = self.filters.rejections.get(reason, 0) + 1
+                if not self._quiet:
+                    await self._emit(
+                        {"type": "filtered", "alert": {**alert, "filtered": errors, "chain_valid": False}}
+                    )
+                return
+            alert = {**alert, "chain_valid": True, "chain_errors": []}
         key = (cell.symbol, cell.timeframe, int(bar["close_time"]), kind)
         if key in self.seen:
             return
@@ -1156,6 +1927,17 @@ class Engine:
             target=float(plan["target"]) if plan.get("target") else None,
             rr=plan.get("rr"),
             zone=zone,
+            zones=[zone],
+            target_rr=float(plan.get("rr") or DEFAULT_TARGET_RR),
+            target_model="book_plan",
+            leg_target=float(plan["target"]) if plan.get("target") else None,
+            leg_target_ms=int(plan["created_ms"]),
+            leg_start_ms=int(trap.get("time") or plan["created_ms"]),
+            leg_break_ms=int((plan.get("shift") or {}).get("time") or plan["created_ms"]),
+            lifecycle_version=LIFECYCLE_VERSION,
+            mitigation_kind="fvg",
+            mitigation_zone=zone,
+            state_reason="FVG mitigation confirmed the book entry",
             swept_level=float(trap.get("level") or 0.0),
             swept_side=str(trap.get("side") or ""),
             sweep_ms=int(trap.get("time") or 0),
@@ -1198,31 +1980,67 @@ class Engine:
         setup = alert.get("setup") or {}
         side = alert.get("side") or setup.get("side") or "SHORT"
         key = f"{alert['symbol']}|{alert['timeframe']}|{alert['time']}"
+        if key in self.setup_payloads and self.setup_payloads[key].get("stored"):
+            # A row loaded from the archive: replace both its JSON and its
+            # rehydrated lifecycle object with the freshly derived record.
+            old = self.registry.pop(key, None)
+            if old is not None:
+                records = self.by_cell.get((old.symbol, old.timeframe), [])
+                self.by_cell[(old.symbol, old.timeframe)] = [row for row in records if row.key != key]
+            self.setup_payloads.pop(key, None)
         if key in self.registry:
             return self.setup_payloads[key]
-        if key in self.setup_payloads and self.setup_payloads[key].get("stored"):
-            # a row loaded from the archive: replace it with the live record
-            self.setup_payloads.pop(key, None)
         # the cell being evaluated - during a history replay that is the *fresh*
         # cell, not the one in self.cells yet
         source = cell or self.cells.get((alert["symbol"], alert["timeframe"]))
         candles = list(source.candles) if source is not None else []
+        stop = float(setup.get("stop") or 0.0)
+        block = order_block(candles, side)
+        breaker = breaker_block(
+            candles,
+            side,
+            int(setup.get("broke_level_time") or 0),
+            stop,
+            min_body_atr=float(self.filters.config.get("breaker_body_atr") or 1.0),
+            stop_buffer_atr=float(self.filters.config.get("breaker_stop_buffer_atr", 0.10)),
+        )
+        zones = [zone for zone in (breaker, block) if zone is not None]
+        # Until a zone is actually mitigated this is only the nearest planned
+        # fill. The lifecycle will replace it with the touched zone's proximal
+        # edge and freeze the favorable H/L of this setup's confirmation leg.
+        if zones:
+            planned_entry = (
+                min(float(zone["low"]) for zone in zones) if side == "SHORT"
+                else max(float(zone["high"]) for zone in zones)
+            )
+        else:
+            planned_entry = float(setup.get("entry") or alert.get("price") or 0.0)
+        confirmation_leg = setup.get("confirmation_leg") or {}
+        leg_target = setup.get("leg_target", setup.get("target"))
         record = SetupRecord(
             key=key,
             symbol=alert["symbol"],
             timeframe=alert["timeframe"],
             side=side,
             created_ms=int(alert["time"]),
-            entry=float(setup.get("entry") or alert.get("price") or 0.0),
-            stop=float(setup.get("stop") or 0.0),
-            target=None if setup.get("target") is None else float(setup["target"]),
-            rr=setup.get("rr"),
-            zone=order_block(candles, side),
+            entry=planned_entry,
+            stop=stop,
+            target=None,
+            rr=None,
+            zone=block,
+            zones=zones,
+            target_rr=None,
+            target_model=str(setup.get("target_model") or LEG_TARGET_MODEL),
+            leg_target=None if leg_target is None else float(leg_target),
+            leg_target_ms=setup.get("leg_target_ms") or confirmation_leg.get("target_time"),
+            leg_start_ms=confirmation_leg.get("start_time") or setup.get("sweep_time"),
+            leg_break_ms=confirmation_leg.get("break_time") or setup.get("break_time"),
+            lifecycle_version=LIFECYCLE_VERSION,
             swept_level=float(setup.get("swept_level") or 0.0),
             swept_side=str(setup.get("swept_side") or ""),
             sweep_ms=int(setup.get("sweep_time") or 0),
             bos_level=float(setup.get("broke_level") or 0.0),
-            bos_ms=int(setup.get("broke_time") or 0),
+            bos_ms=int(setup.get("break_time") or alert.get("time") or 0),
             break_kind=str(setup.get("break_kind") or "SHIFT"),
             hvb_ms=int(alert["time"]) if alert.get("hvb") else None,
             hvb_side=alert.get("hvb"),
@@ -1234,7 +2052,29 @@ class Engine:
             trend_clean=((alert.get("context") or {}).get("external") or {}).get("clean"),
             grade=alert.get("grade"),
             reasons=_evidence(alert),
-            max_bars=int(self.filters.config.get("setup_max_bars") or 240),
+            max_bars=max(0, int(self.filters.config.get("setup_max_bars", 0))),
+        )
+        if breaker is not None:
+            record.reasons.append(
+                f"aggressive {breaker['body_atr']:.2f} ATR shift armed a "
+                f"{breaker['kind'].replace('_', ' ')}"
+            )
+        record.reasons.append(
+            "price moved directly from the paired opposite endpoint into the sweep "
+            "with no intervening structural turn"
+        )
+        sweep_displacement = setup.get("sweep_displacement") or {}
+        break_displacement = setup.get("break_displacement") or {}
+        if sweep_displacement and break_displacement:
+            record.reasons.append(
+                "directed displacement qualified both events: "
+                f"sweep {float(sweep_displacement.get('body_atr') or 0):.2f} ATR and "
+                f"paired break {float(break_displacement.get('body_atr') or 0):.2f} ATR"
+            )
+        target_side = "low" if side == "SHORT" else "high"
+        record.reasons.append(
+            f"target is the {target_side} of the sweep-to-HVB/BOS confirmation leg; "
+            "it can extend while pending and freezes immediately before mitigation"
         )
         self.registry[key] = record
         cell_records = self.by_cell.setdefault((record.symbol, record.timeframe), [])
@@ -1246,8 +2086,20 @@ class Engine:
         # one object, so the feed, the card and the API cannot disagree
         payload = {**alert, **{k: v for k, v in record.as_dict().items() if k not in {"key"}}}
         payload["kind"] = "signal"
+        payload["strategy"] = "sweep"
+        payload["chain_version"] = CURRENT_CHAIN_VERSION
+        payload["approach_model"] = setup.get("approach_model")
+        payload["approach_start_ms"] = setup.get("approach_start_time")
+        payload["approach_end_ms"] = setup.get("approach_end_time")
+        payload["approach_bars"] = setup.get("approach_bars")
+        payload["approach_pivot_count"] = setup.get("approach_pivot_count")
+        payload["displacement_model"] = setup.get("displacement_model")
+        payload["sweep_displacement"] = setup.get("sweep_displacement")
+        payload["break_displacement"] = setup.get("break_displacement")
         payload["key"] = key
         payload["setup"] = setup
+        payload["chain_valid"] = True
+        payload["chain_errors"] = []
         self.setup_payloads[key] = payload
         self._remember(payload)
         return payload
@@ -1260,6 +2112,8 @@ class Engine:
         for record in records:
             if record.state in DONE:
                 continue
+            if int(bar.get("close_time") or 0) <= record.created_ms:
+                continue  # history before this setup existed cannot age/fill it
             if not record.advance(bar):
                 continue
             payload = self.setup_payloads.get(record.key)
@@ -1289,8 +2143,24 @@ class Engine:
         imbalance it is sitting in, and what it still needs to fire.
         """
         if self.book is None:
-            return []
-        rows: list[dict[str, Any]] = []
+            rows: list[dict[str, Any]] = []
+            for cell in self.cells.values():
+                last = cell.candles[-1] if cell.candles else None
+                armed = cell.structure.armed(last["close"] if last else None)
+                if not armed:
+                    continue
+                rows.append(
+                    {
+                        "mode": "sweep",
+                        "symbol": cell.symbol,
+                        "timeframe": cell.timeframe,
+                        "structure": armed,
+                        "regime": self._regime_dict(cell),
+                    }
+                )
+            rows.sort(key=lambda row: -int((row.get("structure") or {}).get("sweep_time") or 0))
+            return rows[:limit]
+        rows = []
         for symbol, state in self.book.states.items():
             for timeframe, narrative in state.narratives.items():
                 if narrative.trap is None:
@@ -1306,45 +2176,253 @@ class Engine:
             counts[row["state"]] = counts.get(row["state"], 0) + 1
         return counts
 
-    def chart(self, symbol: str, timeframe: str, bars: int = 180) -> dict:
-        """Candles plus every marker the setup is made of, for one cell."""
+    async def chart_history(
+        self,
+        feed,
+        symbol: str,
+        timeframe: str,
+        *,
+        bars: int = 600,
+        at: int = 0,
+    ) -> list[dict]:
+        """Fetch an audit window centred on an old setup instead of on today.
+
+        A 1d signal from January cannot be audited with the cell's latest 180
+        candles in November.  Exchange history is therefore requested with an
+        explicit end time after the setup, leaving ample pre-sweep context and a
+        smaller amount of post-signal lifecycle context.  Unsupported MEXC 3m
+        and 2h windows are rebuilt from their canonical lower timeframe.
+        """
+        symbol = symbol.upper()
+        if timeframe not in TIMEFRAMES or not hasattr(feed, "history"):
+            return []
+        wanted = max(80, min(1000, int(bars)))
+        step = TIMEFRAMES[timeframe]
+        focus = max(0, int(at))
+        after = max(20, min(80, wanted // 4))
+        end_time = focus + after * step if focus else None
+        interval = feed.exchange_interval(timeframe) if hasattr(feed, "exchange_interval") else timeframe
+
+        async def fetch(name: str, limit: int) -> list[dict]:
+            try:
+                return await feed.history(symbol, name, limit, end_time=end_time) or []
+            except TypeError:
+                # A small third-party/test feed may still implement the older
+                # signature. It can provide latest data, just not time travel.
+                return await feed.history(symbol, name, limit) or []
+
+        if interval is not None:
+            return (await fetch(interval, wanted))[-wanted:]
+
+        source = "1m" if timeframe == "3m" else "1h" if timeframe == "2h" else None
+        if source is None:
+            return []
+        ratio = max(1, TIMEFRAMES[timeframe] // TIMEFRAMES[source])
+        raw = await fetch(source, wanted * ratio + ratio)
+        rollup = Rollup(timeframe)
+        out: list[dict] = []
+        for candle in raw:
+            out.extend(rollup.add(candle))
+        # Rollup only emits when the next bucket starts. Flush solely when the
+        # source bars prove that the final target bucket is actually complete.
+        if rollup.start is not None and raw:
+            target_end = int(rollup.start) + TIMEFRAMES[timeframe] - 1
+            if int(raw[-1].get("close_time") or 0) >= target_end:
+                out.extend(rollup.flush())
+        return out[-wanted:]
+
+    @staticmethod
+    def _live_risk_reward(selected: dict | None, market: dict | None, enabled: bool) -> dict:
+        """Mark-to-market R without mutating the closed-candle lifecycle.
+
+        ``planned_rr`` is target reward divided by initial risk. ``current_r`` is
+        P/L from the actual mitigation entry in those same initial-risk units.
+        ``remaining_rr`` is reward-to-risk from the current market price to the
+        frozen target/current stop. Pending setups expose only a projected plan;
+        no live P/L is invented before mitigation.
+        """
+        result: dict[str, Any] = {"enabled": bool(enabled), "forming": False}
+        if not enabled or market is None:
+            return result
+
+        def number(value: Any) -> float | None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+
+        price = number(market.get("close"))
+        high = number(market.get("high"))
+        low = number(market.get("low"))
+        result.update(
+            {
+                "forming": not bool(market.get("closed", True)),
+                "price": price,
+                "high": high,
+                "low": low,
+                "at": int(market.get("close_time") or market.get("open_time") or 0),
+                "updated_ms": int(market.get("_received_ms") or 0),
+            }
+        )
+        if selected is None or price is None:
+            return result
+
+        side = str(selected.get("side") or "").upper()
+        state = str(selected.get("state") or "pending").lower()
+        mitigated = bool(selected.get("mitigated") or selected.get("touched_ms"))
+        entry = number(selected.get("entry"))
+        stop = number(selected.get("stop"))
+        stop0 = number(selected.get("stop0")) or stop
+        target = number(selected.get("target")) if mitigated else number(selected.get("leg_target"))
+        initial_risk = number(selected.get("risk0")) if mitigated else None
+        if not initial_risk and entry is not None and stop0 is not None:
+            initial_risk = abs(entry - stop0)
+
+        planned_rr = None
+        if entry is not None and target is not None and initial_risk and initial_risk > 0:
+            reward = entry - target if side == "SHORT" else target - entry
+            if reward > 0:
+                planned_rr = reward / initial_risk
+
+        result.update(
+            {
+                "side": side,
+                "state": state,
+                "mitigated": mitigated,
+                "planned_rr": None if planned_rr is None else round(planned_rr, 4),
+                "current_r": None,
+                "remaining_rr": None,
+                "status": "pending_unfilled" if state == "pending" else state,
+            }
+        )
+        if state != "active" or not mitigated or entry is None or stop is None or target is None:
+            return result
+
+        if initial_risk and initial_risk > 0:
+            move = entry - price if side == "SHORT" else price - entry
+            result["current_r"] = round(move / initial_risk, 4)
+
+        if side == "SHORT":
+            hit_stop = high is not None and high >= stop
+            hit_target = low is not None and low <= target
+        else:
+            hit_stop = low is not None and low <= stop
+            hit_target = high is not None and high >= target
+        if hit_stop and hit_target:
+            result["status"] = "both_touched_live"
+        elif hit_stop:
+            result["status"] = "stop_touched_live"
+        elif hit_target:
+            result["status"] = "target_touched_live"
+        else:
+            result["status"] = "active_live"
+
+        remaining_reward = price - target if side == "SHORT" else target - price
+        remaining_risk = stop - price if side == "SHORT" else price - stop
+        if remaining_reward > 0 and remaining_risk > 0:
+            result["remaining_rr"] = round(remaining_reward / remaining_risk, 4)
+        return result
+
+    def chart(
+        self,
+        symbol: str,
+        timeframe: str,
+        bars: int = 180,
+        *,
+        candles_override: list[dict] | None = None,
+        selected: dict | None = None,
+        live: bool = False,
+    ) -> dict:
+        """Candles and an explicit, auditable sweep -> break -> HVB chain.
+
+        Setup mode is immutable historical evidence. Live mode deliberately uses
+        the in-memory tail and appends the still-forming exchange candle without
+        allowing it into indicators, structure, or lifecycle decisions.
+        """
         cell = self.cells.get((symbol.upper(), timeframe))
         if cell is None:
-            return {"symbol": symbol, "timeframe": timeframe, "candles": [], "setups": []}
-        candles = list(cell.candles)[-max(20, min(400, bars)):]
+            return {
+                "symbol": symbol, "timeframe": timeframe, "candles": [], "setups": [],
+                "live": {"enabled": bool(live), "forming": False},
+            }
+        limit = max(20, min(1000, bars))
+        closed_candles = list(
+            candles_override if candles_override is not None else cell.candles
+        )[-limit:]
+        candles = list(closed_candles)
+        forming_added = False
+        if live and candles_override is None and cell.forming is not None:
+            forming = dict(cell.forming)
+            forming["closed"] = False
+            if not candles or int(forming.get("open_time") or 0) > int(candles[-1].get("open_time") or 0):
+                candles.append(forming)
+                forming_added = True
+        candles = candles[-limit:]
         first = int(candles[0]["open_time"]) if candles else 0
+        last = int(candles[-1]["close_time"]) if candles else 0
         rows = []
         for bar in candles:
             rows.append(
                 {
                     "t": int(bar["open_time"]),
+                    "ct": int(bar["close_time"]),
                     "o": bar["open"],
                     "h": bar["high"],
                     "l": bar["low"],
                     "c": bar["close"],
                     "v": bar.get("volume"),
+                    "closed": bar.get("closed", True),
                 }
             )
         setups = [
             row
             for row in self.setup_payloads.values()
             if row["symbol"] == symbol.upper() and row["timeframe"] == timeframe
-            and row["created_ms"] >= first
+            and first <= int(row["created_ms"]) <= last
         ]
-        setups.sort(key=lambda row: row["created_ms"])
-        markers = self._markers(cell, candles, first)
+        if selected is not None and not any(row.get("key") == selected.get("key") for row in setups):
+            setups.append(selected)
+        setups.sort(key=lambda row: int(row.get("created_ms") or 0))
+        selected_row = selected or (setups[-1] if setups else None)
+        chain_errors = sweep_chain_errors(
+            selected_row, require_hvb=bool(self.filters.config.get("hvb", True))
+        ) if selected_row else []
+        if selected_row is not None:
+            selected_row = {**selected_row, "chain_valid": not chain_errors, "chain_errors": chain_errors}
+        # Forming candles are visual/mark-to-market data only. Structure and
+        # indicator markers remain closed-candle evidence.
+        marker_candles = [bar for bar in closed_candles if bar.get("closed", True)]
+        markers = self._markers(cell, marker_candles, first)
+        focus_ms = int((selected_row or {}).get("created_ms") or 0)
+        if live and candles:
+            focus_index = len(candles) - 1
+        else:
+            focus_index = next(
+                (i for i, bar in enumerate(candles) if int(bar.get("close_time") or 0) >= focus_ms),
+                max(0, len(candles) - 1),
+            ) if candles else 0
+        live_metrics = self._live_risk_reward(
+            selected_row,
+            candles[-1] if candles else None,
+            live,
+        )
+        live_metrics["forming"] = forming_added
         return {
             "symbol": symbol.upper(),
             "timeframe": timeframe,
             "candles": rows,
             "markers": markers,
             "setups": setups,
+            "selected": selected_row,
+            "focus_index": focus_index,
             "pools": self._chart_pools(symbol.upper()),
             "book": self._book_state(symbol.upper(), timeframe),
             "structure": cell.structure.as_dict(),
             "trend": cell.tmap_state or {},
             "warm": len(cell.candles) >= 120,
-            "bars": len(cell.candles),
+            "bars": len(candles),
+            "live": live_metrics,
         }
 
     # ----------------------------------------------------------- book drawing
@@ -1375,22 +2453,37 @@ class Engine:
 
     # ------------------------------------------------------------- preview
     def _preview(self, symbol: str, candle: dict) -> None:
-        """Evaluate the still-forming candle so the UI shows it live."""
-        if len(self.symbols) > self.preview_max_symbols:
-            return  # a full universe is too big for per-tick recomputation
+        """Maintain live OHLC for every cell; throttle expensive indicators.
+
+        Exchange kline updates carry cumulative volume for the current 1m bar.
+        Re-merging the previous preview on every tick double-counted that volume.
+        Higher-timeframe previews are instead rebuilt from the rollup's closed
+        partial bucket plus the latest forming minute. This also keeps candles
+        moving for a full exchange universe; only TDI/BOS preview computation is
+        capped by ``preview_max_symbols``.
+        """
         now = time.monotonic()
+        indicators_enabled = len(self.symbols) <= self.preview_max_symbols
         for tf in self.timeframes:
             cell = self.cells.get((symbol, tf))
-            if cell is None or not cell.candles:
+            if cell is None:
                 continue
             start = (int(candle["open_time"]) // TIMEFRAMES[tf]) * TIMEFRAMES[tf]
-            preview = dict(candle)
+            if tf == "1m":
+                preview = dict(candle)
+            else:
+                partial = cell.rollup.candle if cell.rollup and cell.rollup.start == start else None
+                preview = merge(partial, candle) if partial is not None else dict(candle)
             preview["open_time"] = start
-            if cell.forming and cell.forming.get("open_time") == start:
-                preview = merge(cell.forming, candle)
-                preview["open_time"] = start
+            preview["timeframe"] = tf
+            preview["closed"] = False
+            preview["_received_ms"] = int(time.time() * 1000)
             cell.forming = preview
-            if len(cell.candles) < 120 or now - cell.preview_at < 1.5:
+            if (
+                not indicators_enabled
+                or len(cell.candles) < 120
+                or now - cell.preview_at < 1.5
+            ):
                 continue
             cell.preview_at = now
 
@@ -1405,7 +2498,11 @@ class Engine:
                 float(self.tdi_settings.get("band_mult", 1.6185)),
             )
             index = len(tail) - 1
-            hvb = hvb_signal(points, index, self.hvb_min_points, self.centre_reference)
+            hvb = hvb_signal(
+                points, index,
+                min_points=self.hvb_min_points,
+                min_speed=self.hvb_min_speed,
+            )
             cell.preview = {
                 "hvb": hvb,
                 "break": break_signal(tail, index, self.break_lookback),
@@ -1488,7 +2585,7 @@ class Engine:
         enough for the trader to see that the cross really happens at the band.
         """
         tail = list(cell.tracker.history)[-40:]
-        return [[round(p.fast, 2), round(centre_of(p, self.centre_reference) or 0.0, 2)] for p in tail if p.fast is not None]
+        return [[round(p.fast, 2), round(centre_of(p) or 0.0, 2)] for p in tail if p.fast is not None]
 
     # ------------------------------------------------------------ snapshot
     def snapshot(self) -> dict[str, Any]:
@@ -1502,6 +2599,8 @@ class Engine:
             "break_lookback": self.break_lookback,
             "hvb_min_points": self.hvb_min_points,
             "hvb_min_speed": self.hvb_min_speed,
+            "history_bars": self.history_bars,
+            "history_days": self.history_days,
             "structure_settings": self.structure_settings,
             "filters": self.filters.summary(),
             "kinds": dict(self.kinds),
@@ -1518,6 +2617,8 @@ class Engine:
             "archive": (self.store.counts() if self.store else {}),
             "failed": len(self.warm_failures),
             "warming": self.warming(),
+            "coverage": self.coverage(),
+            "decision_funnel": self.decision_funnel(),
             "candles_seen": self.candles_seen,
             "last_candle_age": round(time.time() - self.last_event_at, 1),
             "uptime": round(time.time() - self.started_at, 1),
@@ -1564,9 +2665,23 @@ def _evidence(alert: dict) -> list[str]:
     if swept:
         out.append(f"swept the {'high' if swept == 'high' else 'low'} at {_fmt(setup.get('swept_level'))}")
     if setup.get("broke_level") is not None:
-        out.append(f"broke structure at {_fmt(setup.get('broke_level'))} ({setup.get('break_kind', 'SHIFT')})")
+        pairing = ", paired leg" if setup.get("swept_level_time") and setup.get("broke_level_time") else ""
+        out.append(
+            f"broke structure at {_fmt(setup.get('broke_level'))} "
+            f"({setup.get('break_kind', 'SHIFT')}{pairing})"
+        )
     if alert.get("hvb"):
-        out.append(f"HVB {alert['hvb']} on the break candle ({_fmt(alert.get('hvb_points'))} pts)")
+        relation = "≤" if alert["hvb"] == "up" else "≥"
+        crossed = ">" if alert["hvb"] == "up" else "<"
+        out.append(
+            f"HVB {alert['hvb']} is an MBL cross on the break candle: "
+            f"{_fmt(alert.get('hvb_prev_fast'))} {relation} "
+            f"{_fmt(alert.get('hvb_prev_centre'))} → "
+            f"{_fmt(alert.get('hvb_fast'))} {crossed} "
+            f"{_fmt(alert.get('hvb_centre'))}"
+        )
+    if alert.get("range_clearance"):
+        out.append(str(alert["range_clearance"]))
     if external.get("direction"):
         degree = "HH+HL" if external["direction"] > 0 else "LH+LL"
         out.append(

@@ -20,7 +20,30 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var NF = window.TdigmNotify;
+  var SF = window.TdigmState;
   var quiet = localStorage.getItem("tdigm.quiet") !== "0";
+  var PREFS_KEY = "tdigm.ui.preferences.v2";
+
+  function defaultFilters() {
+    return { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" };
+  }
+
+  function restoredPreferences() {
+    var raw = {};
+    try { raw = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}"); } catch (e) { raw = {}; }
+    var f = defaultFilters();
+    var saved = raw.filters || {};
+    f.search = typeof saved.search === "string" ? saved.search : "";
+    f.side = ["both", "long", "short"].indexOf(saved.side) >= 0 ? saved.side : "both";
+    f.state = typeof saved.state === "string" ? saved.state : "all";
+    f.sort = typeof saved.sort === "string" ? saved.sort : "new";
+    f.tfs = new Set(Array.isArray(saved.tfs) ? saved.tfs : []);
+    f.grades = new Set(Array.isArray(saved.grades) ? saved.grades : []);
+    f.sessions = new Set(Array.isArray(saved.sessions) ? saved.sessions : []);
+    return { filters: f, selected: typeof raw.selected === "string" ? raw.selected : null };
+  }
+
+  var restored = restoredPreferences();
 
   // ------------------------------------------------------------------ model
   var model = {
@@ -28,7 +51,8 @@
     live: new Set(),        // keys the engine currently holds
     order: [],              // keys, newest first (recomputed on render)
     selected: null,         // key
-    filters: { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" },
+    preferredSelected: restored.selected,
+    filters: restored.filters,
     state: null,            // last snapshot
     health: null,
     archive: {},
@@ -42,6 +66,19 @@
     chartTimer: 0,
     medianRr: null,
   };
+
+  function savePreferences() {
+    var f = model.filters;
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify({
+        selected: model.selected || model.preferredSelected || null,
+        filters: {
+          search: f.search, side: f.side, state: f.state, sort: f.sort,
+          tfs: Array.from(f.tfs), grades: Array.from(f.grades), sessions: Array.from(f.sessions),
+        },
+      }));
+    } catch (e) { /* private storage/full quota must never break the scanner */ }
+  }
 
   var queue = NF.createQueue({ minGapMs: quiet ? 60_000 : 8_000 });
   var toastQueue = queue;
@@ -79,9 +116,12 @@
 
   function sideOf(row) { return String(row.side || "").toUpperCase() === "SHORT" ? "short" : "long"; }
 
+  function lifecycleStateOf(row) {
+    return SF.lifecycleStateOf(row || {});
+  }
+
   function stateOf(row) {
-    if (row.state) return String(row.state).toLowerCase();
-    return row.valid === false ? "expired" : "open";
+    return SF.displayStateOf(row || {});
   }
 
   function normaliseRow(raw) {
@@ -91,7 +131,9 @@
       timeframe: raw.timeframe || "",
       side: String(raw.side || "").toUpperCase(),
       grade: raw.grade || "",
+      lifecycle_state: lifecycleStateOf(raw),
       state: stateOf(raw),
+      display_state: raw.display_state || "",
       valid: raw.valid !== false,
       entry: raw.entry,
       stop: raw.stop,
@@ -101,11 +143,47 @@
       score: raw.score,
       session: raw.session || "",
       created_ms: Number(raw.created_ms || raw.time || 0),
+      touched_ms: Number(raw.touched_ms || 0),
+      closed_ms: Number(raw.closed_ms || 0),
       zone: raw.zone || null,
+      zones: raw.zones || (raw.zone ? [raw.zone] : []),
+      mitigation_kind: raw.mitigation_kind || "",
+      mitigation_zone: raw.mitigation_zone || null,
+      state_reason: raw.state_reason || "",
+      target_rr: raw.target_rr,
+      target_model: raw.target_model || "",
+      leg_target: raw.leg_target,
+      leg_target_ms: Number(raw.leg_target_ms || 0),
+      leg_start_ms: Number(raw.leg_start_ms || 0),
+      leg_break_ms: Number(raw.leg_break_ms || 0),
+      chain_version: Number(raw.chain_version || 1),
+      approach_model: raw.approach_model || (raw.setup || {}).approach_model || "",
+      approach_start_ms: Number(raw.approach_start_ms || (raw.setup || {}).approach_start_time || 0),
+      approach_end_ms: Number(raw.approach_end_ms || (raw.setup || {}).approach_end_time || 0),
+      approach_bars: Number(raw.approach_bars || (raw.setup || {}).approach_bars || 0),
+      approach_pivot_count: Number(
+        raw.approach_pivot_count ?? (raw.setup || {}).approach_pivot_count ?? -1
+      ),
+      displacement_model: raw.displacement_model || (raw.setup || {}).displacement_model || "",
+      sweep_displacement: raw.sweep_displacement || (raw.setup || {}).sweep_displacement || null,
+      break_displacement: raw.break_displacement || (raw.setup || {}).break_displacement || null,
+      lifecycle_version: Number(raw.lifecycle_version || 1),
+      mitigated: !!raw.mitigated,
       swept_level: raw.swept_level,
+      swept_side: raw.swept_side,
+      sweep_ms: Number(raw.sweep_ms || (raw.setup || {}).sweep_time || 0),
       bos_level: raw.bos_level,
+      bos_ms: Number(raw.bos_ms || raw.created_ms || raw.time || 0),
       break_kind: raw.break_kind,
       hvb_side: raw.hvb_side,
+      hvb_ms: Number(raw.hvb_ms || raw.created_ms || raw.time || 0),
+      hvb_model: raw.hvb_model || "",
+      hvb_prev_fast: raw.hvb_prev_fast,
+      hvb_prev_centre: raw.hvb_prev_centre,
+      hvb_fast: raw.hvb_fast,
+      hvb_centre: raw.hvb_centre,
+      chain_valid: raw.chain_valid !== false,
+      chain_errors: raw.chain_errors || [],
       volume_ratio: raw.volume_ratio,
       reasons: raw.reasons || raw.confluences || [],
       evidence: raw.evidence || [],
@@ -234,6 +312,7 @@
       b.onclick = function () {
         if (set.has(value)) set.delete(value); else set.add(value);
         chipRow(host, values, set, label);
+        savePreferences();
         renderTable();
       };
       host.appendChild(b);
@@ -282,17 +361,34 @@
     }
     $("source-text").textContent = label;
     if (s) {
-      $("strategy-tag").textContent = s.strategy === "book" ? "book engine" : (s.strategy || "engine");
+      $("strategy-tag").textContent = s.strategy === "book" ? "book engine" : "TDIGM setup";
       $("stat-symbols").textContent = (s.symbols ? s.symbols.length : 0) + " symbols · " + (s.warming || 0) + " warming" + (s.failed ? " · " + s.failed + " failed" : "");
       var tf = s.timeframes && s.timeframes.length ? s.timeframes.join(" ") : "";
       $("stat-candle").textContent = (s.candles_seen !== null && s.candles_seen !== undefined ? num(s.candles_seen, 0) + " candles" : "") + (tf ? " · " + tf : "");
     }
     if (model.health) {
       var n = model.health.notifications || {};
+      var u = model.health.universe || {};
+      var cov = model.health.coverage || {};
+      var universeLabel = u.auto
+        ? (u.mode === "discovered" ? " · " + (u.available || 0) + " discovered"
+          + (u.error ? " (refresh failed)" : "")
+          : " · FALLBACK universe" + (u.error ? " (discovery failed)" : ""))
+        : "";
+      $("stat-symbols").textContent = (model.health.symbols || 0) + " symbols · "
+        + (cov.symbols_ready || 0) + " fully warm · " + (cov.cells_waiting || 0) + " cells waiting"
+        + (cov.symbols_active_warmup ? " · " + cov.symbols_active_warmup + " replaying" : "")
+        + (cov.queued_symbols ? " · " + cov.queued_symbols + " queued" : "")
+        + universeLabel;
+      $("stat-symbols").title = u.error || (u.mode === "discovered"
+        ? "Automatic exchange discovery succeeded." : "Automatic exchange discovery is not active.");
       var noise = (n.filtered || 0) + (n.suppressed || 0);
-      $("status-noise").textContent = noise + " event(s) dropped by policy";
-      $("status-noise").title = (n.filtered || 0) + " filtered setups and " + (n.suppressed || 0) + " duplicates/chatter never reached the screen";
-      $("status-counts").textContent = (model.health.signals || 0) + " signals · " + (model.health.stored || 0) + " stored · " + (model.health.setups_valid || 0) + " valid now";
+      $("status-noise").textContent = noise + " notice(s) hidden";
+      $("status-noise").title = (n.filtered || 0) + " rejected setup notices and " + (n.suppressed || 0)
+        + " duplicate/chatter notices hidden. No market frames or confirmed signals are dropped here.";
+      $("status-counts").textContent = (model.health.signals || 0) + " signals · " + (model.health.stored || 0)
+        + " stored · " + (model.health.setups_valid || 0) + " valid now · "
+        + (model.health.setups_unmitigated || 0) + " unmitigated";
       renderFunnel();
       $("status-feed").textContent = "feed: " + (model.health.feed || "—") + " · " + num(model.health.frames, 0) + " frames";
     }
@@ -322,13 +418,13 @@
     }
     var rows = [];
     rows.push(row("signals stored", num(counts.total, 0), "every plan ever recorded, across restarts"));
-    rows.push(row("decided", num(all.decided, 0), "closed at the draw, the stop or break-even"));
+    rows.push(row("mitigated", num(all.mitigated, 0), "order-block or eligible aggressive-breaker touches under the current lifecycle"));
+    rows.push(row("decided", num(all.decided, 0), "mitigated trades closed at their frozen confirmation-leg target or at the stop"));
     rows.push(row("win rate", all.win_rate == null ? "—" : (all.win_rate * 100).toFixed(1) + "%",
-      "wins / decided. At the median 1:" + (model.medianRr || "?") + " a plan needs "
-      + (model.medianRr ? Math.round(100 / (1 + model.medianRr)) : "?") + "% to break even before fees."));
+      "leg-target wins / (leg-target wins + stopped trades), after mitigation only"));
     var rpt = all.r_per_trade;
     rows.push(row("R / trade", rpt == null ? "—" : (rpt > 0 ? "+" : "") + Number(rpt).toFixed(3),
-      "measured on the stored rows at the fixed 2R convention, net of nothing else"));
+      "measured only after mitigation: variable R at the frozen leg H/L, -1R at the stop"));
     rows.push(row("95% interval", all.ci_low == null ? "—"
       : (all.ci_low > 0 ? "+" : "") + Number(all.ci_low).toFixed(2) + " … "
         + (all.ci_high > 0 ? "+" : "") + Number(all.ci_high).toFixed(2),
@@ -367,16 +463,60 @@
     if (!row) { host.innerHTML = ""; return; }
     var bits = [];
     var chain = [];
+    if (row.swept_level !== null && row.swept_level !== undefined) {
+      chain.push((row.swept_side === "low" ? "low sweep" : "high sweep") + " @ " + num(row.swept_level)
+        + (row.sweep_ms ? " [" + clock(row.sweep_ms) + "]" : ""));
+    }
+    if (row.bos_level !== null && row.bos_level !== undefined) {
+      chain.push("same-leg opposite body break @ " + num(row.bos_level) + " [" + clock(row.created_ms) + "]");
+    }
+    if (row.hvb_side) chain.push("same-candle MBL-cross HVB " + row.hvb_side);
     if (row.trap) chain.push("trap " + (row.trap.side || "") + " @ " + num(row.trap.level));
     if (row.ac) chain.push("imbalance " + num(row.ac.bottom) + "–" + num(row.ac.top));
     if (row.shift) chain.push("shift " + (row.shift.kind || "MS") + " @ " + num(row.shift.level));
     if (row.target) chain.push("draw @ " + num(row.target));
     if (chain.length) bits.push('<div class="chain">' + escapeHtml(chain.join("  →  ")) + "</div>");
+    if (row.chain_valid === false) {
+      bits.push('<div class="chain-invalid"><b>QUARANTINED</b> · ' + escapeHtml((row.chain_errors || []).join(" · ")) + "</div>");
+    }
+    if (row.lifecycle_version !== 7 || row.chain_version !== 8 || row.target_model !== "hvb_bos_leg_extreme_v1") {
+      bits.push('<div class="chain-invalid"><b>NON-CURRENT POLICY</b> · excluded from current displacement/MBL-cross/direct-sweep lifecycle statistics until deep replay regrades it</div>');
+    }
+    if (row.hvb_model === "mbl_centre_cross_v1") {
+      var beforeSign = row.hvb_side === "up" ? " ≤ " : " ≥ ";
+      var afterSign = row.hvb_side === "up" ? " > " : " < ";
+      bits.push('<div class="nums"><span>HVB proof <b>moving centre crossed on this candle</b> · '
+        + escapeHtml(num(row.hvb_prev_fast) + beforeSign + num(row.hvb_prev_centre)
+          + " → " + num(row.hvb_fast) + afterSign + num(row.hvb_centre)) + '</span></div>');
+    }
+    if (row.approach_model === "direct_from_paired_endpoint_v1" && row.approach_pivot_count === 0) {
+      bits.push('<div class="nums"><span>approach <b>direct paired endpoint → sweep</b> · '
+        + escapeHtml(String(row.approach_bars || "—")) + ' bars · no intervening pivot</span></div>');
+    }
+    if (row.displacement_model === "directed_body_over_prior_atr_v1"
+        && row.sweep_displacement && row.break_displacement) {
+      bits.push('<div class="nums"><span>displacement <b>qualified on both events</b> · sweep '
+        + escapeHtml(num(row.sweep_displacement.body_atr, 2)) + ' ATR · paired break '
+        + escapeHtml(num(row.break_displacement.body_atr, 2)) + ' ATR</span></div>');
+    }
+    var stateLabel = stateOf(row).toUpperCase();
+    var stateWhy = row.state_reason || (row.lifecycle_state === "pending"
+      ? "active signal awaiting order-block or eligible aggressive-breaker mitigation; the leg H/L is tracked but no trade target is armed yet"
+      : row.lifecycle_state === "active"
+        ? "the zone has been mitigated and the filled trade is awaiting its target or stop"
+        : "no lifecycle reason was stored for this legacy row");
+    bits.push('<div class="nums"><span>state <b>' + escapeHtml(stateLabel) + "</b> · "
+      + escapeHtml(stateWhy) + "</span></div>");
     var nums = [];
     ["entry", "stop", "target"].forEach(function (k) {
       if (row[k] !== null && row[k] !== undefined) nums.push(k + " <b>" + escapeHtml(num(row[k])) + "</b>");
     });
-    if (row.rr) nums.push("planned <b>1:" + Number(row.rr).toFixed(1) + "</b>");
+    if (row.rr) nums.push("armed <b>1:" + Number(row.rr).toFixed(2) + " to confirmation-leg H/L</b>");
+    else if (row.leg_target !== null && row.leg_target !== undefined) {
+      nums.push("pending leg " + (sideOf(row) === "short" ? "low" : "high") + " <b>"
+        + escapeHtml(num(row.leg_target)) + "</b> · freezes before mitigation");
+    } else nums.push("target <b>awaiting confirmation-leg H/L proof</b>");
+    if (row.mitigation_kind) nums.push("filled from <b>" + escapeHtml(row.mitigation_kind.replace(/_/g, " ")) + "</b>");
     if (row.r_now !== null && row.r_now !== undefined) nums.push("now <b>" + (Number(row.r_now) > 0 ? "+" : "") + Number(row.r_now).toFixed(2) + "R</b>");
     if (row.fee_r !== null && row.fee_r !== undefined) nums.push("fee <b>" + Number(row.fee_r).toFixed(2) + "R</b>");
     if (row.score !== null && row.score !== undefined) nums.push("score <b>" + escapeHtml(row.score) + "</b>");
@@ -394,10 +534,11 @@
     }
     var bucket = bucketRecord(row);
     if (bucket) {
-      bits.push('<div class="nums" title="Every closed trade in this instrument-timeframe-side bucket, '
-        + 'at the fixed 2R convention. The interval is what the sample actually supports.">'
+      bits.push('<div class="nums" title="Every mitigated trade in this instrument-timeframe bucket, '
+        + 'at its own frozen confirmation-leg H/L. Unfilled invalidations are not losses. The interval is what the sample supports.">'
         + "<span>" + escapeHtml(row.timeframe) + " " + escapeHtml(sideOf(row)) + " so far: <b>"
-        + bucket.n + "</b> closed · <b>" + (bucket.r > 0 ? "+" : "") + Number(bucket.r).toFixed(2) + "R</b>"
+        + bucket.decided + "</b> decided · <b>" + (bucket.r_per_trade > 0 ? "+" : "")
+        + Number(bucket.r_per_trade || 0).toFixed(2) + "R</b>"
         + " each · 95% " + (bucket.ci_low > 0 ? "+" : "") + Number(bucket.ci_low).toFixed(2)
         + "…" + (bucket.ci_high > 0 ? "+" : "") + Number(bucket.ci_high).toFixed(2)
         + " <b>" + escapeHtml(bucket.verdict) + "</b></span></div>");
@@ -432,13 +573,23 @@
     box.hidden = false;
     var shown = rows.slice(0, 12);
     host.innerHTML = shown.map(function (w) {
-      var st = w.armed ? "armed" : "trap";
-      var cls = w.armed ? "st-armed" : "st-trap";
-      var what = w.armed
-        ? (w.armed.kind === "bull" ? "gap " : "gap ") + num(w.armed.bottom) + "–" + num(w.armed.top)
-          + " · " + Math.round((w.armed.fill || 0) * 100) + "% filled"
-        : (w.trap.side === "high" ? "took high " : "took low ") + num(w.trap.level) + " (" + w.trap.name + ")";
-      var need = w.armed ? "needs the reverse shift" : "needs a displacement";
+      var st, cls, what, need;
+      if (w.mode === "sweep") {
+        var s = w.structure || {};
+        st = "swept";
+        cls = "st-trap";
+        what = (s.swept_side === "high" ? "took high " : "took low ") + num(s.swept_level);
+        need = "body close " + (s.watching_side === "low" ? "below " : "above ") + num(s.watching)
+          + " with matching HVB";
+      } else {
+        st = w.armed ? "armed" : "trap";
+        cls = w.armed ? "st-armed" : "st-trap";
+        what = w.armed
+          ? "gap " + num(w.armed.bottom) + "–" + num(w.armed.top)
+            + " · " + Math.round((w.armed.fill || 0) * 100) + "% filled"
+          : (w.trap.side === "high" ? "took high " : "took low ") + num(w.trap.level) + " (" + w.trap.name + ")";
+        need = w.armed ? "needs the reverse shift" : "needs a displacement";
+      }
       return '<div class="watch-row"><span class="sym">' + escapeHtml(w.symbol) + "</span>"
         + "<span>" + escapeHtml(w.timeframe) + "</span>"
         + '<span class="' + cls + '">' + st + "</span>"
@@ -463,14 +614,54 @@
     if (!f) return;
     var drops = f.drops || {};
     var worst = Object.keys(drops).sort(function (a, b) { return drops[b] - drops[a]; })[0];
-    $("status-funnel").textContent = f.traps + " traps → " + f.displacements + " displacements → "
-      + f.plans + " plans"
-      + (worst ? " · mostly refused: " + worst + " (" + drops[worst] + ")" : "");
+    if (f.mode === "sweep") {
+      $("status-funnel").textContent = (f.sweeps || 0) + " sweeps → " + (f.setups || 0)
+        + " paired body breaks → " + (f.hvb_aligned || 0) + " same-candle HVBs → "
+        + (f.plans || 0) + " filter-passed setups"
+        + (worst ? " · top rejection: " + worst + " (" + drops[worst] + ")" : "");
+    } else {
+      $("status-funnel").textContent = (f.traps || 0) + " traps → " + (f.displacements || 0)
+        + " displacements → " + (f.plans || 0) + " plans"
+        + (worst ? " · mostly refused: " + worst + " (" + drops[worst] + ")" : "");
+    }
   }
 
   // ------------------------------------------------------------------- chart
+  // The interaction model intentionally mirrors the chart in SMC-Radar:
+  // wheel zoom, drag pan, right-axis price scaling, crosshair/OHLC and empty
+  // right margin.  The selected setup—not today's candle—is the focus.
+  var chartView = {
+    data: null, selectedKey: "", loadedMode: "", mode: "setup", requestToken: "", requestSeq: 0,
+    span: 120, right: 0, zoomY: 1, panY: 0, followLive: false,
+    hover: null, drag: null, focus: 0,
+  };
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function timeframeMs(tf) {
+    return { "1m": 60000, "3m": 180000, "5m": 300000, "15m": 900000,
+      "30m": 1800000, "1h": 3600000, "2h": 7200000, "4h": 14400000,
+      "1d": 86400000, "1w": 604800000 }[tf] || 60000;
+  }
+
+  function barAtTime(candles, ms) {
+    if (!ms || !candles.length) return -1;
+    var firstOpen = Number(candles[0].t || 0);
+    var lastClose = Number(candles[candles.length - 1].ct || candles[candles.length - 1].t || 0);
+    if (Number(ms) < firstOpen || Number(ms) > lastClose) return -1;
+    var lo = 0, hi = candles.length - 1, found = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (Number(candles[mid].ct || candles[mid].t) >= Number(ms)) { found = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return found;
+  }
+
   function selectRow(row) {
     model.selected = row ? row.key : null;
+    model.preferredSelected = model.selected;
+    savePreferences();
     Array.prototype.forEach.call(document.querySelectorAll("tr.sel"), function (tr) { tr.classList.remove("sel"); });
     var tr = row ? document.querySelector('tr[data-key="' + CSS.escape(row.key) + '"]') : null;
     if (tr) tr.classList.add("sel");
@@ -478,169 +669,517 @@
     $("chart-title").textContent = row.symbol + " " + row.timeframe + " · " + sideOf(row);
     $("chart-sub").textContent = clock(row.created_ms) + " UTC · " + stateOf(row) + (row.grade ? " · grade " + row.grade : "");
     renderStory(row);
-    loadChart(row.symbol, row.timeframe);
+    chartView.mode = row.valid ? "live" : "setup";
+    chartView.followLive = chartView.mode === "live";
+    loadChart(row, false, chartView.mode);
   }
 
-  function loadChart(symbol, timeframe) {
-    var key = symbol + "|" + timeframe;
+  function paintChartMode() {
+    $("btn-chart-live").classList.toggle("on", chartView.mode === "live");
+    $("btn-chart-reset").classList.toggle("on", chartView.mode === "setup");
+  }
+
+  function loadChart(row, force, requestedMode) {
+    if (!row) return;
+    var key = row.key;
+    var mode = requestedMode || chartView.mode || "setup";
+    chartView.mode = mode;
+    paintChartMode();
     model.chartKey = key;
     model.chartBusy = true;
-    fetch("/api/chart?symbol=" + encodeURIComponent(symbol) + "&timeframe=" + encodeURIComponent(timeframe) + "&bars=180")
+    var token = key + "|" + mode + "|" + (++chartView.requestSeq);
+    chartView.requestToken = token;
+    var url = "/api/chart?symbol=" + encodeURIComponent(row.symbol)
+      + "&timeframe=" + encodeURIComponent(row.timeframe)
+      + "&bars=600&key=" + encodeURIComponent(row.key)
+      + "&at=" + encodeURIComponent(row.created_ms)
+      + (mode === "live" ? "&live=1" : "")
+      + (force && mode === "setup" ? "&refresh=1" : "");
+    fetch(url)
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (model.chartKey !== key || chartView.requestToken !== token) return;
         model.chartBusy = false;
-        if (model.chartKey !== key) return;
-        drawChart(data);
+        var changed = chartView.selectedKey !== key || chartView.loadedMode !== mode;
+        chartView.data = data;
+        chartView.selectedKey = key;
+        chartView.loadedMode = mode;
+        updateLiveMetrics(data);
+        if (changed || force) resetChartView();
+        else if (mode === "live" && chartView.followLive) {
+          var candles = data.candles || [];
+          chartView.focus = Math.max(0, candles.length - 1);
+          chartView.right = Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.10);
+          drawChart();
+        } else drawChart();
       })
-      .catch(function () { model.chartBusy = false; });
+      .catch(function () {
+        if (chartView.requestToken !== token) return;
+        model.chartBusy = false;
+        $("chart-hint").hidden = false;
+        $("chart-hint").textContent = "Could not load candles for this setup.";
+      });
   }
 
-  function drawChart(data) {
-    var canvas = $("chart");
-    var wrap = canvas.parentElement;
-    var dpr = window.devicePixelRatio || 1;
-    var w = wrap.clientWidth || 600;
-    var h = wrap.clientHeight || 420;
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-    var ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
+  function updateLiveMetrics(data) {
+    var live = data && data.live || {};
+    var state = $("chart-live-state");
+    var price = $("chart-live-price");
+    var plan = $("chart-plan-rr");
+    var current = $("chart-current-r");
+    var remaining = $("chart-remaining-rr");
+    var note = $("chart-live-note");
+    state.className = "live-pill";
+    current.className = "";
 
-    var candles = (data && data.candles) || [];
-    $("chart-hint").hidden = candles.length > 0;
-    if (!candles.length) {
-      $("chart-hint").hidden = false;
-      $("chart-hint").textContent = "No candles yet for " + (data && data.symbol || "") + " " + (data && data.timeframe || "") + " — the instrument is still warming.";
+    if (!live.enabled) {
+      state.textContent = "SETUP VIEW";
+      price.textContent = "—";
+      plan.textContent = "—";
+      current.textContent = "—";
+      remaining.textContent = "—";
+      note.textContent = "Immutable setup evidence; select LIVE for the current market.";
       return;
     }
 
-    var pads = { l: 8, r: 74, t: 14, b: 22 };
-    var plotW = w - pads.l - pads.r;
-    var plotH = h - pads.t - pads.b;
+    var stale = live.forming && live.age_ms != null && Number(live.age_ms) > 15000;
+    state.textContent = stale ? "STALE FEED" : live.forming ? "● LIVE CANDLE" : "LIVE · LAST CLOSE";
+    state.classList.add(stale ? "bad" : live.forming ? "live" : "warn");
+    price.textContent = num(live.price);
+    plan.textContent = live.planned_rr == null ? "—" : "1:" + Number(live.planned_rr).toFixed(2);
+    if (live.current_r == null) current.textContent = live.state === "pending" ? "unfilled" : "—";
+    else {
+      current.textContent = (Number(live.current_r) > 0 ? "+" : "") + Number(live.current_r).toFixed(2) + "R";
+      current.className = Number(live.current_r) >= 0 ? "pos" : "neg";
+    }
+    remaining.textContent = live.remaining_rr == null ? "—" : "1:" + Number(live.remaining_rr).toFixed(2);
 
-    // levels that belong on the price axis: pools, the setup, the trade
-    var levels = [];
-    var pools = data.pools || [];
-    pools.forEach(function (p) {
-      if (p && (p.level !== undefined) && p.level !== null) levels.push(Number(p.level));
-    });
-    var setups = data.setups || [];
-    setups.forEach(function (s) {
-      ["entry", "stop", "target"].forEach(function (k) { if (s[k] !== null && s[k] !== undefined) levels.push(Number(s[k])); });
-    });
-    var hi = -Infinity, lo = Infinity;
-    candles.forEach(function (c) { hi = Math.max(hi, c.h); lo = Math.min(lo, c.l); });
-    levels.forEach(function (v) { if (isFinite(v) && v > 0) { hi = Math.max(hi, v); lo = Math.min(lo, v); } });
-    var span = hi - lo || 1;
-    hi += span * 0.03; lo -= span * 0.03; span = hi - lo;
+    var messages = {
+      pending_unfilled: "Projected plan only — mitigation has not filled the trade.",
+      active_live: "Mark-to-market from the mitigation entry; remaining R:R uses current price to target/stop.",
+      target_touched_live: "Target touched inside the forming candle; awaiting the closed-candle lifecycle update.",
+      stop_touched_live: "STOP TOUCHED inside the forming candle; awaiting the closed-candle lifecycle update.",
+      both_touched_live: "STOP AND TARGET touched; conservative stop-first policy applies on close.",
+    };
+    note.textContent = stale
+      ? "No forming-kline update for more than 15 seconds; displayed price may be stale."
+      : messages[live.status] || "Live market view; archived outcomes remain closed-candle decisions.";
+    if (!stale && (live.status === "stop_touched_live" || live.status === "both_touched_live")) {
+      state.className = "live-pill bad";
+    } else if (!stale && live.status === "target_touched_live") {
+      state.className = "live-pill warn";
+    }
+  }
 
-    function x(i) { return pads.l + (i + 0.5) * (plotW / candles.length); }
-    function y(v) { return pads.t + (hi - v) / span * plotH; }
-    var cw = Math.max(1.5, (plotW / candles.length) * 0.66);
+  function resetChartView() {
+    var data = chartView.data || {};
+    var candles = data.candles || [];
+    chartView.zoomY = 1;
+    chartView.panY = 0;
+    chartView.hover = null;
+    chartView.span = Math.min(Math.max(60, Math.min(140, candles.length)), Math.max(20, candles.length));
+    if (chartView.mode === "live") {
+      chartView.followLive = true;
+      chartView.focus = Math.max(0, candles.length - 1);
+      chartView.right = chartView.focus + Math.round(chartView.span * 0.10);
+    } else {
+      chartView.followLive = false;
+      chartView.focus = clamp(Number(data.focus_index) || 0, 0, Math.max(0, candles.length - 1));
+      // Put the break/HVB candle about two thirds across the frame, leaving both
+      // the preceding sweep and post-signal lifecycle in sight.
+      chartView.right = clamp(
+        chartView.focus + Math.round(chartView.span * 0.32),
+        Math.min(chartView.span - 1, Math.max(0, candles.length - 1)),
+        Math.max(0, candles.length - 1) + Math.round(chartView.span * 0.18)
+      );
+    }
+    drawChart();
+  }
 
-    // grid: three price lines, labelled on the right
-    ctx.font = "10px ui-monospace, monospace";
+  function chartCanvasSize() {
+    var canvas = $("chart");
+    var dpr = Math.min(2, window.devicePixelRatio || 1);
+    var w = Math.max(320, Math.round(canvas.clientWidth || canvas.parentElement.clientWidth || 600));
+    var h = Math.max(240, Math.round(canvas.clientHeight || canvas.parentElement.clientHeight || 420));
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    }
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { canvas: canvas, ctx: ctx, w: w, h: h, l: 8, r: 76, t: 16, b: 28 };
+  }
+
+  function priceText(v) { return num(v); }
+
+  function drawChart() {
+    var box = chartCanvasSize();
+    var ctx = box.ctx, w = box.w, h = box.h, padL = box.l, padR = box.r, padT = box.t, padB = box.b;
+    ctx.clearRect(0, 0, w, h);
+    var data = chartView.data || {};
+    var candles = data.candles || [];
+    var hint = $("chart-hint");
+    if (!candles.length) {
+      hint.hidden = false;
+      hint.textContent = data.history_error
+        ? "Historical window unavailable: " + data.history_error
+        : "No candles yet for " + (data.symbol || "") + " " + (data.timeframe || "") + ".";
+      return;
+    }
+    hint.hidden = true;
+
+    var len = candles.length;
+    chartView.span = clamp(chartView.span, 20, Math.max(20, len));
+    var spanBars = Math.min(chartView.span, len);
+    var future = Math.round(spanBars * 0.18);
+    chartView.right = clamp(chartView.right, spanBars - 1, len - 1 + future);
+    var left = chartView.right - spanBars + 1;
+    var i0 = Math.max(0, Math.floor(left));
+    var i1 = Math.min(len - 1, Math.ceil(chartView.right));
+    var plotW = w - padL - padR;
+    var plotH = h - padT - padB;
+    var candleW = plotW / spanBars;
+    function x(i) { return padL + (i - left + 0.5) * candleW; }
+    var bodyW = Math.max(1, Math.min(13, candleW * 0.68));
+
+    var selected = data.selected || null;
+    var liveEnabled = !!(data.live && data.live.enabled);
+    var hvbProofValid = !!(selected && selected.hvb_model === "mbl_centre_cross_v1"
+      && selected.hvb_prev_fast != null && selected.hvb_prev_centre != null
+      && selected.hvb_fast != null && selected.hvb_centre != null
+      && Number.isFinite(Number(selected.hvb_prev_fast))
+      && Number.isFinite(Number(selected.hvb_prev_centre))
+      && Number.isFinite(Number(selected.hvb_fast))
+      && Number.isFinite(Number(selected.hvb_centre))
+      && (selected.hvb_side === "up"
+        ? Number(selected.hvb_prev_fast) <= Number(selected.hvb_prev_centre)
+          && Number(selected.hvb_fast) > Number(selected.hvb_centre)
+        : Number(selected.hvb_prev_fast) >= Number(selected.hvb_prev_centre)
+          && Number(selected.hvb_fast) < Number(selected.hvb_centre)));
+    var rawSetup = selected && selected.setup || {};
+    var sweepTime = selected ? Number(selected.sweep_ms || rawSetup.sweep_time || 0) : 0;
+    var breakTime = selected ? Number(selected.created_ms || rawSetup.break_time || 0) : 0;
+    var approachTime = selected ? Number(
+      selected.approach_start_ms || rawSetup.approach_start_time || rawSetup.broke_level_time || 0
+    ) : 0;
+    var sweepIndex = barAtTime(candles, sweepTime);
+    var breakIndex = barAtTime(candles, breakTime);
+    var approachIndex = barAtTime(candles, approachTime);
+
+    var lo = Infinity, hi = -Infinity;
+    for (var i = i0; i <= i1; i++) { lo = Math.min(lo, Number(candles[i].l)); hi = Math.max(hi, Number(candles[i].h)); }
+    if (!isFinite(lo) || !isFinite(hi)) return;
+    if (selected && (liveEnabled || breakIndex >= i0 && breakIndex <= i1)) {
+      [selected.entry, selected.stop, selected.target, selected.leg_target,
+        selected.swept_level, selected.bos_level].forEach(function (v) {
+        v = Number(v); if (isFinite(v) && v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      });
+      (selected.zones || []).forEach(function (zone) {
+        var zl = Number(zone.low), zh = Number(zone.high);
+        if (isFinite(zl) && isFinite(zh)) { lo = Math.min(lo, zl); hi = Math.max(hi, zh); }
+      });
+    }
+    var rawSpan = hi - lo || Math.max(1, Math.abs(hi) * 0.01);
+    var centre = (hi + lo) / 2 + chartView.panY * rawSpan;
+    var half = (rawSpan * 1.08 / 2) / chartView.zoomY;
+    var pLo = centre - half, pHi = centre + half;
+    function y(v) { return padT + (pHi - Number(v)) / (pHi - pLo) * plotH; }
+
+    // TradingView/SMC-Radar grid: time and price axes are part of the chart, not
+    // guessed from the signal list.
+    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textBaseline = "middle";
-    for (var g = 1; g <= 3; g++) {
-      var val = lo + span * (g / 4);
-      ctx.strokeStyle = "#161d27";
-      ctx.beginPath(); ctx.moveTo(pads.l, y(val)); ctx.lineTo(pads.l + plotW, y(val)); ctx.stroke();
-      ctx.fillStyle = "#5b6678";
-      ctx.fillText(num(val), pads.l + plotW + 8, y(val));
+    ctx.textAlign = "left";
+    for (var g = 0; g <= 4; g++) {
+      var price = pLo + (pHi - pLo) * g / 4;
+      var gy = y(price);
+      ctx.strokeStyle = "#1b2434"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(w - padR, gy); ctx.stroke();
+      ctx.fillStyle = "#6d7b93"; ctx.fillText(priceText(price), w - padR + 7, gy);
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    var ticks = Math.max(3, Math.min(7, Math.round(plotW / 105)));
+    var step = timeframeMs(data.timeframe);
+    for (var t = 0; t <= ticks; t++) {
+      var ti = Math.round(left + (spanBars - 1) * t / ticks);
+      if (ti < 0) continue;
+      var base = ti < len ? candles[ti].t : candles[len - 1].t + (ti - len + 1) * step;
+      var tx = x(ti);
+      ctx.strokeStyle = "#151d2b"; ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, h - padB); ctx.stroke();
+      var d = new Date(base);
+      var label = String(d.getUTCDate()).padStart(2, "0") + " "
+        + d.toLocaleString("en-US", { month: "short", timeZone: "UTC" }) + " "
+        + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+      ctx.fillStyle = "#6d7b93"; ctx.fillText(label, tx, h - padB + 7);
     }
 
-    // zones the setups came from
-    setups.forEach(function (s) {
-      var z = s.zone || {};
-      if (z.high === undefined || z.low === undefined) return;
-      ctx.fillStyle = (String(s.side).toUpperCase() === "SHORT") ? "rgba(255,92,122,.08)" : "rgba(46,230,168,.08)";
-      ctx.fillRect(pads.l, y(z.high), plotW, Math.max(1.5, y(z.low) - y(z.high)));
-    });
+    // The paired endpoint must travel straight into the sweep. Highlight that
+    // approach separately from the post-sweep path, which may oscillate.
+    if (selected && approachIndex >= 0 && sweepIndex >= 0) {
+      var ax = x(approachIndex), approachSweepX = x(sweepIndex);
+      ctx.fillStyle = "rgba(103,169,255,.055)";
+      ctx.fillRect(Math.min(ax, approachSweepX) - bodyW, padT,
+        Math.max(bodyW * 2, Math.abs(approachSweepX - ax) + bodyW * 2), plotH);
+      ctx.strokeStyle = "rgba(103,169,255,.38)"; ctx.setLineDash([2, 4]);
+      ctx.strokeRect(Math.min(ax, approachSweepX) - bodyW, padT,
+        Math.max(bodyW * 2, Math.abs(approachSweepX - ax) + bodyW * 2), plotH);
+      ctx.setLineDash([]); ctx.fillStyle = "#67a9ff"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      ctx.fillText("DIRECT SWEEP APPROACH", Math.min(ax, approachSweepX) + 4, padT + 16);
+    }
 
-    // candles
-    candles.forEach(function (c, i) {
-      var up = c.c >= c.o;
-      ctx.strokeStyle = up ? "#1c8f69" : "#a83b4f";
-      ctx.fillStyle = up ? "#2ee6a8" : "#ff5c7a";
-      ctx.beginPath();
-      ctx.moveTo(x(i), y(c.h)); ctx.lineTo(x(i), y(c.l)); ctx.stroke();
-      var top = y(Math.max(c.o, c.c));
-      var bottom = y(Math.min(c.o, c.c));
-      ctx.fillRect(x(i) - cw / 2, top, cw, Math.max(1, bottom - top));
-    });
-
-    // structure breaks and the TDIGM centre cross, at the candle they printed on
-    var index = {};
-    candles.forEach(function (c, i) { index[c.t] = i; });
-    var markers = data.markers || {};
-    (markers.bos || []).forEach(function (m) {
-      var i = index[m.t];
-      if (i === undefined) return;
-      ctx.strokeStyle = m.dir > 0 ? "rgba(46,230,168,.5)" : "rgba(255,92,122,.5)";
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(x(i), y(m.level)); ctx.lineTo(pads.l + plotW, y(m.level)); ctx.stroke();
+    // The exact setup window is unmistakable: amber sweep candle/level, a
+    // shaded time range, then the body-break candle. It is labelled HVB only
+    // when the archived four-value MBL crossing proof is mathematically valid.
+    if (selected && sweepIndex >= 0 && breakIndex >= 0) {
+      var sx = x(sweepIndex), bx = x(breakIndex);
+      ctx.fillStyle = "rgba(255,179,71,.055)";
+      ctx.fillRect(Math.min(sx, bx) - bodyW, padT, Math.max(bodyW * 2, Math.abs(bx - sx) + bodyW * 2), plotH);
+      ctx.strokeStyle = "rgba(255,179,71,.34)"; ctx.setLineDash([3, 4]);
+      ctx.strokeRect(Math.min(sx, bx) - bodyW, padT, Math.max(bodyW * 2, Math.abs(bx - sx) + bodyW * 2), plotH);
       ctx.setLineDash([]);
-      ctx.fillStyle = m.dir > 0 ? "#2ee6a8" : "#ff5c7a";
-      ctx.beginPath();
-      var yy = y(candles[i].h) - 6;
-      ctx.moveTo(x(i), yy); ctx.lineTo(x(i) - 4, yy - 6); ctx.lineTo(x(i) + 4, yy - 6);
-      ctx.closePath(); ctx.fill();
-    });
-    (markers.hvb || []).forEach(function (m) {
-      var i = index[m.t];
-      if (i === undefined) return;
-      ctx.fillStyle = "rgba(103,169,255,.85)";
-      ctx.beginPath();
-      ctx.arc(x(i), y(m.side === "up" ? candles[i].l : candles[i].h) + (m.side === "up" ? 6 : -6), 2.6, 0, Math.PI * 2);
-      ctx.fill();
-    });
+      ctx.fillStyle = "#ffb347"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      ctx.fillText("SETUP WINDOW", Math.min(sx, bx) + 4, padT + 4);
 
-    // the liquidity map: dotted lines, labelled with the pool's name
-    pools.slice(-14).forEach(function (p) {
-      var level = Number(p.level);
-      if (!isFinite(level)) return;
-      ctx.strokeStyle = "rgba(133,146,166,.22)";
-      ctx.setLineDash([2, 5]);
-      ctx.beginPath(); ctx.moveTo(pads.l, y(level)); ctx.lineTo(pads.l + plotW, y(level)); ctx.stroke();
-      ctx.setLineDash([]);
-      var label = String(p.kind || p.name || p.tier || "").slice(0, 14);
-      if (label) {
-        ctx.fillStyle = "#5b6678";
-        ctx.fillText(label, pads.l + 4, y(level) - 6);
+      var swept = Number(selected.swept_level || rawSetup.swept_level);
+      if (isFinite(swept)) {
+        ctx.strokeStyle = "rgba(255,179,71,.9)"; ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.moveTo(Math.max(padL, sx - candleW * 10), y(swept)); ctx.lineTo(bx, y(swept)); ctx.stroke();
+        ctx.setLineDash([]); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
+        ctx.fillText((selected.swept_side === "low" ? "swept low " : "swept high ") + priceText(swept), Math.max(padL + 2, sx - candleW * 9), y(swept) - 2);
+      }
+
+      var entry = Number(selected.entry), stop = Number(selected.stop), target = Number(selected.target);
+      var mitigationIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+      var tradeStart = mitigationIndex >= 0 ? x(mitigationIndex) : bx;
+      var tradeEnd = Math.min(w - padR, tradeStart + Math.max(candleW * 12, plotW * 0.24));
+      if (selected.mitigated && isFinite(entry) && isFinite(stop)) {
+        ctx.fillStyle = "rgba(255,92,122,.075)";
+        ctx.fillRect(tradeStart, Math.min(y(entry), y(stop)), Math.max(2, tradeEnd - tradeStart), Math.abs(y(stop) - y(entry)));
+      }
+      if (selected.mitigated && isFinite(entry) && isFinite(target)) {
+        ctx.fillStyle = "rgba(46,230,168,.075)";
+        ctx.fillRect(tradeStart, Math.min(y(entry), y(target)), Math.max(2, tradeEnd - tradeStart), Math.abs(y(target) - y(entry)));
+      }
+
+      // Both legitimate mitigation choices are explicit. The breaker is the
+      // paired endpoint candle on the left of an aggressive displacement.
+      (selected.zones || []).forEach(function (zone, zi) {
+        var zl = Number(zone.low), zh = Number(zone.high);
+        if (!isFinite(zl) || !isFinite(zh) || zh <= zl) return;
+        var sourceIndex = barAtTime(candles, Number(zone.time || breakTime));
+        var zx = sourceIndex >= 0 ? x(sourceIndex) : bx;
+        var endIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+        var zEnd = endIndex >= 0 ? x(endIndex) + bodyW : tradeEnd;
+        var breaker = zone.type === "breaker_block";
+        ctx.fillStyle = breaker ? "rgba(180,135,255,.13)" : "rgba(103,169,255,.10)";
+        ctx.strokeStyle = breaker ? "rgba(180,135,255,.78)" : "rgba(103,169,255,.68)";
+        ctx.fillRect(zx, y(zh), Math.max(bodyW, zEnd - zx), Math.max(2, y(zl) - y(zh)));
+        ctx.strokeRect(zx, y(zh), Math.max(bodyW, zEnd - zx), Math.max(2, y(zl) - y(zh)));
+        ctx.fillStyle = breaker ? "#b487ff" : "#67a9ff";
+        ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+        ctx.fillText(breaker ? "BREAKER" : "ORDER BLOCK", zx + 3, y(zh) - 2 - zi * 10);
+      });
+    }
+
+    // Candles use the same colours and spacing as SMC-Radar.
+    for (var ci = i0; ci <= i1; ci++) {
+      var c = candles[ci];
+      var bull = Number(c.c) >= Number(c.o);
+      var colour = bull ? "#2ee6a8" : "#ff5c7a";
+      ctx.strokeStyle = colour; ctx.globalAlpha = c.closed === false ? 1 : 0.84; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x(ci), y(c.h)); ctx.lineTo(x(ci), y(c.l)); ctx.stroke();
+      var top = Math.min(y(c.o), y(c.c));
+      var bottom = Math.max(y(c.o), y(c.c));
+      ctx.fillStyle = colour; ctx.fillRect(x(ci) - bodyW / 2, top, bodyW, Math.max(1, bottom - top));
+    }
+    ctx.globalAlpha = 1;
+
+    function outlineCandle(index, colour, label, above) {
+      if (index < i0 || index > i1 || !candles[index]) return;
+      var c = candles[index];
+      var top = y(c.h), bottom = y(c.l);
+      ctx.strokeStyle = colour; ctx.lineWidth = 2;
+      ctx.strokeRect(x(index) - bodyW * 0.9, top - 3, bodyW * 1.8, Math.max(8, bottom - top + 6));
+      ctx.fillStyle = colour; ctx.textAlign = "center";
+      ctx.textBaseline = above ? "bottom" : "top";
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillText(label, x(index), above ? top - 7 : bottom + 7);
+    }
+    if (selected) {
+      outlineCandle(
+        approachIndex, "#67a9ff",
+        selected.swept_side === "low" ? "PAIRED HIGH" : "PAIRED LOW", false
+      );
+      outlineCandle(sweepIndex, "#ffb347", selected.swept_side === "low" ? "LOW SWEEP" : "HIGH SWEEP", true);
+      outlineCandle(
+        breakIndex, hvbProofValid ? "#67a9ff" : "#ff5c7a",
+        hvbProofValid ? "BODY BREAK + MBL CROSS HVB" : "BODY BREAK · HVB UNPROVEN", false
+      );
+    }
+
+    // Entry and the trade target arm at mitigation, not at the body-break close.
+    // Pending rows still show the evolving confirmation-leg H/L as unarmed proof.
+    if (selected && (breakIndex >= 0 || liveEnabled)) {
+      var touchedIndex = selected.touched_ms ? barAtTime(candles, selected.touched_ms) : -1;
+      var anchorIndex = touchedIndex >= 0 ? touchedIndex : breakIndex >= 0 ? breakIndex : i0;
+      var startX = Math.max(padL, x(anchorIndex));
+      var entryLabel = selected.mitigated ? "entry after mitigation" : "planned mitigation fill";
+      var breakX = Math.max(padL, x(breakIndex >= 0 ? breakIndex : i0));
+      var targetValue = selected.mitigated ? selected.target : selected.leg_target;
+      var targetLabel = selected.mitigated
+        ? "frozen confirmation-leg target"
+        : "pending leg " + (sideOf(selected) === "short" ? "low" : "high") + " (unarmed)";
+      var targetIndex = selected.leg_target_ms ? barAtTime(candles, selected.leg_target_ms) : -1;
+      var targetStartX = selected.mitigated
+        ? startX
+        : Math.max(padL, x(targetIndex >= 0 ? targetIndex : breakIndex >= 0 ? breakIndex : i0));
+      var levelLines = [
+        [selected.entry, "#dfe6f2", entryLabel, [], startX],
+        [selected.stop, "#ff5c7a", "stop", [5, 4], breakX],
+        [targetValue, "#2ee6a8", targetLabel, [5, 4], targetStartX],
+      ];
+      if (breakIndex >= 0) levelLines.push(
+        [selected.bos_level, "#b487ff", "body break", [2, 3], breakX]
+      );
+      levelLines.forEach(function (line) {
+          var value = Number(line[0]); if (!isFinite(value)) return;
+          var yy = y(value); if (yy < padT || yy > h - padB) return;
+          var lineStart = line[4];
+          ctx.strokeStyle = line[1]; ctx.lineWidth = 1; ctx.setLineDash(line[3]);
+          ctx.beginPath(); ctx.moveTo(lineStart, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = line[1]; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+          ctx.fillText(line[2] + " " + priceText(value), lineStart + 4, yy - 2);
+        });
+    }
+
+    // Last visible price and crosshair/OHLC.
+    var last = candles[Math.min(i1, len - 1)];
+    if (last) {
+      var ly = y(last.c);
+      if (ly >= padT && ly <= h - padB) {
+        ctx.strokeStyle = "rgba(103,169,255,.45)"; ctx.beginPath(); ctx.moveTo(padL, ly); ctx.lineTo(w - padR, ly); ctx.stroke();
+        ctx.fillStyle = "#67a9ff"; ctx.fillRect(w - padR + 2, ly - 8, padR - 4, 16);
+        ctx.fillStyle = "#07101c"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(priceText(last.c), w - padR + 6, ly);
+      }
+    }
+
+    var hoverBar = last;
+    if (chartView.hover && chartView.hover.inside) {
+      var hv = chartView.hover;
+      ctx.strokeStyle = "rgba(200,215,240,.38)"; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(hv.x, padT); ctx.lineTo(hv.x, h - padB); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(padL, hv.y); ctx.lineTo(w - padR, hv.y); ctx.stroke(); ctx.setLineDash([]);
+      var hoverPrice = pHi - (hv.y - padT) / plotH * (pHi - pLo);
+      ctx.fillStyle = "#162033"; ctx.fillRect(w - padR + 2, hv.y - 7, padR - 4, 14);
+      ctx.fillStyle = "#c8d7f0"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(priceText(hoverPrice), w - padR + 5, hv.y);
+      hoverBar = candles[hv.i] || last;
+    }
+    if (hoverBar) {
+      var when = new Date(hoverBar.t).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+      $("chart-ohlc").innerHTML = escapeHtml(when) + " · O <b>" + escapeHtml(priceText(hoverBar.o))
+        + "</b> H <b>" + escapeHtml(priceText(hoverBar.h)) + "</b> L <b>" + escapeHtml(priceText(hoverBar.l))
+        + "</b> C <b class=\"" + (hoverBar.c >= hoverBar.o ? "pos" : "neg") + "\">" + escapeHtml(priceText(hoverBar.c)) + "</b>";
+    }
+
+    var audit = $("chart-audit");
+    if (selected) {
+      if (selected.chain_valid === false) {
+        audit.className = "chart-audit bad";
+        audit.textContent = "QUARANTINED · " + (selected.chain_errors || []).join(" · ");
+      } else if (!hvbProofValid) {
+        audit.className = "chart-audit bad";
+        audit.textContent = "NON-CURRENT · this row does not prove a same-candle moving-centre-band cross";
+      } else if (liveEnabled && (sweepIndex < 0 || breakIndex < 0)) {
+        audit.className = "chart-audit ok";
+        audit.textContent = "LIVE MARKET · setup proof remains available in SETUP view";
+      } else if (data.history_error || sweepIndex < 0 || breakIndex < 0) {
+        audit.className = "chart-audit warn";
+        audit.textContent = "Chain recorded, but its historical candle window is unavailable"
+          + (data.history_error ? " · " + data.history_error : "");
+      } else {
+        audit.className = "chart-audit ok";
+        audit.textContent = "✓ paired endpoint → direct sweep → opposite body break + same-candle MBL cross " + String(selected.hvb_side || "HVB").toUpperCase();
+      }
+    } else { audit.className = "chart-audit"; audit.textContent = "select a setup"; }
+    $("chart-tf").textContent = candles.length + (liveEnabled ? " market bars" : " historical bars")
+      + (data.historical_window ? " · setup-centred" : liveEnabled ? " · live tail" : " · latest")
+      + (data.live && data.live.forming ? " · forming now" : "")
+      + (data.history_error ? " · history fallback" : "");
+  }
+
+  function chartCoords(ev) {
+    var rect = $("chart").getBoundingClientRect();
+    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top, w: rect.width || 1, h: rect.height || 1 };
+  }
+
+  function attachChartInteractions() {
+    var canvas = $("chart");
+    canvas.addEventListener("wheel", function (ev) {
+      if (!chartView.data || !(chartView.data.candles || []).length) return;
+      ev.preventDefault();
+      var p = chartCoords(ev);
+      if (p.x > p.w - 76) chartView.zoomY = clamp(chartView.zoomY * (ev.deltaY > 0 ? 0.92 : 1.08), 0.25, 16);
+      else {
+        var old = chartView.span;
+        chartView.span = clamp(Math.round(old * (ev.deltaY > 0 ? 1.18 : 0.84)), 20, chartView.data.candles.length);
+        var frac = clamp((p.x - 8) / Math.max(1, p.w - 84), 0, 1);
+        var anchor = chartView.right - old + 1 + frac * old;
+        chartView.right = anchor + chartView.span - 1 - frac * chartView.span;
+      }
+      drawChart();
+    }, { passive: false });
+    canvas.addEventListener("mousedown", function (ev) {
+      if (!chartView.data) return;
+      var p = chartCoords(ev);
+      chartView.drag = p.x > p.w - 76
+        ? { mode: "scale", y: p.y, zoom: chartView.zoomY }
+        : { mode: "pan", x: p.x, y: p.y, right: chartView.right, panY: chartView.panY };
+      canvas.classList.toggle("panning", chartView.drag.mode === "pan");
+      ev.preventDefault();
+    });
+    window.addEventListener("mousemove", function (ev) {
+      if (!chartView.data || !(chartView.data.candles || []).length) return;
+      var p = chartCoords(ev);
+      if (chartView.drag) {
+        if (chartView.drag.mode === "scale") chartView.zoomY = clamp(chartView.drag.zoom * (1 + (p.y - chartView.drag.y) / 220), 0.25, 16);
+        else {
+          chartView.followLive = false;
+          chartView.right = chartView.drag.right - (p.x - chartView.drag.x) / Math.max(1, p.w - 84) * chartView.span;
+          chartView.panY = chartView.drag.panY + (p.y - chartView.drag.y) / Math.max(1, p.h - 44) / Math.max(0.25, chartView.zoomY);
+        }
+        drawChart(); return;
+      }
+      if (p.x >= 0 && p.x < p.w - 76 && p.y >= 0 && p.y <= p.h) {
+        var left = chartView.right - chartView.span + 1;
+        var index = Math.round(left + (p.x - 8) / Math.max(1, p.w - 84) * chartView.span);
+        chartView.hover = { x: p.x, y: p.y, i: clamp(index, 0, chartView.data.candles.length - 1), inside: true };
+        drawChart();
       }
     });
-
-    // the trade: entry solid, stop dashed red, draw dashed green
-    setups.slice(-6).forEach(function (s) {
-      var short = String(s.side).toUpperCase() === "SHORT";
-      var colour = short ? "#ff5c7a" : "#2ee6a8";
-      if (s.entry !== undefined && s.entry !== null) {
-        ctx.strokeStyle = colour; ctx.lineWidth = 1.2;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.entry)); ctx.lineTo(pads.l + plotW, y(s.entry)); ctx.stroke();
-      }
-      if (s.stop !== undefined && s.stop !== null) {
-        ctx.strokeStyle = "#a83b4f"; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.stop)); ctx.lineTo(pads.l + plotW, y(s.stop)); ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      if (s.target !== undefined && s.target !== null) {
-        ctx.strokeStyle = "#1c8f69"; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(pads.l, y(s.target)); ctx.lineTo(pads.l + plotW, y(s.target)); ctx.stroke();
-        ctx.setLineDash([]);
-      }
-    });
-    ctx.lineWidth = 1;
-
-    // last price, in the axis gutter
-    var last = candles[candles.length - 1];
-    ctx.fillStyle = "#dfe6f2";
-    ctx.fillRect(pads.l + plotW + 3, y(last.c) - 8, pads.r - 8, 16);
-    ctx.fillStyle = "#0b0e13";
-    ctx.fillText(num(last.c), pads.l + plotW + 7, y(last.c));
-
-    $("chart-hint").hidden = true;
-    $("chart-tf").textContent = (data.bars || candles.length) + " bars" + (data.warm ? "" : " · still warming");
+    window.addEventListener("mouseup", function () { chartView.drag = null; canvas.classList.remove("panning"); });
+    canvas.addEventListener("mouseleave", function () { if (!chartView.drag) { chartView.hover = null; drawChart(); } });
+    canvas.addEventListener("dblclick", resetChartView);
+    $("btn-chart-in").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 0.8), 20, (chartView.data.candles || []).length); if (chartView.mode === "live") chartView.followLive = true; drawChart(); };
+    $("btn-chart-out").onclick = function () { if (!chartView.data) return; chartView.span = clamp(Math.round(chartView.span * 1.25), 20, (chartView.data.candles || []).length); if (chartView.mode === "live") chartView.followLive = true; drawChart(); };
+    $("btn-chart-live").onclick = function () {
+      var row = model.selected ? model.rows.get(model.selected) : null;
+      if (!row) return;
+      chartView.mode = "live";
+      chartView.followLive = true;
+      loadChart(row, true, "live");
+    };
+    $("btn-chart-reset").onclick = function () {
+      var row = model.selected ? model.rows.get(model.selected) : null;
+      if (!row) return;
+      if (chartView.mode === "setup") resetChartView();
+      else loadChart(row, true, "setup");
+    };
+    $("btn-chart-full").onclick = function () {
+      var panel = $("chart-panel");
+      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+      else if (panel.requestFullscreen) panel.requestFullscreen().catch(function () { panel.classList.toggle("fs"); });
+      else panel.classList.toggle("fs");
+      setTimeout(drawChart, 80);
+    };
   }
 
   // ------------------------------------------------------- notifications :: ui
@@ -708,14 +1247,13 @@
     renderTable();
     if (added) buildFacets();
     if (!model.selected) {
-      var first = sorted()[0];
+      var first = model.rows.get(model.preferredSelected) || sorted()[0];
       if (first) selectRow(first);
     } else {
       var row = model.rows.get(model.selected);
       if (row) {
         renderStory(row);
-        // the chart follows the symbol when its candles move on
-        if (model.chartKey !== row.symbol + "|" + row.timeframe) loadChart(row.symbol, row.timeframe);
+        if (model.chartKey !== row.key) loadChart(row, false);
       }
     }
   }
@@ -734,7 +1272,7 @@
         renderTable();
         if (added) buildFacets();
         if (!model.selected) {
-          var first = sorted()[0];
+          var first = model.rows.get(model.preferredSelected) || sorted()[0];
           if (first) selectRow(first);
         }
       })
@@ -744,7 +1282,7 @@
   function refreshHealth() {
     fetch("/api/health")
       .then(function (r) { return r.json(); })
-      .then(function (data) { model.health = data; renderHeader(); })
+      .then(function (data) { model.health = data; renderHeader(); checkAlarm(); })
       .catch(function () {});
   }
 
@@ -767,6 +1305,14 @@
     var age = model.lastMessage ? (Date.now() - model.lastMessage) / 1000 : null;
     if (h.feed === "stopped" || (h.failed && h.failed > 0 && h.symbols === 0)) {
       banner("The feed stopped. The page is still reading the archive, but no new candles are arriving. Check the server log.");
+    } else if (h.universe && h.universe.auto && h.universe.mode !== "discovered") {
+      banner("Automatic futures-universe discovery failed. The scanner is using only "
+        + (h.universe.selected || h.symbols || 0) + " configured fallback contracts and will retry. "
+        + (h.universe.error || "The exchange returned a suspiciously small list."));
+    } else if (h.universe && h.universe.auto && h.universe.error) {
+      banner("The latest futures-universe refresh failed. The scanner retained all "
+        + (h.universe.selected || h.symbols || 0) + " contracts from the last successful discovery and will retry. "
+        + h.universe.error);
     } else if (!model.wsOk && age !== null && age > 20) {
       banner("Socket disconnected — falling back to HTTP polling, so the table may lag by a few seconds. It will reconnect by itself.");
     } else {
@@ -822,6 +1368,12 @@
     open();
   }
 
+  function refreshLiveChart() {
+    if (document.hidden || chartView.mode !== "live" || model.chartBusy || !model.selected) return;
+    var row = model.rows.get(model.selected);
+    if (row) loadChart(row, false, "live");
+  }
+
   function poll() {
     fetch("/api/state")
       .then(function (r) { return r.json(); })
@@ -837,6 +1389,7 @@
   function wire() {
     $("search").addEventListener("input", function (e) {
       model.filters.search = e.target.value.trim();
+      savePreferences();
       renderTable();
     });
     document.addEventListener("keydown", function (e) {
@@ -854,20 +1407,22 @@
       btn.onclick = function () {
         model.filters.side = btn.dataset.side;
         Array.prototype.forEach.call($("seg-side").children, function (b) { b.classList.toggle("on", b === btn); });
+        savePreferences();
         renderTable();
       };
     });
 
-    $("state-select").onchange = function (e) { model.filters.state = e.target.value; renderTable(); };
-    $("sort-select").onchange = function (e) { model.filters.sort = e.target.value; renderTable(); };
+    $("state-select").onchange = function (e) { model.filters.state = e.target.value; savePreferences(); renderTable(); };
+    $("sort-select").onchange = function (e) { model.filters.sort = e.target.value; savePreferences(); renderTable(); };
 
     $("btn-reset").onclick = function () {
-      model.filters = { search: "", tfs: new Set(), side: "both", grades: new Set(), sessions: new Set(), state: "all", sort: "new" };
+      model.filters = defaultFilters();
       $("search").value = "";
       $("state-select").value = "all";
       $("sort-select").value = "new";
       Array.prototype.forEach.call($("seg-side").children, function (b) { b.classList.toggle("on", b.dataset.side === "both"); });
       buildFacets();
+      savePreferences();
       renderTable();
     };
 
@@ -880,7 +1435,7 @@
 
     $("btn-refresh-chart").onclick = function () {
       var row = model.selected ? model.rows.get(model.selected) : null;
-      if (row) loadChart(row.symbol, row.timeframe);
+      if (row) loadChart(row, true);
       else refreshArchive();
     };
 
@@ -909,18 +1464,28 @@
       paintQuiet();
     };
 
+    attachChartInteractions();
     var resizeTimer = 0;
     window.addEventListener("resize", function () {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(function () {
-        var row = model.selected ? model.rows.get(model.selected) : null;
-        if (row) loadChart(row.symbol, row.timeframe);
-      }, 200);
+      resizeTimer = setTimeout(drawChart, 120);
     });
   }
 
   // --------------------------------------------------------------------- boot
+  function paintSavedPreferences() {
+    $("search").value = model.filters.search;
+    $("state-select").value = model.filters.state;
+    if ($("state-select").value !== model.filters.state) model.filters.state = "all";
+    $("sort-select").value = model.filters.sort;
+    if ($("sort-select").value !== model.filters.sort) model.filters.sort = "new";
+    Array.prototype.forEach.call($("seg-side").children, function (b) {
+      b.classList.toggle("on", b.dataset.side === model.filters.side);
+    });
+  }
+
   function boot() {
+    paintSavedPreferences();
     wire();
     renderInbox();
     renderHeader();
@@ -932,6 +1497,7 @@
     connect();
     poll();
     setInterval(poll, 6000);
+    setInterval(refreshLiveChart, 1000);
     setInterval(refreshHealth, 8000);
     refreshWatch();
     setInterval(refreshWatch, 5000);

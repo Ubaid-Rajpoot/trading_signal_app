@@ -14,7 +14,7 @@ data · **no** = not implemented, and here is what it would need.
 |---|---|---|---|---|
 | p.42 | **Strong high / weak low** — "the High that caused Manipulation and Structure Breaking"; "the Low that failed to break structure" | **yes** | every alert carries `swept_label` = *strong high/low*, `broke_label` = *weak low/high* (`bot/engine.py::_confluence`) | `test_structure_labels_strong_and_weak_levels_and_the_break_kind`, `test_every_signal_carries_the_book_labels` |
 | p.42 | **Premium / discount** — "above the BSL = premium, below the SSL = discount" | **yes (switch off by default)** | dealing range = last major low..major high; position of the **sweep** (or the entry) in that range, `bot/confluence.py` | `test_dealing_range_separates_premium_and_discount`, `test_book_gates_reject_and_explain` |
-| p.49 | **False break in market structure (FBMS)** | **yes** | a sweep that then closes beyond its own extreme is dropped (`invalidated`) instead of becoming a setup (`bot/structure.py`) | `test_a_sweep_that_keeps_going_is_dropped` |
+| p.49 | **False break in market structure (FBMS)** | **yes** | a candidate is valid only if the opposite endpoint of its exact completed leg later receives the body close; continuation extends the stop rather than erasing provenance | `test_swept_leg_survives_an_extension_and_stop_follows_the_final_extreme` |
 | p.53 | **SHIFT** (minor break) / **MS** (major break) | **yes** — labels; MS as the confirming break is **off** | minor pivots = `pivot_len` (5), major = `major_len` (20); every setup carries `break_kind` | `test_structure_labels_strong_and_weak_levels_and_the_break_kind` |
 | p.53 | **Follow the external structure** (last major break) | **yes, on by default** | `structure_direction` gate compares the trade with `Structure.external_trend` | `test_book_gates_reject_and_explain` |
 | p.53–54 | **Failure swing** — price fails to make a new LL/HH | **yes (shown, not gated)** | `failing_swings()` returns the last swing that failed to extend; printed on the card | `test_failure_swing_is_a_swing_that_fails_to_extend` |
@@ -22,7 +22,7 @@ data · **no** = not implemented, and here is what it would need.
 | p.87 | **FVG / imbalance in the displacement** | **yes (switch on, off by default)** | `fair_value_gaps()` counts the 3-candle gaps the sweep→break leg printed, and how much of the best one is filled | `test_fvg_is_a_three_candle_gap_and_nothing_else` |
 | p.92–93 | **HVB** — the price line crossing the centre band *with speed*, nothing else | **yes** | `centre_of()` + `hvb_signal(..., min_points, min_speed)`; outer bands are never read by a rule | `test_hvb_never_fires_on_an_outer_band_touch`, `test_hvb_needs_speed_when_the_speed_gate_is_on` |
 | p.88 | **Session high/low as liquidity** (Asia / London / NY) | **no** | would need a session calendar + per-session extremes; the sweep of a session extreme is the same `Level` machinery, so it is a small addition, not a redesign | – |
-| p.88 | **Breaker block / LTF "algo candle"** | **no** | needs an LTF order-block detector (last down candle before the up move, etc.) and an LTF feed per symbol; that is a second engine, and it is not in the drawing the strategy came from | – |
+| p.88–89 | **Breaker block after aggressive shift** | **yes** | the candle that formed the exact paired endpoint on the left becomes an alternative breaker zone only when the directed break body is ≥ `breaker_body_atr` (1 ATR default); if it mitigates, risk uses the block's distal edge plus `breaker_stop_buffer_atr` (0.10 ATR), not the distant sweep stop | `test_aggressive_same_leg_endpoint_becomes_a_breaker_block`, `test_long_breaker_touch_arms_the_confirmation_leg_high_like_the_bnb_example` |
 | p.100–103 | **Divergence / Stoch RSI** | **no** | the TDIGM already gates momentum; adding a second oscillator would need its own measured case | – |
 
 > **Round 17 — trend, depth, break of structure, volume.** Four further gates
@@ -40,8 +40,9 @@ data · **no** = not implemented, and here is what it would need.
 
 The **setup shape** the book draws — liquidity taken, strong/weak levels, a SHIFT
 that confirms, an HVB with speed, structure context and liquidity ahead — is
-implemented and tested. The **lower-timeframe execution detail** (session
-blocks, breaker blocks, FVG-fill→algo-candle sequence, divergence) is not.
+implemented and tested. The aggressive-shift paired-endpoint breaker is also
+implemented. The remaining **lower-timeframe execution detail** (session blocks,
+FVG-fill→algo-candle sequence, divergence) is not.
 
 ## Measured: every gate, one at a time
 

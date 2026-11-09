@@ -20,13 +20,10 @@ condition on/off or narrows the same condition:
     volume_break     the signal candle must be a high-volume bar (volume_mult x
                      the average of the previous volume_period candles)
     confirm_mode     "all" = every switched-on condition must hold;
-                     "score" = the weighted confluence score must reach
-                     confirm_min_score (bos + hvb + volume + fvg + trend + depth)
-    hvb_window       the HVB may print on the break candle or up to N bars after
-                     it (the TDI cross and the structure break are two different
-                     measurements; demanding the same candle was the single
-                     biggest reason a real setup never appeared)
-    hvb              the TDIGM price line crosses the CENTRE band on the signal bar
+                     "score" ranks the remaining confluences, but can never
+                     substitute them for the mandatory HVB
+    hvb_window       retained for configuration compatibility; fixed to zero
+    hvb              mandatory moving-MBL cross on the body-break candle
     hvb_min_points   and how far past the centre it closed, in RSI points
     hvb_min_speed    and how fast: this candle's step vs the line's average step
     regime           only trade a trending market (ADX + efficiency ratio)
@@ -41,7 +38,8 @@ condition on/off or narrows the same condition:
     structure_atr_min / _max  the swept->broken structure has to be this tall (ATR)
     break            the classic 20-bar high/low close break, same bar
     sides            long only / short only / both
-    min_rr           skip setups whose next-liquidity target pays less than this
+    min_rr           legacy provisional gate at confirmation; keep 0 because
+                     actual variable R freezes only at mitigation
     max_bars_since_sweep  skip a reversal that took too long to happen
     trend            "off", "with" (only trade in the EMA direction) or
                      "against" (only the reversal kind)
@@ -65,16 +63,29 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "require_bos": True,
     "bos_max_age": 240,
     "max_internal_depth": 2,
-    # how long a published setup stays tradeable before it is "expired"
-    "setup_max_bars": 240,
+    # 0 = an untouched setup remains valid until price invalidates it.  This is
+    # essential for historical discovery: age alone is not mitigation.
+    "setup_max_bars": 0,
+    # Risk/reward starts at mitigation, never at the body-break close. The
+    # target price comes from the setup's own HVB/BOS confirmation-leg H/L.
+    # A paired endpoint becomes a breaker only after an aggressive price shift.
+    "breaker_body_atr": 1.0,
+    "breaker_stop_buffer_atr": 0.10,
+    # Kept opt-in at the reusable Filters boundary so focused callers can test
+    # one gate without fabricating a full multi-degree trend context.  The
+    # shipped config explicitly enables this mandatory production gate.
+    "clear_structure": False,
+    "min_trend_steps": 2,
+    "min_directional_ratio": 1.0,
+    "fresh_shift_max_bars": 20,
     "volume_break": False,
     "volume_mult": 1.5,
     "volume_period": 20,
     "confirm_mode": "all",
     "confirm_min_score": 60,
     "hvb": True,
-    # the HVB may print on the break candle or up to N bars after it
-    "hvb_window": 3,
+    # strict strategy rule: HVB and body break belong to the same closed candle
+    "hvb_window": 0,
     "hvb_min_points": 1.0,
     "hvb_min_speed": 1.5,
     "regime": True,
@@ -87,7 +98,8 @@ DEFAULT_FILTERS: dict[str, Any] = {
     "structure_direction": True,
     "require_ms": False,
     "require_fvg": False,
-    "block_liquidity_pool": True,
+    # optional book confluence, not part of the trader's TDIGM checklist
+    "block_liquidity_pool": False,
     "pool_tolerance": 0.25,
     "pool_count": 3,
     "structure_atr_min": 0.0,
@@ -167,26 +179,83 @@ class Filters:
 
         if cfg.get("trend_context", True) and side:
             external = context.get("external") or {}
-            direction = external.get("direction")
-            if direction is None:
-                reasons.append("no clear external trend (swings are not making higher highs + higher lows or the mirror)")
-            elif direction * want < 0:
-                which = "higher highs + higher lows" if direction > 0 else "lower highs + lower lows"
-                reasons.append(f"against the external trend ({which})")
-            elif cfg.get("require_hh_hl", True) and not external.get("clean"):
-                reasons.append("external structure is not a clean HH+HL / LH+LL sequence")
+            if cfg.get("clear_structure", True):
+                major = context.get("major") or {}
+                macro = context.get("macro") or {}
+                internal = context.get("internal") or context.get("minor") or {}
+                steps = int(cfg.get("min_trend_steps") or 2)
+                ratio = float(cfg.get("min_directional_ratio", 1.0))
+                fresh_bars = int(cfg.get("fresh_shift_max_bars") or 0)
+
+                def clear(degree: dict) -> bool:
+                    return bool(
+                        degree.get("direction") == want
+                        and degree.get("clean")
+                        and int(degree.get("trend_steps") or 0) >= steps
+                        and float(degree.get("directional_ratio") or 0.0) >= ratio
+                        and not degree.get("range_like", True)
+                    )
+
+                def directional_leg(degree: dict) -> bool:
+                    """One clear local LH+LL / HL+HH step inside larger structure."""
+                    return bool(
+                        degree.get("direction") == want
+                        and degree.get("clean")
+                        and int(degree.get("trend_steps") or 0) >= 1
+                        and float(degree.get("directional_ratio") or 0.0) >= ratio
+                        and not degree.get("range_like", True)
+                    )
+
+                def released(degree: dict) -> bool:
+                    age = degree.get("bos_age")
+                    return bool(
+                        degree.get("bos_direction") == want
+                        and degree.get("bos_range_break")
+                        and age is not None
+                        and (fresh_bars <= 0 or int(age) <= fresh_bars)
+                    )
+
+                established = clear(major) or clear(macro)
+                local_release = directional_leg(internal) or released(internal) or released(major)
+                fresh_reversal = released(major) or released(macro)
+                if not (fresh_reversal or (established and local_release)):
+                    reasons.append(
+                        "ranging/unclear structure to the left: needs repeated directional swings "
+                        f"({steps}+ steps, {ratio:.0%} consistency) and a clear local leg/range release, "
+                        "or a fresh major range-breaking shift"
+                    )
+            else:
+                direction = external.get("direction")
+                if direction is None:
+                    reasons.append("no clear external trend (swings are not making higher highs + higher lows or the mirror)")
+                elif direction * want < 0:
+                    which = "higher highs + higher lows" if direction > 0 else "lower highs + lower lows"
+                    reasons.append(f"against the external trend ({which})")
+                elif cfg.get("require_hh_hl", True) and not external.get("clean"):
+                    reasons.append("external structure is not a clean HH+HL / LH+LL sequence")
 
         if cfg.get("require_bos", True) and side:
-            external = context.get("external") or {}
-            bos_direction = external.get("bos_direction")
-            age = external.get("bos_age")
             limit = int(cfg.get("bos_max_age") or 0)
-            if bos_direction is None:
-                reasons.append("no break of structure yet in this trend")
-            elif bos_direction * want < 0:
-                reasons.append("the last break of structure is the other way")
-            elif limit > 0 and age is not None and age > limit:
-                reasons.append(f"the last break of structure was {age} bars ago (max {limit})")
+            if cfg.get("clear_structure", True):
+                degrees = [context.get(name) or {} for name in ("internal", "major", "macro")]
+                matching = [
+                    degree for degree in degrees
+                    if degree.get("bos_direction") == want
+                    and degree.get("bos_age") is not None
+                    and (limit <= 0 or int(degree["bos_age"]) <= limit)
+                ]
+                if not matching:
+                    reasons.append("no recent structure break in the trade direction")
+            else:
+                external = context.get("external") or {}
+                bos_direction = external.get("bos_direction")
+                age = external.get("bos_age")
+                if bos_direction is None:
+                    reasons.append("no break of structure yet in this trend")
+                elif bos_direction * want < 0:
+                    reasons.append("the last break of structure is the other way")
+                elif limit > 0 and age is not None and age > limit:
+                    reasons.append(f"the last break of structure was {age} bars ago (max {limit})")
 
         if side and depth.get("value") is not None:
             allowed = int(cfg.get("max_internal_depth") or 2)
@@ -207,15 +276,23 @@ class Filters:
         if cfg.get("structure", True) and not candidate.get("structure"):
             reasons.append("no structure (needs a sweep, then the opposite side breaking)")
 
-        if cfg.get("hvb", True) and not score_mode:
+        # HVB is mandatory even in score mode. A score can rank otherwise valid
+        # setups, but it can never substitute volume/BOS/trend points for the
+        # actual same-candle moving-centre-band cross.
+        if cfg.get("hvb", True):
             need = float(cfg.get("hvb_min_points") or 0)
             need_speed = float(cfg.get("hvb_min_speed") or 0)
             if candidate.get("hvb"):
-                # the engine already applies both gates; a filter edited from the
-                # page has to bite on the spot too, so re-check the numbers
+                # Direction is part of confluence, not just the existence of a
+                # cross.  A bearish structure break with an upward TDI cross was
+                # previously accepted because any non-empty ``hvb`` was truthy.
+                expected = "up" if side == "long" else "down"
+                actual = str(candidate.get("hvb") or "").lower()
                 power = abs(float(candidate.get("hvb_points") or 0.0))
                 speed = candidate.get("hvb_speed")
-                if need > 0 and power < need:
+                if side and actual != expected:
+                    reasons.append(f"HVB direction {actual} opposes the {side} setup (needs {expected})")
+                elif need > 0 and power < need:
                     reasons.append(f"HVB broke the centre by only {power:.2f} points (needs {need:g})")
                 elif need_speed > 0 and speed is not None and speed < need_speed:
                     reasons.append(f"HVB too slow ({speed:.1f}x its average step, needs {need_speed:g}x)")
@@ -235,7 +312,27 @@ class Filters:
             state = regime.get("state")
             adx_min = float(cfg.get("regime_adx_min") or 0)
             er_min = float(cfg.get("regime_er_min") or 0)
-            if state is None:
+            # ADX and efficiency ratio are lagging measurements. They must not
+            # veto the explicit policy that a fresh major/macro range-breaking
+            # structure shift establishes a new trend. This is not a generic
+            # momentum exception: the close must have broken the remembered
+            # outer range in the trade direction, within the configured age.
+            fresh_bars = int(cfg.get("fresh_shift_max_bars") or 0)
+            fresh_structural_shift = bool(
+                cfg.get("trend_context", True)
+                and cfg.get("clear_structure", True)
+                and side
+                and any(
+                    degree.get("bos_direction") == want
+                    and degree.get("bos_range_break")
+                    and degree.get("bos_age") is not None
+                    and (fresh_bars <= 0 or int(degree["bos_age"]) <= fresh_bars)
+                    for degree in (context.get("major") or {}, context.get("macro") or {})
+                )
+            )
+            if fresh_structural_shift:
+                candidate["range_clearance"] = "fresh major/macro range-breaking shift"
+            elif state is None:
                 reasons.append("market state not known yet (ADX/ER still warming up)")
             elif state != "trend":
                 if adx is not None and adx < adx_min:
@@ -245,7 +342,6 @@ class Filters:
                 else:
                     reasons.append("ranging market (ADX and ER below the trend thresholds)")
             elif str(cfg.get("regime_direction") or "any").lower() == "with" and side:
-                want = 1 if side == "long" else -1
                 if regime.get("direction") is not None and regime["direction"] * want < 0:
                     reasons.append("against the EMA trend (regime_direction = with)")
 
@@ -299,7 +395,7 @@ class Filters:
 
         if reasons:
             for reason in reasons:
-                key = _short(reason)
+                key = rejection_key(reason)
                 self.rejections[key] = self.rejections.get(key, 0) + 1
             return False, reasons
 
@@ -323,7 +419,10 @@ class Filters:
         parts = {
             "trend": bool(external.get("direction") is not None and external["direction"] * want > 0
                           and external.get("clean")),
-            "hvb": bool(candidate.get("hvb")),
+            "hvb": bool(
+                candidate.get("hvb")
+                and str(candidate.get("hvb")).lower() == ("up" if side == "long" else "down")
+            ),
             "bos": bool(external.get("bos_direction") is not None
                         and external["bos_direction"] * want > 0),
             "volume": bool(ratio is not None and float(ratio) >= 1.5),
@@ -396,11 +495,13 @@ class Filters:
         }
 
 
-def _short(reason: str) -> str:
-    """Stable key for the counters - drop the numbers so they group."""
+def rejection_key(reason: str) -> str:
+    """Stable key for decision-funnel counters; drop per-candle numbers."""
     head = reason.split("(")[0].strip()
     out = []
     for token in head.split():
-        # the numbers differ every bar; "N" keeps one counter per kind of reason
-        out.append("N" if any(ch.isdigit() for ch in token) and not token.startswith("20") else token)
+        # The numbers differ every bar; "N" keeps one counter per kind. Preserve
+        # only the strategy phrase "20-bar", not live values such as ADX 20.9.
+        has_number = any(ch.isdigit() for ch in token)
+        out.append("N" if has_number and not token.startswith("20-bar") else token)
     return " ".join(out)[:48]

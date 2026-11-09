@@ -13,7 +13,7 @@
   <div class="brand">
     <span class="mark"></span>
     <span class="name">TDIGM</span>
-    <span class="tag" id="strategy-tag">book engine</span>
+    <span class="tag" id="strategy-tag">TDIGM setup</span>
   </div>
 
   <div class="top-mid">
@@ -72,11 +72,14 @@
       <div class="group-head">state</div>
       <select id="state-select">
         <option value="all">every state</option>
-        <option value="open">open only (valid)</option>
-        <option value="win">closed at the draw</option>
+        <option value="open">open only (active + mitigated)</option>
+        <option value="active">active / awaiting mitigation</option>
+        <option value="mitigated">mitigated / trade open</option>
+        <option value="win">won at confirmation-leg target</option>
         <option value="stopped">closed at the stop</option>
         <option value="breakeven">scratched at break-even</option>
         <option value="expired">expired</option>
+        <option value="invalidated">invalidated before mitigation</option>
       </select>
     </div>
 
@@ -140,20 +143,37 @@
     </div>
   </section>
 
-  <section class="chart-pane">
+  <section class="chart-pane" id="chart-panel">
     <div class="chart-head">
       <div>
         <h2 id="chart-title">chart</h2>
         <div class="muted small" id="chart-sub">pick a signal on the left</div>
+        <div class="chart-audit" id="chart-audit">select a setup</div>
       </div>
       <div class="chart-head-right">
         <span class="muted small" id="chart-tf"></span>
-        <button class="ghost" id="btn-refresh-chart" title="reload this chart">↻</button>
+        <div class="chart-tools" aria-label="chart controls">
+          <button class="ghost" id="btn-chart-live" title="follow the still-forming market candle">live</button>
+          <button class="ghost" id="btn-chart-in" title="zoom in">+</button>
+          <button class="ghost" id="btn-chart-out" title="zoom out">−</button>
+          <button class="ghost" id="btn-chart-reset" title="return to immutable setup evidence">setup</button>
+          <button class="ghost" id="btn-chart-full" title="full screen">⛶</button>
+          <button class="ghost" id="btn-refresh-chart" title="reload setup history">↻</button>
+        </div>
       </div>
     </div>
+    <div class="chart-live" id="chart-live" aria-live="polite">
+      <span class="live-pill" id="chart-live-state">SETUP VIEW</span>
+      <span>price <b id="chart-live-price">—</b></span>
+      <span title="target reward divided by initial risk">plan R:R <b id="chart-plan-rr">—</b></span>
+      <span title="mark-to-market profit or loss in initial-risk units">live R <b id="chart-current-r">—</b></span>
+      <span title="reward to target divided by risk to stop from current price">remaining R:R <b id="chart-remaining-rr">—</b></span>
+      <span class="live-note" id="chart-live-note">Select LIVE to follow the current market.</span>
+    </div>
     <div class="canvas-wrap">
-      <canvas id="chart"></canvas>
-      <div class="chart-hint" id="chart-hint">The liquidity map, the imbalance the trade came from and the levels it aims at are drawn here.</div>
+      <canvas id="chart" title="drag to pan · wheel to zoom · drag the price axis to scale · double-click to reset"></canvas>
+      <div class="chart-ohlc" id="chart-ohlc"></div>
+      <div class="chart-hint" id="chart-hint">The setup-centred chart marks the H/L sweep, opposite body break and same-candle TDIGM HVB.</div>
     </div>
     <div class="story" id="story"></div>
   </section>
@@ -165,9 +185,9 @@
   <span class="sep">·</span>
   <span id="status-counts">—</span>
   <span class="sep">·</span>
-  <span id="status-funnel" title="minutes of price action -> liquidity traps -> displacements -> published plans">—</span>
+  <span id="status-funnel" title="closed candles -> liquidity sweeps -> opposite-side body breaks -> same-candle TDIGM signals">—</span>
   <span class="sep">·</span>
-  <span id="status-noise" title="events the policy dropped before they reached the screen">—</span>
+  <span id="status-noise" title="rejected/duplicate notices hidden; market frames and confirmed signals are never dropped by this policy">—</span>
   <span class="grow"></span>
   <span id="status-memory" class="muted"></span>
 </footer>
@@ -194,6 +214,7 @@
 </div>
 
 <script src="/notify.js"></script>
+<script src="/state.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

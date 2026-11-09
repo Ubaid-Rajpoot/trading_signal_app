@@ -95,8 +95,11 @@ class Degree:
 
     def sequence(self, tolerance: float) -> dict[str, Any]:
         """Higher highs / higher lows (or the mirror) from the last two pivots."""
-        out: dict[str, Any] = {"hh": False, "hl": False, "lh": False, "ll": False,
-                               "clean": False, "direction": None, "streak": 0}
+        out: dict[str, Any] = {
+            "hh": False, "hl": False, "lh": False, "ll": False,
+            "clean": False, "direction": None, "streak": 0,
+            "trend_steps": 0, "directional_ratio": 0.0, "range_like": True,
+        }
         if len(self.highs) >= 2:
             now, before = self.highs[-1].price, self.highs[-2].price
             out["hh"] = now > before + tolerance
@@ -111,21 +114,47 @@ class Degree:
             out["direction"] = -1
         # a *clean* sequence is higher-highs+higher-lows or lower-highs+lower-lows
         out["clean"] = out["direction"] is not None
-        # how many consecutive same-direction swings the sequence shows
-        streak = 0
-        for side, up_key, down_key in (("high", "hh", "lh"), ("low", "hl", "ll")):
-            book = self.highs if side == "high" else self.lows
+        # A clear trend needs both sides to progress, repeatedly. Looking only at
+        # the latest HH+HL lets one lucky pair at the edge of a range masquerade
+        # as a trend, especially on 1m. Keep the legacy max streak for display,
+        # but gate on the minimum high/low run and the wider directional ratio.
+        runs: list[int] = []
+        matches = 0
+        total = 0
+        for book in (self.highs, self.lows):
             run = 0
             for i in range(len(book) - 1, 0, -1):
                 step = book[i].price - book[i - 1].price
-                if (out["direction"] == 1 and step > tolerance) or (
-                    out["direction"] == -1 and step < -tolerance
-                ):
+                directed = (
+                    (out["direction"] == 1 and step > tolerance)
+                    or (out["direction"] == -1 and step < -tolerance)
+                )
+                if directed:
                     run += 1
                 else:
                     break
-            streak = max(streak, run)
-        out["streak"] = streak
+            runs.append(run)
+            # Score every remembered step (up to pivot_memory pivots per side),
+            # not just the last attractive pair. Production requires 100%, so a
+            # visible older oscillation keeps the established-trend path closed;
+            # only a fresh full-range shift can establish the new direction.
+            start = 1
+            for i in range(start, len(book)):
+                step = book[i].price - book[i - 1].price
+                total += 1
+                if (
+                    (out["direction"] == 1 and step > tolerance)
+                    or (out["direction"] == -1 and step < -tolerance)
+                ):
+                    matches += 1
+        out["streak"] = max(runs, default=0)
+        out["trend_steps"] = min(runs, default=0) if len(runs) == 2 else 0
+        out["directional_ratio"] = round(matches / total, 3) if total else 0.0
+        out["range_like"] = bool(
+            out["direction"] is None
+            or out["trend_steps"] < 1
+            or out["directional_ratio"] < 2 / 3
+        )
         return out
 
     def bos(self, direction: int | None = None) -> dict[str, Any] | None:
@@ -198,16 +227,40 @@ class TrendMap:
         # 2. break of structure: a CLOSE beyond the most recent confirmed swing
         for name, degree in self.degrees.items():
             for side, direction in (("high", 1), ("low", -1)):
-                pivot = degree.latest(side)
-                if pivot is None or pivot.broken or pivot.index >= index:
+                book = degree.highs if side == "high" else degree.lows
+                # Break every remembered pivot the close passed, but publish one
+                # BOS for the candle.  This matters when a single displacement
+                # clears a recent internal high (108) and the older range edge
+                # (110): leaving 108 at the tail or handling only one pivot made
+                # the genuine range release invisible or one candle late.
+                eligible = [item for item in book if not item.broken and item.index < index]
+                crossed = [
+                    item for item in eligible
+                    if (close > item.price + tolerance if side == "high"
+                        else close < item.price - tolerance)
+                ]
+                if not crossed:
                     continue
-                through = close > pivot.price + tolerance if side == "high" else close < pivot.price - tolerance
-                if not through:
-                    continue
-                pivot.broken = True
+                range_edge = (
+                    max(item.price for item in book) if side == "high"
+                    else min(item.price for item in book)
+                )
+                range_break = (
+                    close > range_edge + tolerance if side == "high"
+                    else close < range_edge - tolerance
+                )
+                for item in crossed:
+                    item.broken = True
+                # Use the outermost crossed boundary for an actual range release;
+                # otherwise retain the newest local structural break.
+                pivot = (
+                    (max(crossed, key=lambda item: item.price) if side == "high"
+                     else min(crossed, key=lambda item: item.price))
+                    if range_break else max(crossed, key=lambda item: item.index)
+                )
                 degree.bos_events.append(
                     {"degree": name, "side": side, "direction": direction, "price": pivot.price,
-                     "index": index}
+                     "index": index, "range_edge": range_edge, "range_break": range_break}
                 )
 
         self.last_state = self.state()
@@ -229,9 +282,14 @@ class TrendMap:
             "hh": seq["hh"], "hl": seq["hl"], "lh": seq["lh"], "ll": seq["ll"],
             "clean": seq["clean"],
             "streak": seq["streak"],
+            "trend_steps": seq["trend_steps"],
+            "directional_ratio": seq["directional_ratio"],
+            "range_like": seq["range_like"],
             "bos_direction": last["direction"] if last else None,
             "bos_level": last["price"] if last else None,
             "bos_age": (index - last["index"]) if last else None,
+            "bos_range_break": bool(last and last.get("range_break")),
+            "bos_range_edge": last.get("range_edge") if last else None,
             "last_high": degree.latest("high").price if degree.latest("high") else None,
             "last_low": degree.latest("low").price if degree.latest("low") else None,
         }

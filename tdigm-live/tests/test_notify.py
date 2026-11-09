@@ -39,7 +39,7 @@ def signal(key: str, title: str = "LONG BTCUSDT 15m", grade: str = "A", **extra)
         severity=ACTION,
         category="signal",
         grade=grade,
-        detail="entry 100 · draw 90 · 1:4.0",
+        detail="entry 100 · confirmation-leg target 90 · 2.5R",
         time=1_700_000_000_000,
         **extra,
     )
